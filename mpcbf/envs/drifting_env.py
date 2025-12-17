@@ -57,6 +57,14 @@ class DriftingEnv:
         self.right_boundary_line = None
         self.center_line = None
         
+        # Puddles on the road (list of dicts with 'x', 'y', 'radius', 'friction')
+        self.puddles = []
+        self.puddle_patches = []
+        
+        # Static obstacles (other cars) - list of dicts with 'x', 'y', 'theta', 'spec'
+        self.obstacles = []
+        self.obstacle_patches = []
+        
     def _generate_track(self):
         """Generate track boundaries based on track type."""
         if self.track_type == 'straight':
@@ -320,4 +328,226 @@ class DriftingEnv:
             'centerline': self.centerline.copy(),
             'track_width': self.track_width
         }
+    
+    def add_puddle(self, x, y, radius, friction=0.3):
+        """
+        Add a puddle (low friction area) to the track.
+        
+        Args:
+            x: X position of puddle center
+            y: Y position of puddle center
+            radius: Radius of the puddle
+            friction: Friction coefficient in the puddle (default 0.3)
+        """
+        puddle = {
+            'x': x,
+            'y': y,
+            'radius': radius,
+            'friction': friction
+        }
+        self.puddles.append(puddle)
+        
+        # Draw puddle if plot is set up
+        if self.ax is not None:
+            from matplotlib.patches import Circle
+            puddle_patch = Circle(
+                (x, y), radius,
+                facecolor=(0.3, 0.5, 0.8, 0.5),  # Blue with transparency
+                edgecolor=(0.2, 0.4, 0.7),
+                linewidth=2,
+                zorder=2
+            )
+            self.ax.add_patch(puddle_patch)
+            self.puddle_patches.append(puddle_patch)
+    
+    def get_friction_at_position(self, position, default_friction=1.0):
+        """
+        Get the friction coefficient at a given position.
+        
+        Args:
+            position: [x, y] position to check
+            default_friction: Default friction if not in any puddle
+            
+        Returns:
+            float: Friction coefficient at the position
+        """
+        x, y = position[0], position[1]
+        
+        for puddle in self.puddles:
+            dist = np.sqrt((x - puddle['x'])**2 + (y - puddle['y'])**2)
+            if dist <= puddle['radius']:
+                return puddle['friction']
+        
+        return default_friction
+    
+    def add_obstacle_car(self, x, y, theta, robot_spec=None):
+        """
+        Add a static obstacle car to the track.
+        
+        Args:
+            x: X position of obstacle car
+            y: Y position of obstacle car
+            theta: Heading angle of obstacle car
+            robot_spec: Robot specification dict (optional)
+            
+        Returns:
+            int: Index of the added obstacle
+        """
+        if robot_spec is None:
+            robot_spec = {
+                'body_length': 4.5,
+                'body_width': 2.0,
+                'a': 1.4,  # Front axle to CG
+                'b': 1.4,  # Rear axle to CG
+                'radius': 2.5,  # Collision radius (larger for safety)
+            }
+        
+        obstacle = {
+            'x': x,
+            'y': y,
+            'theta': theta,
+            'spec': robot_spec
+        }
+        self.obstacles.append(obstacle)
+        
+        # Draw obstacle car if plot is set up
+        if self.ax is not None:
+            self._draw_obstacle_car(obstacle)
+        
+        return len(self.obstacles) - 1
+    
+    def _draw_obstacle_car(self, obstacle):
+        """Draw a static obstacle car."""
+        x, y, theta = obstacle['x'], obstacle['y'], obstacle['theta']
+        spec = obstacle['spec']
+        
+        a = spec.get('a', 1.6)
+        b = spec.get('b', 0.8)
+        L = spec.get('body_length', 4.3)
+        W = spec.get('body_width', 1.8)
+        
+        # Body vertices (centered at CG)
+        rear_overhang = (L - a - b) * 0.4
+        front_overhang = (L - a - b) * 0.6
+        
+        # Main body outline (counterclockwise from rear-left)
+        body_vertices = np.array([
+            [-b - rear_overhang, -W/2],
+            [-b - rear_overhang, W/2],
+            [-b - rear_overhang + 0.3, W/2 + 0.05],
+            [a + front_overhang - 0.8, W/2 + 0.05],
+            [a + front_overhang - 0.3, W/2 * 0.7],
+            [a + front_overhang, W/2 * 0.5],
+            [a + front_overhang, -W/2 * 0.5],
+            [a + front_overhang - 0.3, -W/2 * 0.7],
+            [a + front_overhang - 0.8, -W/2 - 0.05],
+            [-b - rear_overhang + 0.3, -W/2 - 0.05],
+        ]).T
+        
+        # Rotation matrix
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+        
+        # Transform body vertices
+        body_world = R @ body_vertices + np.array([[x], [y]])
+        
+        # Draw body
+        body_patch = MplPolygon(
+            body_world.T, closed=True,
+            facecolor=(0.7, 0.2, 0.2),  # Dark red color
+            edgecolor='black',
+            linewidth=1.5, alpha=0.9, zorder=8
+        )
+        self.ax.add_patch(body_patch)
+        self.obstacle_patches.append(body_patch)
+        
+        # Draw tires
+        tire_length = 0.6
+        tire_width = 0.25
+        tire_y_offset = W / 2 - tire_width / 2 - 0.1
+        tire_positions = {
+            'front_left': np.array([a, tire_y_offset]),
+            'front_right': np.array([a, -tire_y_offset]),
+            'rear_left': np.array([-b, tire_y_offset]),
+            'rear_right': np.array([-b, -tire_y_offset])
+        }
+        
+        tl = tire_length / 2
+        tw = tire_width / 2
+        tire_vertices = np.array([
+            [-tl, -tw],
+            [-tl, tw],
+            [tl, tw],
+            [tl, -tw]
+        ]).T
+        
+        for name, pos in tire_positions.items():
+            pos_world = R @ pos.reshape(-1, 1) + np.array([[x], [y]])
+            tire_world = R @ tire_vertices + pos_world
+            tire_patch = MplPolygon(
+                tire_world.T, closed=True,
+                facecolor=(0.3, 0.3, 0.3),
+                edgecolor='black',
+                linewidth=1, alpha=0.9, zorder=9
+            )
+            self.ax.add_patch(tire_patch)
+            self.obstacle_patches.append(tire_patch)
+    
+    def check_obstacle_collision(self, position, robot_radius=0.0):
+        """
+        Check if a position collides with any obstacle cars.
+        
+        Args:
+            position: [x, y] position to check
+            robot_radius: Radius of the robot for collision margin
+            
+        Returns:
+            bool: True if collision detected
+            int or None: Index of collided obstacle, or None
+        """
+        x, y = position[0], position[1]
+        
+        for i, obstacle in enumerate(self.obstacles):
+            obs_x, obs_y = obstacle['x'], obstacle['y']
+            obs_radius = obstacle['spec'].get('radius', 2.5)
+            
+            dist = np.sqrt((x - obs_x)**2 + (y - obs_y)**2)
+            if dist < (obs_radius + robot_radius):
+                return True, i
+        
+        return False, None
+    
+    def update_plot_frame(self, ax, position, window_size=(40, 20)):
+        """
+        Update the plot frame to center around the robot position.
+        
+        Args:
+            ax: Matplotlib axis
+            position: [x, y] robot position
+            window_size: (width, height) of the view window
+        """
+        x, y = position[0], position[1]
+        half_w, half_h = window_size[0] / 2, window_size[1] / 2
+        
+        # Calculate new limits, but keep within track bounds
+        x_min = max(self.x_min, x - half_w)
+        x_max = min(self.x_max, x + half_w)
+        y_min = max(self.y_min, y - half_h)
+        y_max = min(self.y_max, y + half_h)
+        
+        # Adjust if we hit boundaries
+        if x_max - x_min < window_size[0]:
+            if x_min == self.x_min:
+                x_max = x_min + window_size[0]
+            elif x_max == self.x_max:
+                x_min = x_max - window_size[0]
+        
+        if y_max - y_min < window_size[1]:
+            if y_min == self.y_min:
+                y_max = y_min + window_size[1]
+            elif y_max == self.y_max:
+                y_min = y_max - window_size[1]
+        
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
 

@@ -254,26 +254,50 @@ def run_mpcc_oval_track():
 
 
 def run_mpcc_straight_track():
-    """Run MPCC on a straight track."""
+    """Run MPCC on a longer straight track with obstacles, puddles, and moving frame."""
     print("=" * 60)
-    print("       MPCC Test - Straight Track (High Friction)")
+    print("       MPCC Test - Straight Track (Extended Features)")
     print("=" * 60)
     
     dt = 0.05
-    tf = 30.0
+    tf = 60.0  # Longer simulation time for extended track
     
-    # Create straight track
+    # Create longer straight track
     env = DriftingEnv(
         track_type='straight',
         track_width=10.0,
-        track_length=120.0
+        track_length=300.0  # Much longer track
     )
     
     plt.ion()
     ax, fig = env.setup_plot()
-    fig.canvas.manager.set_window_title('MPCC - Straight Track')
+    fig.canvas.manager.set_window_title('MPCC - Straight Track with Obstacles & Puddles')
     
     robot_spec = create_robot_spec_high_friction()
+    
+    # Add puddles on the road (low friction areas)
+    print("\nAdding puddles to the track...")
+    env.add_puddle(x=50.0, y=0.0, radius=8.0, friction=0.3)
+    env.add_puddle(x=120.0, y=1.5, radius=6.0, friction=0.4)
+    env.add_puddle(x=180.0, y=-1.0, radius=7.0, friction=0.25)
+    print(f"  Puddle 1: x=50, y=0, r=8, μ=0.3")
+    print(f"  Puddle 2: x=120, y=1.5, r=6, μ=0.4")
+    print(f"  Puddle 3: x=180, y=-1, r=7, μ=0.25")
+    
+    # Add a static obstacle car (parked car on the shoulder of the road)
+    print("\nAdding static obstacle car...")
+    obstacle_spec = {
+        'body_length': 4.5,
+        'body_width': 2.0,
+        'a': 1.4,
+        'b': 1.4,
+        'radius': 2.5,  # Collision radius (tight fit)
+    }
+    # Place obstacle on the shoulder of the road (outside track but visible)
+    # Robot radius is 1.5, obstacle radius is 2.5, so min safe distance is 4.0m
+    # Track half-width is 5.0m, so y=-4.5 puts obstacle just inside shoulder
+    env.add_obstacle_car(x=80.0, y=-4.2, theta=0.0, robot_spec=obstacle_spec)
+    print(f"  Obstacle car at: x=80, y=-4.2, θ=0° (parked on shoulder)")
     
     # Start at beginning of track, slightly off-center to test correction
     X0 = np.array([5.0, 1.0, np.deg2rad(3), 0, 0, 8.0, 0, 0])
@@ -311,12 +335,34 @@ def run_mpcc_straight_track():
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
     print("\nRunning simulation...")
-    print("Car starts off-center and should correct to follow centerline.\n")
+    print("Features enabled:")
+    print("  - Moving plot frame following the robot")
+    print("  - Velocity indicator bar (above car, left)")
+    print("  - Friction indicator bar (above car, right)")
+    print("  - Puddles change robot friction dynamically")
+    print("  - Obstacle collision detection")
+    print()
     
     num_steps = int(tf / dt)
+    window_size = (50, 25)  # View window size for moving frame
+    
+    # Track friction changes for logging
+    last_friction = robot_spec['mu']
     
     for step in range(num_steps):
         state = car.get_state()
+        pos = car.get_position()
+        
+        # Update friction based on position (puddle check)
+        current_friction = env.get_friction_at_position(pos, default_friction=robot_spec['mu'])
+        if abs(current_friction - car.get_friction()) > 0.01:
+            car.set_friction(current_friction)
+            if abs(current_friction - last_friction) > 0.01:
+                if current_friction < robot_spec['mu']:
+                    print(f"Step {step:4d}: *** ENTERED PUDDLE - friction changed to {current_friction:.2f} ***")
+                else:
+                    print(f"Step {step:4d}: *** LEFT PUDDLE - friction restored to {current_friction:.2f} ***")
+                last_friction = current_friction
         
         try:
             U = mpcc.solve_control_problem(state)
@@ -335,23 +381,29 @@ def run_mpcc_straight_track():
         if pred_states is not None:
             mpc_pred_line.set_data(pred_states[0, :], pred_states[1, :])
         
+        # Update plot frame to follow the robot
+        env.update_plot_frame(ax, pos, window_size=window_size)
+        
         simulator.draw_plot(pause=0.001)
         
-        if step % 20 == 0:
-            pos = car.get_position()
+        if step % 40 == 0:
             V = car.get_velocity()
             delta = car.get_steering_angle()
             r = car.get_yaw_rate()
+            mu = car.get_friction()
             print(f"Step {step:4d}: x={pos[0]:6.2f}, y={pos[1]:6.2f}, V={V:5.2f} m/s, "
-                  f"delta={np.rad2deg(delta):5.1f}°, r={np.rad2deg(r):5.1f}°/s, U=[{U[0,0]:.2f}, {U[1,0]:.1f}]")
+                  f"μ={mu:.2f}, delta={np.rad2deg(delta):5.1f}°, r={np.rad2deg(r):5.1f}°/s")
         
         if result['collision']:
-            print(f"\nCOLLISION at step {step}")
+            collision_type = getattr(simulator, 'collision_type', 'unknown')
+            print(f"\n*** COLLISION ({collision_type}) at step {step} ***")
+            print(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})")
+            print(f"  Velocity: {car.get_velocity():.2f} m/s")
             plt.pause(3.0)
             break
         
         # End if we've reached the end of the track
-        if car.get_position()[0] > env.track_length - 5:
+        if pos[0] > env.track_length - 10:
             print("\nReached end of track!")
             break
     
@@ -383,7 +435,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Test MPCC controller')
-    parser.add_argument('--track', type=str, default='oval',
+    parser.add_argument('--track', type=str, default='straight',
                         choices=['straight', 'oval', 'test'],
                         help='Track type to test')
     
