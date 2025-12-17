@@ -1,17 +1,16 @@
 """
-Test script for the drifting environment.
+Created on December 17th, 2025
+@author: Taekyung Kim
 
-This script demonstrates the drifting car simulation:
-1. Creates a racing track environment
-2. Initializes a car with kinematic bicycle dynamics
-3. Runs the car straight until it collides with the track boundary
-4. Shows collision with red exclamation mark and stops simulation
+@description:
+Test script for the drifting environment with basic collision checking.
+Demonstrates the drifting car simulation with kinematic bicycle dynamics,
+running straight until collision with track boundary.
 
 Usage:
-    python -m mpcbf.examples.test_drifting
-    
-    or from the project root:
-    uv run python mpcbf/examples/test_drifting.py
+    uv run python mpcbf/examples/test_drifting.py [--track straight|oval|l_shape]
+
+@required-scripts: mpcbf/envs/drifting_env.py, mpcbf/robots/drifting_car.py
 """
 
 import numpy as np
@@ -21,9 +20,10 @@ import os
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'safe_control'))
 
 from mpcbf.envs.drifting_env import DriftingEnv
-from mpcbf.robots.drifting_car import DriftingCar, DriftingCarSimulator
+from robots.drifting_car import DriftingCar, DriftingCarSimulator
 
 
 def main():
@@ -187,7 +187,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Test drifting environment')
-    parser.add_argument('--track', type=str, default='straight',
+    parser.add_argument('--track', type=str, default='oval',
                         choices=['straight', 'oval'],
                         help='Track type to test')
     
