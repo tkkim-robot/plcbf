@@ -293,7 +293,7 @@ def run_mpcc_straight_track():
         Q_v=50.0,       # Velocity tracking weight
         Q_r=20.0,       # Yaw rate penalty weight
         v_ref=8.0,      # Target velocity [m/s]
-        R=np.array([150.0, 0.1, -0.1]),  # Control effort weights
+        R=np.array([150.0, 0.1, 0.1]),  # Control effort weights (all non-negative)
     )
     mpcc.set_progress_rate(8.0)
     
