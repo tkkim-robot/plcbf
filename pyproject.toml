@@ -10,6 +10,8 @@ dependencies = [
     "matplotlib",
     "cvxpy",
     "casadi",
+    "do-mpc>=5.1.1",
+    "shapely>=2.0.7",
 ]
 
 [build-system]
