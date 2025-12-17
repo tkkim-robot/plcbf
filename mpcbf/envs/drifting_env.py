@@ -1,9 +1,13 @@
 """
-Drifting Environment - A racing track environment for drift simulation.
+Created on December 17th, 2025
+@author: Taekyung Kim
 
+@description:
+Drifting Environment - A racing track environment for drift simulation.
 This module provides a simple racing track with left and right boundaries
-for collision checking. The track is defined by centerline waypoints and
-track width.
+for collision checking. Supports straight, oval, and L-shaped track types.
+
+@required-scripts: None (standalone module)
 """
 
 import numpy as np
@@ -85,12 +89,12 @@ class DriftingEnv:
         self.y_max = self.track_width + 5
         
     def _generate_oval_track(self):
-        """Generate an oval track."""
+        """Generate an oval track with gentler curves."""
         n_points = 200
         
-        # Oval parameters
+        # Oval parameters - make semi-minor axis larger for gentler turns
         a = self.track_length / 2  # Semi-major axis
-        b = self.track_length / 4  # Semi-minor axis
+        b = self.track_length / 2.5  # Semi-minor axis
         
         # Parametric oval
         t = np.linspace(0, 2 * np.pi, n_points)
