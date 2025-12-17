@@ -12,8 +12,19 @@ Test Cases:
 3. Puddle Surprise - Puddle in front of obstacle causes gatekeeper to fail
    (demonstrates limitation: gatekeeper plans with current friction estimate)
 
+Backup Controllers:
+- lane_change: Lane change to left lane (avoids obstacle by changing lanes)
+- stop: Emergency braking to stop the vehicle (expected to fail in puddle scenario)
+
 Usage:
-    uv run python mpcbf/examples/test_gatekeeper.py [--test high_friction|low_friction|puddle_surprise|all]
+    uv run python mpcbf/examples/test_gatekeeper.py [--test high_friction|low_friction|puddle_surprise|all] [--backup lane_change|stop]
+
+Examples:
+    # Test with lane change backup (default)
+    uv run python mpcbf/examples/test_gatekeeper.py --test puddle_surprise --backup lane_change
+    
+    # Test with stopping backup (expected to fail in puddle scenario)
+    uv run python mpcbf/examples/test_gatekeeper.py --test puddle_surprise --backup stop
 
 @required-scripts: safe_control/shielding/gatekeeper.py, safe_control/position_control/mpcc.py
 """
@@ -32,9 +43,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'safe_con
 from mpcbf.envs.drifting_env import DriftingEnv
 from robots.drifting_car import DriftingCar, DriftingCarSimulator
 from position_control.mpcc import MPCC
-from position_control.backup_controller import LaneChangeController
+from position_control.backup_controller import LaneChangeController, StoppingController
 from shielding.gatekeeper import Gatekeeper
 from utils.animation import AnimationSaver
+
+
+# =============================================================================
+# Backup Controller Types
+# =============================================================================
+
+BACKUP_TYPES = ['lane_change', 'stop']
 
 
 # =============================================================================
@@ -80,7 +98,7 @@ class VehicleConfig:
     
     # State limits
     v_max: float = 20.0         # Max velocity [m/s]
-    v_min: float = 0.5          # Min velocity [m/s]
+    v_min: float = 0.0          # Min velocity [m/s] - allow complete stop
     r_max: float = 2.0          # Max yaw rate [rad/s]
     beta_max: float = np.deg2rad(45)  # Max slip angle [rad]
     
@@ -107,7 +125,7 @@ class VehicleConfig:
 class SimulationConfig:
     """Simulation configuration parameters."""
     dt: float = 0.05
-    tf: float = 20.0
+    tf: float = 14.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
     backup_horizon_time: float = 3.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
@@ -148,6 +166,7 @@ class TestConfig:
     puddles: list  # List of PuddleConfig
     expected_collision: bool = False  # Whether collision is expected
     save_animation: bool = False  # Whether to save animation as video
+    backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
 
 
 # =============================================================================
@@ -226,8 +245,15 @@ def setup_controllers(
     )
     mpcc.set_progress_rate(sim.target_velocity)
     
-    # Backup controller (lane change to left)
-    backup_controller = LaneChangeController(robot_spec, sim.dt, direction='left')
+    # Backup controller - choose based on config
+    if config.backup_type == 'stop':
+        backup_controller = StoppingController(robot_spec, sim.dt)
+        backup_target = None  # Stopping doesn't need a target
+        print(f"  Using STOPPING backup controller")
+    else:  # 'lane_change' (default)
+        backup_controller = LaneChangeController(robot_spec, sim.dt, direction='left')
+        backup_target = left_lane_y
+        print(f"  Using LANE CHANGE backup controller (target y={left_lane_y:.2f})")
     
     # Gatekeeper
     gatekeeper = Gatekeeper(
@@ -238,7 +264,7 @@ def setup_controllers(
         event_offset=sim.event_offset,
         ax=ax
     )
-    gatekeeper.set_backup_controller(backup_controller, target=left_lane_y)
+    gatekeeper.set_backup_controller(backup_controller, target=backup_target)
     gatekeeper.set_environment(env)
     
     return mpcc, gatekeeper
@@ -441,7 +467,7 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
         # Create unique output directory for this test
         safe_name = config.name.lower().replace(' ', '_')
         output_dir = f"output/animations/{safe_name}"
-        animation_saver = AnimationSaver(output_dir=output_dir, save_per_frame=2, fps=30)
+        animation_saver = AnimationSaver(output_dir=output_dir, save_per_frame=1, fps=30)
         print(f"\n  Animation saving enabled -> {output_dir}/")
     
     # Print configuration
@@ -449,6 +475,7 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     print(f"  Friction: μ = {config.vehicle.mu}")
     print(f"  Obstacle at: x = {config.obstacle.x}m")
     print(f"  Puddles: {len(config.puddles)}")
+    print(f"  Backup type: {config.backup_type}")
     print(f"  Expected collision: {config.expected_collision}")
     
     # Run simulation
@@ -534,7 +561,7 @@ def create_puddle_surprise_test() -> TestConfig:
         obstacle=ObstacleConfig(x=80.0),
         puddles=[
             # Large puddle right in front of obstacle
-            PuddleConfig(x=70.0, y=middle_lane_y, radius=15.0, friction=0.2),
+            PuddleConfig(x=70.0, y=middle_lane_y, radius=15.0, friction=0.25),
         ],
         expected_collision=True,  # Expected to fail!
     )
@@ -551,33 +578,53 @@ def main():
     parser.add_argument('--test', type=str, default='high_friction',
                         choices=['high_friction', 'low_friction', 'puddle_surprise', 'all'],
                         help='Which test to run')
+    parser.add_argument('--backup', type=str, default='lane_change',
+                        choices=BACKUP_TYPES,
+                        help='Backup controller type: lane_change (default) or stop')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
     
     args = parser.parse_args()
     
+    # Test configurations with expected collisions based on backup type
+    # For stopping backup, puddle surprise is expected to collide
+    # For lane change backup with high/low friction, no collision expected
     test_configs = {
         'high_friction': create_high_friction_test,
         'low_friction': create_low_friction_test,
         'puddle_surprise': create_puddle_surprise_test,
     }
     
+    # Adjust expected collision based on backup type
+    # Stopping backup is less safe than lane change in obstacle avoidance scenarios
+    expected_collision_for_stop = {
+        'high_friction': False,     # Stop should work with high friction
+        'low_friction': False,      # Stop might work with low friction (if enough distance)
+        'puddle_surprise': True,    # Stop will definitely fail with puddle surprise
+    }
+    
     results = {}
     
     if args.test == 'all':
         print("\n" + "=" * 70)
-        print("  RUNNING ALL GATEKEEPER TESTS")
+        print(f"  RUNNING ALL GATEKEEPER TESTS (backup: {args.backup})")
         print("=" * 70)
         
         for name, create_config in test_configs.items():
             config = create_config()
             config.save_animation = args.save
+            config.backup_type = args.backup
+            # Update expected collision based on backup type
+            if args.backup == 'stop':
+                config.expected_collision = expected_collision_for_stop[name]
+            # Update name to include backup type
+            config.name = f"{config.name} ({args.backup})"
             results[name] = run_test(config)
             input("\nPress Enter to continue to next test...")
         
         # Summary
         print("\n" + "=" * 70)
-        print("  TEST SUMMARY")
+        print(f"  TEST SUMMARY (backup: {args.backup})")
         print("=" * 70)
         for name, result in results.items():
             status = "✓ PASSED" if result['passed'] else "✗ FAILED"
@@ -591,6 +638,12 @@ def main():
     else:
         config = test_configs[args.test]()
         config.save_animation = args.save
+        config.backup_type = args.backup
+        # Update expected collision based on backup type
+        if args.backup == 'stop':
+            config.expected_collision = expected_collision_for_stop[args.test]
+        # Update name to include backup type
+        config.name = f"{config.name} ({args.backup})"
         results[args.test] = run_test(config)
     
     return results
