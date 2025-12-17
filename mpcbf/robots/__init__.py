@@ -1,3 +1,3 @@
 # mpcbf robots
-from mpcbf.robots.drifting_car import DriftingCar
+# DriftingCar is now in safe_control/robots/drifting_car.py
 
