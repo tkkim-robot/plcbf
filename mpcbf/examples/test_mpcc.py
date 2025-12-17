@@ -5,13 +5,24 @@ Created on December 17th, 2025
 @description:
 Test script for MPCC (Model Predictive Contouring Control) with Dynamic Bicycle Model.
 Demonstrates path following using contouring MPC with Fiala tire dynamics.
-Supports straight and oval track configurations.
 
-Now includes Gatekeeper safety shielding that validates nominal trajectories
-against backup trajectories for guaranteed safety.
+Track Modes:
+- straight: Simple straight track path following (no obstacles)
+- oval: Oval track path following (no obstacles)
+- gatekeeper: Straight track with obstacles, puddles, and Gatekeeper safety shielding
 
 Usage:
-    uv run python mpcbf/examples/test_mpcc.py [--track straight|oval|gatekeeper]
+    uv run python mpcbf/examples/test_mpcc.py [--track straight|oval|gatekeeper] [--save]
+
+Examples:
+    # Run pure MPCC on straight track
+    uv run python mpcbf/examples/test_mpcc.py --track straight
+    
+    # Run pure MPCC on oval track and save animation
+    uv run python mpcbf/examples/test_mpcc.py --track oval --save
+    
+    # Run MPCC with gatekeeper safety shielding (default)
+    uv run python mpcbf/examples/test_mpcc.py --track gatekeeper --save
 
 @required-scripts: mpcbf/envs/drifting_env.py, safe_control/robots/drifting_car.py,
                    safe_control/robots/dynamic_bicycle2D.py, safe_control/position_control/mpcc.py,
@@ -30,8 +41,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'safe_con
 from mpcbf.envs.drifting_env import DriftingEnv
 from robots.drifting_car import DriftingCar, DriftingCarSimulator
 from position_control.mpcc import MPCC
-from position_control.backup_controller import BackupControllerManager, LaneChangeController
+from position_control.backup_controller import LaneChangeController
 from shielding.gatekeeper import Gatekeeper
+from utils.animation import AnimationSaver
 
 
 def create_robot_spec_high_friction():
@@ -78,7 +90,7 @@ def create_robot_spec_high_friction():
     }
 
 
-def run_mpcc_oval_track():
+def run_mpcc_oval_track(save_animation=False):
     """Run MPCC on an oval track."""
     print("=" * 60)
     print("       MPCC Test - Oval Track (High Friction)")
@@ -86,7 +98,7 @@ def run_mpcc_oval_track():
     
     # Simulation parameters
     dt = 0.05
-    tf = 60.0  # Total simulation time
+    tf = 20.0  # Total simulation time
     
     # Create oval track
     env = DriftingEnv(
@@ -176,6 +188,12 @@ def run_mpcc_oval_track():
     # Create simulator
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
+    # Setup animation saver if enabled
+    animation_saver = None
+    if save_animation:
+        animation_saver = AnimationSaver(output_dir="output/animations/mpcc_oval", save_per_frame=1, fps=30)
+        print("\n  Animation saving enabled -> output/animations/mpcc_oval/")
+    
     print(f"\nRunning simulation for {tf:.0f} seconds...")
     print("The car should follow the oval track.\n")
     
@@ -216,6 +234,10 @@ def run_mpcc_oval_track():
         # Update plot
         simulator.draw_plot(pause=0.001)
         
+        # Save animation frame
+        if animation_saver is not None:
+            animation_saver.save_frame(fig)
+        
         # Get current velocity
         V = car.get_velocity()
         
@@ -254,88 +276,60 @@ def run_mpcc_oval_track():
         else:
             low_speed_counter = 0
     
+    # Export video if animation was saved
+    if animation_saver is not None:
+        animation_saver.export_video(output_name="mpcc_oval.mp4")
+    
     print("\nSimulation complete!")
     plt.ioff()
     plt.show()
 
 
-def run_mpcc_straight_track():
-    """Run MPCC on a 5-lane straight track with obstacles, puddles, backup controller."""
+def run_mpcc_straight_track(save_animation=False):
+    """Run MPCC on a straight track - pure path following without obstacles."""
     print("=" * 60)
-    print("       MPCC Test - 5-Lane Track with Backup Controller")
+    print("       MPCC Test - Straight Track")
     print("=" * 60)
     
     dt = 0.05
-    tf = 60.0  # Longer simulation time for extended track
+    tf = 10.0  # Simulation time
     
-    # Create 5-lane straight track
-    # Total width = 5 lanes * 4m per lane = 20m
+    # Create straight track
     lane_width = 4.0
-    num_lanes = 5
+    num_lanes = 3
     total_width = lane_width * num_lanes
     
     env = DriftingEnv(
         track_type='straight',
         track_width=total_width,
-        track_length=300.0,  # Much longer track
+        track_length=300.0,
         num_lanes=num_lanes
     )
     
     plt.ion()
     ax, fig = env.setup_plot()
-    fig.canvas.manager.set_window_title('MPCC - 5-Lane Track with Backup Controller')
+    fig.canvas.manager.set_window_title('MPCC - Straight Track')
     
     robot_spec = create_robot_spec_high_friction()
     
-    # Get lane centers
-    print(f"\nTrack configuration: {num_lanes} lanes, {lane_width}m wide each")
-    for i in range(num_lanes):
-        lane_y = env.get_lane_center(i)
-        lane_type = "shoulder" if i == 0 or i == num_lanes - 1 else "driving"
-        print(f"  Lane {i}: y = {lane_y:.1f}m ({lane_type})")
-    
-    # Middle lane index (lane 2 for 5 lanes)
+    # Middle lane
     middle_lane = env.get_middle_lane_idx()
     middle_lane_y = env.get_lane_center(middle_lane)
-    left_lane_y = env.get_lane_center(middle_lane - 1)  # Lane to the left
     
-    print(f"\nRobot starts in middle lane (lane {middle_lane}, y={middle_lane_y:.1f}m)")
-    print(f"Backup controller target: left lane (lane {middle_lane-1}, y={left_lane_y:.1f}m)")
+    print(f"\nTrack configuration: {num_lanes} lanes, {lane_width}m wide each")
+    print(f"Robot starts in middle lane (y={middle_lane_y:.1f}m)")
     
-    # Add puddles on the road (low friction areas)
-    print("\nAdding puddles to the track...")
-    env.add_puddle(x=50.0, y=middle_lane_y, radius=8.0, friction=0.3)
-    env.add_puddle(x=150.0, y=left_lane_y, radius=6.0, friction=0.4)
-    env.add_puddle(x=220.0, y=middle_lane_y - 2.0, radius=7.0, friction=0.25)
-    print(f"  Puddle 1: x=50, y={middle_lane_y:.1f}, r=8, μ=0.3")
-    print(f"  Puddle 2: x=150, y={left_lane_y:.1f}, r=6, μ=0.4")
-    print(f"  Puddle 3: x=220, y={middle_lane_y-2:.1f}, r=7, μ=0.25")
+    # Initial state
+    V0 = 8.0
+    X0 = np.array([6.0, middle_lane_y, np.deg2rad(10), 0, 0, V0, 0, 0])
     
-    # Add a static obstacle car in the middle lane (blocking!)
-    print("\nAdding static obstacle car in middle lane...")
-    obstacle_spec = {
-        'body_length': 4.5,
-        'body_width': 2.0,
-        'a': 1.4,
-        'b': 1.4,
-        'radius': 2.5,  # Collision radius
-    }
-    # Place obstacle in middle lane - robot will need to change lane to avoid it
-    env.add_obstacle_car(x=100.0, y=middle_lane_y, theta=0.0, robot_spec=obstacle_spec)
-    print(f"  Obstacle car at: x=100, y={middle_lane_y:.1f}, θ=0° (blocking middle lane!)")
-    
-    # Start in middle lane
-    X0 = np.array([5.0, middle_lane_y, np.deg2rad(0), 0, 0, 8.0, 0, 0])
-    
-    print(f"\nInitial state: x={X0[0]:.1f}, y={X0[1]:.1f}, "
-          f"theta={np.rad2deg(X0[2]):.1f}°, V={X0[5]:.1f} m/s")
+    print(f"\nInitial state: x={X0[0]:.1f}, y={X0[1]:.1f}, V={V0:.1f} m/s")
     
     car = DriftingCar(X0, robot_spec, dt, ax)
     
-    # Create MPCC controller - use middle lane as reference
-    # Create a reference path along the middle lane
+    # Create MPCC controller
     ref_x = env.centerline[:, 0]
-    ref_y = np.full_like(ref_x, middle_lane_y)  # Middle lane y-coordinate
+    ref_y = np.full_like(ref_x, middle_lane_y)
     
     mpcc = MPCC(car, robot_spec)
     mpcc.set_reference_path(ref_x, ref_y)
@@ -345,67 +339,34 @@ def run_mpcc_straight_track():
         Q_theta=30.0,   # Heading error weight
         Q_v=50.0,       # Velocity tracking weight
         Q_r=20.0,       # Yaw rate penalty weight
-        v_ref=8.0,      # Target velocity [m/s]
-        R=np.array([150.0, 0.1, 0.1]),  # Control effort weights (all non-negative)
+        v_ref=V0,       # Target velocity [m/s]
+        R=np.array([150.0, 0.1, 0.1]),
     )
-    mpcc.set_progress_rate(8.0)
+    mpcc.set_progress_rate(V0)
     
-    # Create backup controller manager
-    print("\nInitializing backup controller...")
-    backup_manager = BackupControllerManager(robot_spec, dt, ax)
-    backup_manager.create_lane_change_controller(direction='left')
-    backup_manager.set_backup_horizon(80)  # Long horizon to see stabilization
-    print(f"  Backup behavior: left lane change to y={left_lane_y:.1f}m")
-    print(f"  Backup horizon: {backup_manager.backup_horizon} steps ({backup_manager.backup_horizon * dt:.1f}s)")
-    
-    # Reference path along middle lane (faint)
-    ax.plot(ref_x, ref_y, 'g-', linewidth=1, alpha=0.3, label='Reference path (middle lane)')
-    
-    # Target lane for backup (faint)
-    ax.plot(ref_x, np.full_like(ref_x, left_lane_y), 
-            'orange', linewidth=1, alpha=0.3, linestyle=':', label='Backup target (left lane)')
-    
-    # Reference horizon
+    # Visualization
+    ax.plot(ref_x, ref_y, 'g-', linewidth=1, alpha=0.3, label='Reference path')
     ref_horizon_line, = ax.plot([], [], 'g-', linewidth=3, alpha=0.8, label='Reference horizon')
-    
-    # MPC prediction
     mpc_pred_line, = ax.plot([], [], 'r--', linewidth=2, alpha=0.8, label='MPC prediction')
-    
     ax.legend(loc='upper right', fontsize=8)
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
-    print("\nRunning simulation...")
-    print("Features enabled:")
-    print("  - 5-lane track with colored shoulders")
-    print("  - Moving plot frame following the robot")
-    print("  - Velocity indicator bar (above car, left)")
-    print("  - Friction indicator bar (above car, right)")
-    print("  - Puddles change robot friction dynamically")
-    print("  - Obstacle collision detection")
-    print("  - Backup controller trajectory (orange line)")
-    print()
+    # Setup animation saver if enabled
+    animation_saver = None
+    if save_animation:
+        animation_saver = AnimationSaver(output_dir="output/animations/mpcc_straight", save_per_frame=1, fps=30)
+        print("\n  Animation saving enabled -> output/animations/mpcc_straight/")
+    
+    print(f"\nRunning simulation for {tf:.0f} seconds...")
+    print("The car should follow the straight path.\n")
     
     num_steps = int(tf / dt)
-    window_size = (60, 30)  # View window size for moving frame (wider for 5 lanes)
-    
-    # Track friction changes for logging
-    last_friction = robot_spec['mu']
+    window_size = (60, 20)
     
     for step in range(num_steps):
         state = car.get_state()
         pos = car.get_position()
-        
-        # Update friction based on position (puddle check)
-        current_friction = env.get_friction_at_position(pos, default_friction=robot_spec['mu'])
-        if abs(current_friction - car.get_friction()) > 0.01:
-            car.set_friction(current_friction)
-            if abs(current_friction - last_friction) > 0.01:
-                if current_friction < robot_spec['mu']:
-                    print(f"Step {step:4d}: *** ENTERED PUDDLE - friction changed to {current_friction:.2f} ***")
-                else:
-                    print(f"Step {step:4d}: *** LEFT PUDDLE - friction restored to {current_friction:.2f} ***")
-                last_friction = current_friction
         
         try:
             U = mpcc.solve_control_problem(state)
@@ -424,48 +385,38 @@ def run_mpcc_straight_track():
         if pred_states is not None:
             mpc_pred_line.set_data(pred_states[0, :], pred_states[1, :])
         
-        # Simulate and visualize backup trajectory
-        # Use current friction for backup simulation (as specified)
-        backup_traj = backup_manager.simulate_backup(
-            'lane_change_left', 
-            state, 
-            left_lane_y,
-            friction=car.get_friction()  # Use current friction
-        )
-        backup_manager.update_visualization(backup_traj)
-        
-        # Update plot frame to follow the robot
         env.update_plot_frame(ax, pos, window_size=window_size)
-        
         simulator.draw_plot(pause=0.001)
         
-        if step % 40 == 0:
+        # Save animation frame
+        if animation_saver is not None:
+            animation_saver.save_frame(fig)
+        
+        if step % 50 == 0:
             V = car.get_velocity()
             delta = car.get_steering_angle()
-            r = car.get_yaw_rate()
-            mu = car.get_friction()
             print(f"Step {step:4d}: x={pos[0]:6.2f}, y={pos[1]:6.2f}, V={V:5.2f} m/s, "
-                  f"μ={mu:.2f}, delta={np.rad2deg(delta):5.1f}°, r={np.rad2deg(r):5.1f}°/s")
+                  f"delta={np.rad2deg(delta):5.1f}°")
         
         if result['collision']:
-            collision_type = getattr(simulator, 'collision_type', 'unknown')
-            print(f"\n*** COLLISION ({collision_type}) at step {step} ***")
-            print(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})")
-            print(f"  Velocity: {car.get_velocity():.2f} m/s")
+            print(f"\nCOLLISION at step {step}")
             plt.pause(3.0)
             break
         
-        # End if we've reached the end of the track
         if pos[0] > env.track_length - 10:
             print("\nReached end of track!")
             break
+    
+    # Export video if animation was saved
+    if animation_saver is not None:
+        animation_saver.export_video(output_name="mpcc_straight.mp4")
     
     print("\nSimulation complete!")
     plt.ioff()
     plt.show()
 
 
-def run_mpcc_with_gatekeeper():
+def run_mpcc_with_gatekeeper(save_animation=False):
     """
     Run MPCC with Gatekeeper safety shielding.
     
@@ -607,6 +558,12 @@ def run_mpcc_with_gatekeeper():
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
+    # Setup animation saver if enabled
+    animation_saver = None
+    if save_animation:
+        animation_saver = AnimationSaver(output_dir="output/animations/mpcc_gatekeeper", save_per_frame=1, fps=30)
+        print("\n  Animation saving enabled -> output/animations/mpcc_gatekeeper/")
+    
     print("\n" + "="*60)
     print("Gatekeeper Safety Shielding Active")
     print("="*60)
@@ -685,6 +642,10 @@ def run_mpcc_with_gatekeeper():
         env.update_plot_frame(ax, pos, window_size=window_size)
         simulator.draw_plot(pause=0.001)
         
+        # Save animation frame
+        if animation_saver is not None:
+            animation_saver.save_frame(fig)
+        
         # Status output
         if step % 40 == 0:
             V = car.get_velocity()
@@ -705,6 +666,10 @@ def run_mpcc_with_gatekeeper():
         if pos[0] > env.track_length - 10:
             print("\nReached end of track!")
             break
+    
+    # Export video if animation was saved
+    if animation_saver is not None:
+        animation_saver.export_video(output_name="mpcc_gatekeeper.mp4")
     
     # Print statistics
     print("\n" + "="*60)
@@ -747,15 +712,17 @@ if __name__ == "__main__":
     parser.add_argument('--track', type=str, default='gatekeeper',
                         choices=['straight', 'oval', 'gatekeeper', 'test'],
                         help='Track type to test (gatekeeper = MPCC + safety shielding)')
+    parser.add_argument('--save', action='store_true',
+                        help='Save animation as video')
     
     args = parser.parse_args()
     
     if args.track == 'straight':
-        run_mpcc_straight_track()
+        run_mpcc_straight_track(save_animation=args.save)
     elif args.track == 'oval':
-        run_mpcc_oval_track()
+        run_mpcc_oval_track(save_animation=args.save)
     elif args.track == 'gatekeeper':
-        run_mpcc_with_gatekeeper()
+        run_mpcc_with_gatekeeper(save_animation=args.save)
     elif args.track == 'test':
         test_parameter_combinations()
 

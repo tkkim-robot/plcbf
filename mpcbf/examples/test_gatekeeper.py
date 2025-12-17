@@ -16,15 +16,25 @@ Backup Controllers:
 - lane_change: Lane change to left lane (avoids obstacle by changing lanes)
 - stop: Emergency braking to stop the vehicle (expected to fail in puddle scenario)
 
+Number of Obstacles:
+- 1: Single obstacle in middle lane (default)
+- 2: Two obstacles - one in middle lane, one in left lane (blocks lane change backup)
+
 Usage:
-    uv run python mpcbf/examples/test_gatekeeper.py [--test high_friction|low_friction|puddle_surprise|all] [--backup lane_change|stop]
+    uv run python mpcbf/examples/test_gatekeeper.py [--test TEST] [--backup BACKUP] [--obs NUM] [--save]
 
 Examples:
     # Test with lane change backup (default)
-    uv run python mpcbf/examples/test_gatekeeper.py --test puddle_surprise --backup lane_change
+    uv run python mpcbf/examples/test_gatekeeper.py --test high_friction --backup lane_change
     
     # Test with stopping backup (expected to fail in puddle scenario)
     uv run python mpcbf/examples/test_gatekeeper.py --test puddle_surprise --backup stop
+    
+    # Test with 2 obstacles (lane change will fail due to blocked left lane)
+    uv run python mpcbf/examples/test_gatekeeper.py --test high_friction --backup lane_change --obs 2
+    
+    # Save animation
+    uv run python mpcbf/examples/test_gatekeeper.py --test high_friction --save
 
 @required-scripts: safe_control/shielding/gatekeeper.py, safe_control/position_control/mpcc.py
 """
@@ -136,13 +146,17 @@ class SimulationConfig:
 
 @dataclass
 class ObstacleConfig:
-    """Obstacle configuration."""
+    """Single obstacle configuration."""
     x: float = 80.0             # X position
     y: Optional[float] = None   # Y position (None = middle lane)
     theta: float = 0.0          # Heading angle
     body_length: float = 4.5
     body_width: float = 2.0
     radius: float = 2.5         # Collision radius
+
+
+# Number of obstacles options
+NUM_OBSTACLES = [1, 2]
 
 
 @dataclass
@@ -162,11 +176,12 @@ class TestConfig:
     track: TrackConfig
     vehicle: VehicleConfig
     simulation: SimulationConfig
-    obstacle: ObstacleConfig
+    obstacles: list  # List of ObstacleConfig
     puddles: list  # List of PuddleConfig
     expected_collision: bool = False  # Whether collision is expected
     save_animation: bool = False  # Whether to save animation as video
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
+    num_obstacles: int = 1  # Number of obstacles to use
 
 
 # =============================================================================
@@ -273,20 +288,28 @@ def setup_controllers(
 def setup_obstacles_and_puddles(
     config: TestConfig, 
     env: DriftingEnv, 
-    middle_lane_y: float
+    middle_lane_y: float,
+    left_lane_y: float
 ):
     """Add obstacles and puddles to the environment."""
-    obs = config.obstacle
-    
-    # Add obstacle
-    obs_y = obs.y if obs.y is not None else middle_lane_y
-    obstacle_spec = {
-        'body_length': obs.body_length,
-        'body_width': obs.body_width,
-        'a': 1.4, 'b': 1.4,
-        'radius': obs.radius,
-    }
-    env.add_obstacle_car(x=obs.x, y=obs_y, theta=obs.theta, robot_spec=obstacle_spec)
+    # Add obstacles (up to num_obstacles)
+    for i, obs in enumerate(config.obstacles[:config.num_obstacles]):
+        # Determine Y position
+        if obs.y is not None:
+            obs_y = obs.y
+        elif i == 0:
+            obs_y = middle_lane_y  # First obstacle in middle lane
+        else:
+            obs_y = left_lane_y  # Additional obstacles in left lane by default
+        
+        obstacle_spec = {
+            'body_length': obs.body_length,
+            'body_width': obs.body_width,
+            'a': 1.4, 'b': 1.4,
+            'radius': obs.radius,
+        }
+        env.add_obstacle_car(x=obs.x, y=obs_y, theta=obs.theta, robot_spec=obstacle_spec)
+        print(f"  Obstacle {i+1}: x={obs.x:.1f}, y={obs_y:.1f}")
     
     # Add puddles
     for puddle in config.puddles:
@@ -456,7 +479,7 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     env, ax, fig = setup_environment(config)
     car, X0, middle_lane_y, left_lane_y = setup_vehicle(config, env, ax)
     mpcc, gatekeeper = setup_controllers(config, car, env, middle_lane_y, left_lane_y, ax)
-    setup_obstacles_and_puddles(config, env, middle_lane_y)
+    setup_obstacles_and_puddles(config, env, middle_lane_y, left_lane_y)
     ref_horizon_line, mpc_pred_line = setup_visualization(ax, env, middle_lane_y, left_lane_y)
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
@@ -473,7 +496,7 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     # Print configuration
     print(f"\nConfiguration:")
     print(f"  Friction: μ = {config.vehicle.mu}")
-    print(f"  Obstacle at: x = {config.obstacle.x}m")
+    print(f"  Obstacles: {config.num_obstacles}")
     print(f"  Puddles: {len(config.puddles)}")
     print(f"  Backup type: {config.backup_type}")
     print(f"  Expected collision: {config.expected_collision}")
@@ -524,7 +547,10 @@ def create_high_friction_test() -> TestConfig:
         track=TrackConfig(),
         vehicle=VehicleConfig(mu=1.0),  # High friction
         simulation=SimulationConfig(),
-        obstacle=ObstacleConfig(x=80.0),
+        obstacles=[
+            ObstacleConfig(x=80.0, y=None),       # First obstacle in middle lane
+            ObstacleConfig(x=85.0, y=None),       # Second obstacle in left lane (y=None uses default)
+        ],
         puddles=[],  # No puddles
         expected_collision=False,
     )
@@ -538,7 +564,10 @@ def create_low_friction_test() -> TestConfig:
         track=TrackConfig(),
         vehicle=VehicleConfig(mu=0.3),  # Low friction everywhere
         simulation=SimulationConfig(),
-        obstacle=ObstacleConfig(x=80.0),
+        obstacles=[
+            ObstacleConfig(x=80.0, y=None),       # First obstacle in middle lane
+            ObstacleConfig(x=85.0, y=None),       # Second obstacle in left lane
+        ],
         puddles=[],  # No puddles - friction is globally low
         expected_collision=False,
     )
@@ -558,7 +587,10 @@ def create_puddle_surprise_test() -> TestConfig:
         track=track,
         vehicle=VehicleConfig(mu=1.0),  # Start with high friction
         simulation=SimulationConfig(),
-        obstacle=ObstacleConfig(x=80.0),
+        obstacles=[
+            ObstacleConfig(x=80.0, y=None),       # First obstacle in middle lane
+            ObstacleConfig(x=85.0, y=None),       # Second obstacle in left lane
+        ],
         puddles=[
             # Large puddle right in front of obstacle
             PuddleConfig(x=70.0, y=middle_lane_y, radius=15.0, friction=0.25),
@@ -581,6 +613,9 @@ def main():
     parser.add_argument('--backup', type=str, default='lane_change',
                         choices=BACKUP_TYPES,
                         help='Backup controller type: lane_change (default) or stop')
+    parser.add_argument('--obs', type=int, default=1,
+                        choices=NUM_OBSTACLES,
+                        help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
     
@@ -595,36 +630,48 @@ def main():
         'puddle_surprise': create_puddle_surprise_test,
     }
     
-    # Adjust expected collision based on backup type
-    # Stopping backup is less safe than lane change in obstacle avoidance scenarios
-    expected_collision_for_stop = {
-        'high_friction': False,     # Stop should work with high friction
-        'low_friction': False,      # Stop might work with low friction (if enough distance)
-        'puddle_surprise': True,    # Stop will definitely fail with puddle surprise
-    }
+    # Expected collision matrix based on (backup_type, num_obstacles)
+    # Key: (backup_type, num_obstacles, test_name) -> expected_collision
+    def get_expected_collision(test_name, backup_type, num_obstacles):
+        """Determine expected collision based on test configuration."""
+        # With 2 obstacles, lane change backup will fail (left lane blocked)
+        if num_obstacles == 2 and backup_type == 'lane_change':
+            return True  # Both lanes blocked - collision expected
+        
+        # With stopping backup
+        if backup_type == 'stop':
+            if test_name == 'puddle_surprise':
+                return True  # Can't stop in time with puddle
+            else:
+                return False  # Should be able to stop with high/low friction
+        
+        # Default: lane change with 1 obstacle
+        if test_name == 'puddle_surprise':
+            return True  # Puddle causes failure
+        return False  # Lane change should work
     
     results = {}
     
     if args.test == 'all':
         print("\n" + "=" * 70)
-        print(f"  RUNNING ALL GATEKEEPER TESTS (backup: {args.backup})")
+        print(f"  RUNNING ALL GATEKEEPER TESTS (backup: {args.backup}, obstacles: {args.obs})")
         print("=" * 70)
         
         for name, create_config in test_configs.items():
             config = create_config()
             config.save_animation = args.save
             config.backup_type = args.backup
-            # Update expected collision based on backup type
-            if args.backup == 'stop':
-                config.expected_collision = expected_collision_for_stop[name]
-            # Update name to include backup type
-            config.name = f"{config.name} ({args.backup})"
+            config.num_obstacles = args.obs
+            # Update expected collision based on configuration
+            config.expected_collision = get_expected_collision(name, args.backup, args.obs)
+            # Update name to include backup type and obstacle count
+            config.name = f"{config.name} ({args.backup}, {args.obs} obs)"
             results[name] = run_test(config)
             input("\nPress Enter to continue to next test...")
         
         # Summary
         print("\n" + "=" * 70)
-        print(f"  TEST SUMMARY (backup: {args.backup})")
+        print(f"  TEST SUMMARY (backup: {args.backup}, obstacles: {args.obs})")
         print("=" * 70)
         for name, result in results.items():
             status = "✓ PASSED" if result['passed'] else "✗ FAILED"
@@ -639,11 +686,11 @@ def main():
         config = test_configs[args.test]()
         config.save_animation = args.save
         config.backup_type = args.backup
-        # Update expected collision based on backup type
-        if args.backup == 'stop':
-            config.expected_collision = expected_collision_for_stop[args.test]
-        # Update name to include backup type
-        config.name = f"{config.name} ({args.backup})"
+        config.num_obstacles = args.obs
+        # Update expected collision based on configuration
+        config.expected_collision = get_expected_collision(args.test, args.backup, args.obs)
+        # Update name to include backup type and obstacle count
+        config.name = f"{config.name} ({args.backup}, {args.obs} obs)"
         results[args.test] = run_test(config)
     
     return results
