@@ -24,28 +24,33 @@ class DriftingEnv:
     configurable dimensions. Boundaries are computed for collision checking.
     """
     
-    def __init__(self, track_type='straight', track_width=8.0, track_length=100.0):
+    def __init__(self, track_type='straight', track_width=8.0, track_length=100.0, num_lanes=1):
         """
         Initialize the drifting environment.
         
         Args:
             track_type: Type of track ('straight', 'oval', 'l_shape')
-            track_width: Width of the track in meters
+            track_width: Width of the track in meters (total width for all lanes)
             track_length: Length of the track in meters
+            num_lanes: Number of lanes (default 1, use 5 for multi-lane)
         """
         self.track_type = track_type
         self.track_width = track_width
         self.track_length = track_length
+        self.num_lanes = num_lanes
+        self.lane_width = track_width / num_lanes if num_lanes > 1 else track_width
         
         # Generate track boundaries
         self.left_boundary = None
         self.right_boundary = None
         self.centerline = None
+        self.lane_centers = []  # Y-positions of lane centers
         
         self._generate_track()
         
         # Colors for visualization (similar to MATLAB style)
         self.road_color = np.array([150, 150, 150]) / 255  # Gray asphalt
+        self.shoulder_color = np.array([100, 100, 100]) / 255  # Darker gray for outer lanes
         self.grass_color = np.array([100, 180, 100]) / 255  # Green grass
         self.line_color = 'white'
         self.center_line_color = 'yellow'
@@ -53,9 +58,11 @@ class DriftingEnv:
         # Plot handles
         self.ax = None
         self.road_patch = None
+        self.lane_patches = []  # Patches for individual lanes
         self.left_boundary_line = None
         self.right_boundary_line = None
         self.center_line = None
+        self.lane_lines = []  # Lane divider lines
         
         # Puddles on the road (list of dicts with 'x', 'y', 'radius', 'friction')
         self.puddles = []
@@ -77,7 +84,7 @@ class DriftingEnv:
             raise ValueError(f"Unknown track type: {self.track_type}")
     
     def _generate_straight_track(self):
-        """Generate a straight track."""
+        """Generate a straight track with optional multiple lanes."""
         # Centerline points
         n_points = 100
         x = np.linspace(0, self.track_length, n_points)
@@ -90,11 +97,40 @@ class DriftingEnv:
         self.left_boundary = np.column_stack([x, y + half_width])
         self.right_boundary = np.column_stack([x, y - half_width])
         
+        # Calculate lane centers (from left to right, i.e., top to bottom in plot)
+        # Lane 0 is leftmost (top), Lane num_lanes-1 is rightmost (bottom)
+        self.lane_centers = []
+        if self.num_lanes > 1:
+            for i in range(self.num_lanes):
+                # Lane center Y position
+                lane_y = half_width - (i + 0.5) * self.lane_width
+                self.lane_centers.append(lane_y)
+        else:
+            self.lane_centers = [0.0]  # Single lane at center
+        
         # Track bounds for plotting
         self.x_min = -5
         self.x_max = self.track_length + 5
         self.y_min = -self.track_width - 5
         self.y_max = self.track_width + 5
+    
+    def get_lane_center(self, lane_idx):
+        """
+        Get the Y-position of a lane center.
+        
+        Args:
+            lane_idx: Lane index (0 = leftmost/top, num_lanes-1 = rightmost/bottom)
+            
+        Returns:
+            float: Y-coordinate of the lane center
+        """
+        if lane_idx < 0 or lane_idx >= len(self.lane_centers):
+            raise ValueError(f"Invalid lane index {lane_idx}. Must be 0 to {len(self.lane_centers)-1}")
+        return self.lane_centers[lane_idx]
+    
+    def get_middle_lane_idx(self):
+        """Get the index of the middle lane."""
+        return self.num_lanes // 2
         
     def _generate_oval_track(self):
         """Generate an oval track with gentler curves."""
@@ -201,12 +237,16 @@ class DriftingEnv:
         # Draw grass background
         ax.set_facecolor(self.grass_color)
         
-        # Draw road surface
-        road_vertices = np.vstack([self.left_boundary, self.right_boundary[::-1]])
-        road_polygon = MplPolygon(road_vertices, closed=True, 
-                                   facecolor=self.road_color, edgecolor='none')
-        ax.add_patch(road_polygon)
-        self.road_patch = road_polygon
+        # Draw road surface with multiple lanes if applicable
+        if self.num_lanes > 1 and self.track_type == 'straight':
+            self._draw_multi_lane_road(ax)
+        else:
+            # Single lane road
+            road_vertices = np.vstack([self.left_boundary, self.right_boundary[::-1]])
+            road_polygon = MplPolygon(road_vertices, closed=True, 
+                                       facecolor=self.road_color, edgecolor='none')
+            ax.add_patch(road_polygon)
+            self.road_patch = road_polygon
         
         # Draw boundaries
         self.left_boundary_line, = ax.plot(
@@ -218,11 +258,15 @@ class DriftingEnv:
             color=self.line_color, linewidth=3, solid_capstyle='round'
         )
         
-        # Draw center line (dashed yellow)
-        self.center_line, = ax.plot(
-            self.centerline[:, 0], self.centerline[:, 1],
-            color=self.center_line_color, linewidth=2, linestyle='--'
-        )
+        # Draw lane divider lines for multi-lane roads
+        if self.num_lanes > 1 and self.track_type == 'straight':
+            self._draw_lane_dividers(ax)
+        else:
+            # Draw center line (dashed yellow) for single lane
+            self.center_line, = ax.plot(
+                self.centerline[:, 0], self.centerline[:, 1],
+                color=self.center_line_color, linewidth=2, linestyle='--'
+            )
         
         # Set axis properties
         ax.set_xlim(self.x_min, self.x_max)
@@ -233,6 +277,55 @@ class DriftingEnv:
         ax.grid(True, alpha=0.3)
         
         return ax, fig
+    
+    def _draw_multi_lane_road(self, ax):
+        """Draw multi-lane road with colored outer lanes."""
+        half_width = self.track_width / 2
+        x_start = self.left_boundary[0, 0]
+        x_end = self.left_boundary[-1, 0]
+        
+        self.lane_patches = []
+        
+        for i in range(self.num_lanes):
+            # Lane boundaries (top and bottom of lane)
+            lane_top = half_width - i * self.lane_width
+            lane_bottom = half_width - (i + 1) * self.lane_width
+            
+            # Determine lane color (outer lanes are darker)
+            if i == 0 or i == self.num_lanes - 1:
+                lane_color = self.shoulder_color  # Outer lanes (shoulders)
+            else:
+                lane_color = self.road_color  # Middle lanes
+            
+            # Create lane polygon
+            lane_vertices = np.array([
+                [x_start, lane_top],
+                [x_end, lane_top],
+                [x_end, lane_bottom],
+                [x_start, lane_bottom]
+            ])
+            
+            lane_patch = MplPolygon(lane_vertices, closed=True,
+                                     facecolor=lane_color, edgecolor='none', zorder=1)
+            ax.add_patch(lane_patch)
+            self.lane_patches.append(lane_patch)
+    
+    def _draw_lane_dividers(self, ax):
+        """Draw lane divider lines."""
+        half_width = self.track_width / 2
+        x_start = self.left_boundary[0, 0]
+        x_end = self.left_boundary[-1, 0]
+        
+        self.lane_lines = []
+        
+        for i in range(1, self.num_lanes):
+            # Y position of lane divider
+            divider_y = half_width - i * self.lane_width
+            
+            # Dashed white line for lane dividers
+            line, = ax.plot([x_start, x_end], [divider_y, divider_y],
+                           color='white', linewidth=2, linestyle='--', alpha=0.8, zorder=2)
+            self.lane_lines.append(line)
     
     def check_collision(self, position, robot_radius=0.0):
         """

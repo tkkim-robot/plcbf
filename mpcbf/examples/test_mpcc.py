@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'safe_con
 from mpcbf.envs.drifting_env import DriftingEnv
 from robots.drifting_car import DriftingCar, DriftingCarSimulator
 from position_control.mpcc import MPCC
+from position_control.backup_controller import BackupControllerManager, LaneChangeController
 
 
 def create_robot_spec_high_friction():
@@ -254,62 +255,85 @@ def run_mpcc_oval_track():
 
 
 def run_mpcc_straight_track():
-    """Run MPCC on a longer straight track with obstacles, puddles, and moving frame."""
+    """Run MPCC on a 5-lane straight track with obstacles, puddles, backup controller."""
     print("=" * 60)
-    print("       MPCC Test - Straight Track (Extended Features)")
+    print("       MPCC Test - 5-Lane Track with Backup Controller")
     print("=" * 60)
     
     dt = 0.05
     tf = 60.0  # Longer simulation time for extended track
     
-    # Create longer straight track
+    # Create 5-lane straight track
+    # Total width = 5 lanes * 4m per lane = 20m
+    lane_width = 4.0
+    num_lanes = 5
+    total_width = lane_width * num_lanes
+    
     env = DriftingEnv(
         track_type='straight',
-        track_width=10.0,
-        track_length=300.0  # Much longer track
+        track_width=total_width,
+        track_length=300.0,  # Much longer track
+        num_lanes=num_lanes
     )
     
     plt.ion()
     ax, fig = env.setup_plot()
-    fig.canvas.manager.set_window_title('MPCC - Straight Track with Obstacles & Puddles')
+    fig.canvas.manager.set_window_title('MPCC - 5-Lane Track with Backup Controller')
     
     robot_spec = create_robot_spec_high_friction()
     
+    # Get lane centers
+    print(f"\nTrack configuration: {num_lanes} lanes, {lane_width}m wide each")
+    for i in range(num_lanes):
+        lane_y = env.get_lane_center(i)
+        lane_type = "shoulder" if i == 0 or i == num_lanes - 1 else "driving"
+        print(f"  Lane {i}: y = {lane_y:.1f}m ({lane_type})")
+    
+    # Middle lane index (lane 2 for 5 lanes)
+    middle_lane = env.get_middle_lane_idx()
+    middle_lane_y = env.get_lane_center(middle_lane)
+    left_lane_y = env.get_lane_center(middle_lane - 1)  # Lane to the left
+    
+    print(f"\nRobot starts in middle lane (lane {middle_lane}, y={middle_lane_y:.1f}m)")
+    print(f"Backup controller target: left lane (lane {middle_lane-1}, y={left_lane_y:.1f}m)")
+    
     # Add puddles on the road (low friction areas)
     print("\nAdding puddles to the track...")
-    env.add_puddle(x=50.0, y=0.0, radius=8.0, friction=0.3)
-    env.add_puddle(x=120.0, y=1.5, radius=6.0, friction=0.4)
-    env.add_puddle(x=180.0, y=-1.0, radius=7.0, friction=0.25)
-    print(f"  Puddle 1: x=50, y=0, r=8, μ=0.3")
-    print(f"  Puddle 2: x=120, y=1.5, r=6, μ=0.4")
-    print(f"  Puddle 3: x=180, y=-1, r=7, μ=0.25")
+    env.add_puddle(x=50.0, y=middle_lane_y, radius=8.0, friction=0.3)
+    env.add_puddle(x=150.0, y=left_lane_y, radius=6.0, friction=0.4)
+    env.add_puddle(x=220.0, y=middle_lane_y - 2.0, radius=7.0, friction=0.25)
+    print(f"  Puddle 1: x=50, y={middle_lane_y:.1f}, r=8, μ=0.3")
+    print(f"  Puddle 2: x=150, y={left_lane_y:.1f}, r=6, μ=0.4")
+    print(f"  Puddle 3: x=220, y={middle_lane_y-2:.1f}, r=7, μ=0.25")
     
-    # Add a static obstacle car (parked car on the shoulder of the road)
-    print("\nAdding static obstacle car...")
+    # Add a static obstacle car in the middle lane (blocking!)
+    print("\nAdding static obstacle car in middle lane...")
     obstacle_spec = {
         'body_length': 4.5,
         'body_width': 2.0,
         'a': 1.4,
         'b': 1.4,
-        'radius': 2.5,  # Collision radius (tight fit)
+        'radius': 2.5,  # Collision radius
     }
-    # Place obstacle on the shoulder of the road (outside track but visible)
-    # Robot radius is 1.5, obstacle radius is 2.5, so min safe distance is 4.0m
-    # Track half-width is 5.0m, so y=-4.5 puts obstacle just inside shoulder
-    env.add_obstacle_car(x=80.0, y=-4.2, theta=0.0, robot_spec=obstacle_spec)
-    print(f"  Obstacle car at: x=80, y=-4.2, θ=0° (parked on shoulder)")
+    # Place obstacle in middle lane - robot will need to change lane to avoid it
+    env.add_obstacle_car(x=100.0, y=middle_lane_y, theta=0.0, robot_spec=obstacle_spec)
+    print(f"  Obstacle car at: x=100, y={middle_lane_y:.1f}, θ=0° (blocking middle lane!)")
     
-    # Start at beginning of track, slightly off-center to test correction
-    X0 = np.array([5.0, 1.0, np.deg2rad(3), 0, 0, 8.0, 0, 0])
+    # Start in middle lane
+    X0 = np.array([5.0, middle_lane_y, np.deg2rad(0), 0, 0, 8.0, 0, 0])
     
     print(f"\nInitial state: x={X0[0]:.1f}, y={X0[1]:.1f}, "
           f"theta={np.rad2deg(X0[2]):.1f}°, V={X0[5]:.1f} m/s")
     
     car = DriftingCar(X0, robot_spec, dt, ax)
     
-    # Create MPCC controller
+    # Create MPCC controller - use middle lane as reference
+    # Create a reference path along the middle lane
+    ref_x = env.centerline[:, 0]
+    ref_y = np.full_like(ref_x, middle_lane_y)  # Middle lane y-coordinate
+    
     mpcc = MPCC(car, robot_spec)
-    mpcc.set_reference_path(env.centerline[:, 0], env.centerline[:, 1])
+    mpcc.set_reference_path(ref_x, ref_y)
     mpcc.set_cost_weights(
         Q_c=50.0,       # Contouring error weight
         Q_l=1.0,        # Lag error weight
@@ -321,30 +345,44 @@ def run_mpcc_straight_track():
     )
     mpcc.set_progress_rate(8.0)
     
-    # Full track centerline (faint)
-    ax.plot(env.centerline[:, 0], env.centerline[:, 1],
-            'g-', linewidth=1, alpha=0.3, label='Track centerline')
+    # Create backup controller manager
+    print("\nInitializing backup controller...")
+    backup_manager = BackupControllerManager(robot_spec, dt, ax)
+    backup_manager.create_lane_change_controller(direction='left')
+    backup_manager.set_backup_horizon(80)  # Long horizon to see stabilization
+    print(f"  Backup behavior: left lane change to y={left_lane_y:.1f}m")
+    print(f"  Backup horizon: {backup_manager.backup_horizon} steps ({backup_manager.backup_horizon * dt:.1f}s)")
+    
+    # Reference path along middle lane (faint)
+    ax.plot(ref_x, ref_y, 'g-', linewidth=1, alpha=0.3, label='Reference path (middle lane)')
+    
+    # Target lane for backup (faint)
+    ax.plot(ref_x, np.full_like(ref_x, left_lane_y), 
+            'orange', linewidth=1, alpha=0.3, linestyle=':', label='Backup target (left lane)')
     
     # Reference horizon
     ref_horizon_line, = ax.plot([], [], 'g-', linewidth=3, alpha=0.8, label='Reference horizon')
     
     # MPC prediction
     mpc_pred_line, = ax.plot([], [], 'r--', linewidth=2, alpha=0.8, label='MPC prediction')
-    ax.legend(loc='upper right')
+    
+    ax.legend(loc='upper right', fontsize=8)
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
     print("\nRunning simulation...")
     print("Features enabled:")
+    print("  - 5-lane track with colored shoulders")
     print("  - Moving plot frame following the robot")
     print("  - Velocity indicator bar (above car, left)")
     print("  - Friction indicator bar (above car, right)")
     print("  - Puddles change robot friction dynamically")
     print("  - Obstacle collision detection")
+    print("  - Backup controller trajectory (orange line)")
     print()
     
     num_steps = int(tf / dt)
-    window_size = (50, 25)  # View window size for moving frame
+    window_size = (60, 30)  # View window size for moving frame (wider for 5 lanes)
     
     # Track friction changes for logging
     last_friction = robot_spec['mu']
@@ -380,6 +418,16 @@ def run_mpcc_straight_track():
         pred_states, _ = mpcc.get_predictions()
         if pred_states is not None:
             mpc_pred_line.set_data(pred_states[0, :], pred_states[1, :])
+        
+        # Simulate and visualize backup trajectory
+        # Use current friction for backup simulation (as specified)
+        backup_traj = backup_manager.simulate_backup(
+            'lane_change_left', 
+            state, 
+            left_lane_y,
+            friction=car.get_friction()  # Use current friction
+        )
+        backup_manager.update_visualization(backup_traj)
         
         # Update plot frame to follow the robot
         env.update_plot_frame(ax, pos, window_size=window_size)
