@@ -11,6 +11,8 @@
 results/
 wandb/
 uv.lock
+.DS_Store
+/output/
 
 *.png
 *.svg

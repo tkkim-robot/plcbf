@@ -34,6 +34,7 @@ from robots.drifting_car import DriftingCar, DriftingCarSimulator
 from position_control.mpcc import MPCC
 from position_control.backup_controller import LaneChangeController
 from shielding.gatekeeper import Gatekeeper
+from utils.animation import AnimationSaver
 
 
 # =============================================================================
@@ -146,6 +147,7 @@ class TestConfig:
     obstacle: ObstacleConfig
     puddles: list  # List of PuddleConfig
     expected_collision: bool = False  # Whether collision is expected
+    save_animation: bool = False  # Whether to save animation as video
 
 
 # =============================================================================
@@ -303,6 +305,8 @@ def run_simulation(
     ref_horizon_line,
     mpc_pred_line,
     ax: plt.Axes,
+    fig: plt.Figure,
+    animation_saver: Optional[AnimationSaver] = None,
 ) -> Dict[str, Any]:
     """Run the simulation loop and return results."""
     sim = config.simulation
@@ -370,6 +374,10 @@ def run_simulation(
         env.update_plot_frame(ax, pos, window_size=window_size)
         simulator.draw_plot(pause=0.001)
         
+        # Save animation frame
+        if animation_saver is not None:
+            animation_saver.save_frame(fig)
+        
         # Status output
         if step % 50 == 0:
             V = car.get_velocity()
@@ -384,6 +392,8 @@ def run_simulation(
             collision_type = getattr(simulator, 'collision_type', 'unknown')
             print(f"\n*** COLLISION ({collision_type}) at step {step} ***")
             print(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})")
+            if animation_saver is not None:
+                animation_saver.save_frame(fig, force=True)
             plt.pause(2.0)
             break
         
@@ -425,6 +435,15 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
+    # Setup animation saver if enabled
+    animation_saver = None
+    if config.save_animation:
+        # Create unique output directory for this test
+        safe_name = config.name.lower().replace(' ', '_')
+        output_dir = f"output/animations/{safe_name}"
+        animation_saver = AnimationSaver(output_dir=output_dir, save_per_frame=2, fps=30)
+        print(f"\n  Animation saving enabled -> {output_dir}/")
+    
     # Print configuration
     print(f"\nConfiguration:")
     print(f"  Friction: μ = {config.vehicle.mu}")
@@ -435,8 +454,12 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     # Run simulation
     results = run_simulation(
         config, car, env, mpcc, gatekeeper, simulator,
-        ref_horizon_line, mpc_pred_line, ax
+        ref_horizon_line, mpc_pred_line, ax, fig, animation_saver
     )
+    
+    # Export video if animation was saved
+    if animation_saver is not None:
+        animation_saver.export_video(output_name=f"{config.name.lower().replace(' ', '_')}.mp4")
     
     # Print results
     print("\n" + "-" * 50)
@@ -528,6 +551,8 @@ def main():
     parser.add_argument('--test', type=str, default='high_friction',
                         choices=['high_friction', 'low_friction', 'puddle_surprise', 'all'],
                         help='Which test to run')
+    parser.add_argument('--save', action='store_true',
+                        help='Save animation as video')
     
     args = parser.parse_args()
     
@@ -546,6 +571,7 @@ def main():
         
         for name, create_config in test_configs.items():
             config = create_config()
+            config.save_animation = args.save
             results[name] = run_test(config)
             input("\nPress Enter to continue to next test...")
         
@@ -564,6 +590,7 @@ def main():
         print("=" * 70)
     else:
         config = test_configs[args.test]()
+        config.save_animation = args.save
         results[args.test] = run_test(config)
     
     return results

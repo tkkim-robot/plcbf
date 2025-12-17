@@ -168,6 +168,9 @@ class DriftingEnv:
         self.y_min = -b - self.track_width - 5
         self.y_max = b + self.track_width + 5
         
+        # Lane centers (for oval, just use centerline - no multi-lane support)
+        self.lane_centers = [0.0]
+        
     def _generate_l_shape_track(self):
         """Generate an L-shaped track."""
         half_width = self.track_width / 2
@@ -214,6 +217,9 @@ class DriftingEnv:
         self.x_max = seg1_length + 2 * corner_radius + 5
         self.y_min = -self.track_width - 5
         self.y_max = corner_radius + seg2_length + 5
+        
+        # Lane centers (for L-shape, just use centerline - no multi-lane support)
+        self.lane_centers = [0.0]
     
     def setup_plot(self, ax=None, fig=None):
         """
