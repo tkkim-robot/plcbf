@@ -407,12 +407,24 @@ class MPCBF(PCBF):
             constraint_value = Lf_V + Lg_V @ u_nom + self.cbf_alpha * V
             constraint_dict[name] = float(constraint_value)
         
-        # Get backup policies (exclude mpcc which has short horizon)
-        backup_policies = [k for k in constraint_dict.keys() if k != 'mpcc']
+        # Get all policies including mpcc
+        backup_policies = list(constraint_dict.keys())
         
-        # Select policy with maximum constraint value among backups
-        # (MPCC is short-horizon so we don't trust it for safety decisions)
-        best_policy = max(backup_policies, key=lambda k: constraint_dict[k])
+        # Filter for safe policies (V > 0)
+        # Prioritize policies that are currently safe over those that are already in collision.
+        # This prevents switching to a "less violating" unsafe policy when a safe policy exists.
+        safe_policies = [k for k in backup_policies if V_dict[k] > 0.0]
+        
+        if len(safe_policies) > 0:
+            candidates = safe_policies
+            # Among safe policies, select the one with MAXIMUM SAFETY MARGIN (V).
+            # This ensures we pick the most robust backup plan, even if it requires
+            # more aggressive control intervention (lower constraint value).
+            best_policy = max(candidates, key=lambda k: V_dict[k])
+        else:
+            candidates = backup_policies
+            # If all are unsafe, pick the one that violates constraint least (damage mitigation)
+            best_policy = max(candidates, key=lambda k: constraint_dict[k])
         
         return best_policy, constraint_dict
     
@@ -513,6 +525,16 @@ class MPCBF(PCBF):
             print(f"  [MPCBF] CBF(u_nom): {c_str} -> best={best_policy}")
         
         self.curr_step += 1
+        
+        # PCBF Threshold Check:
+        # If the best backup policy provides sufficient safety margin (V > threshold),
+        # we can skip the strict CBF constraint and allow nominal control.
+        # This prevents unnecessary braking when far from obstacles.
+        v_threshold = 2.0
+        if V_best > v_threshold:
+            self.status = 'safe'
+            self._update_multi_visualization(traj_dict, best_policy)
+            return u_nom.reshape(-1, 1)
         
         # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.

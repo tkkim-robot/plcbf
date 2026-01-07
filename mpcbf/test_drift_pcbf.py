@@ -717,6 +717,33 @@ def create_puddle_surprise_test() -> TestConfig:
     )
 
 
+def create_straight_safe_test() -> TestConfig:
+    """Test Case 4: Straight safe - obstacle in left and right lanes, middle is safe."""
+    # Get middle, left, right lane positions
+    track = TrackConfig()
+    half_width = track.lane_width * track.num_lanes / 2
+    middle_lane_y = half_width - (track.num_lanes // 2 + 0.5) * track.lane_width
+    left_lane_y = middle_lane_y + track.lane_width
+    right_lane_y = middle_lane_y - track.lane_width
+    
+    return TestConfig(
+        name="Straight Safe",
+        description="Obstacles in left and right lanes. Middle lane is safe. Algorithm should go straight.",
+        track=track,
+        vehicle=VehicleConfig(mu=1.0),
+        simulation=SimulationConfig(),
+        obstacles=[
+            ObstacleConfig(x=80.0, y=right_lane_y),  # Right lane (moved from middle)
+            ObstacleConfig(x=85.0, y=left_lane_y),   # Left lane
+        ],
+        puddles=[
+            # Same puddle as surprise test
+            PuddleConfig(x=70.0, y=middle_lane_y, radius=15.0, friction=0.25),
+        ],
+        expected_collision=False,  # Should be safe going straight
+    )
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -726,7 +753,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/PCBF)')
     parser.add_argument('--test', type=str, default='high_friction',
-                        choices=['high_friction', 'low_friction', 'puddle_surprise', 'all'],
+                        choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'all'],
                         help='Which test to run')
     parser.add_argument('--algo', type=str, default='pcbf',
                         choices=ALGO_TYPES,
@@ -749,12 +776,24 @@ def main():
         'high_friction': create_high_friction_test,
         'low_friction': create_low_friction_test,
         'puddle_surprise': create_puddle_surprise_test,
+        'straight_safe': create_straight_safe_test,
     }
     
     # Expected collision matrix based on (backup_type, num_obstacles)
     # Key: (backup_type, num_obstacles, test_name) -> expected_collision
     def get_expected_collision(test_name, backup_type, num_obstacles, algo_type='pcbf'):
         """Determine expected collision based on test configuration."""
+        # For straight_safe test, all algorithms should be safe if they pick straight
+        if test_name == 'straight_safe':
+            if algo_type == 'mpcbf':
+                 return False # MPCC policy should be selected
+            # For PCBF with lane change, it might fail if forced to change lane
+            # into an obstacle. But our logic handles obstacles via CBF.
+            # PCBF single backup will try to lane change.
+            if backup_type == 'lane_change_left': return True # Hit left obstacle
+            if backup_type == 'lane_change_right': return True # Hit right obstacle
+            return False # Stop backup might work?
+
         # MPCBF has multiple policies - generally safer
         # It will pick the best policy (max V) among: left, right, stop, mpcc
         if algo_type == 'mpcbf':
