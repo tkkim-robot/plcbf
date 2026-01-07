@@ -423,16 +423,15 @@ class StoppingControllerJAX:
         tau = state[7]
         
         # ===== Braking control =====
-        # Smooth transition between braking and holding using JAX-compatible ops
-        tau_braking = -self.Kp_v * V
-        tau_braking = jnp.minimum(tau_braking, -500.0)  # At least -500 Nm when moving
+        # Smooth braking policy - linear in velocity with saturation
+        # This is differentiable (unlike sign()-based controllers)
+        tau_braking = -self.Kp_v * V + self.holding_torque
+        tau_des = jnp.clip(tau_braking, -self.tau_max, self.tau_max)
         
-        tau_des = jnp.where(V > self.stop_velocity_threshold, tau_braking, self.holding_torque)
-        tau_des = jnp.clip(tau_des, -self.tau_max, self.tau_max)
-        
-        # Torque rate - fast response for emergency braking
+        # Torque rate - smooth proportional control
+        # Use lower gain to avoid gradient explosion in PCBF
         tau_error = tau_des - tau
-        tau_dot = 5000.0 * jnp.sign(tau_error) * jnp.minimum(jnp.abs(tau_error) / 50.0, 1.0)
+        tau_dot = 2.0 * tau_error  # Lower gain for stable gradients
         tau_dot = jnp.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
         
         # ===== Steering control =====
@@ -643,7 +642,9 @@ def _rollout_trajectory(
             tau_des = jnp.clip(tau_des, -tau_max, tau_max)
             
             tau_error = tau_des - tau
-            tau_dot = 2000.0 * jnp.sign(tau_error) * jnp.minimum(jnp.abs(tau_error), 1.0)
+            # Smooth proportional control (avoids sign() which has zero gradient)
+            # Use lower gain to avoid gradient explosion in PCBF
+            tau_dot = 2.0 * tau_error
             tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
             
             return jnp.array([delta_dot, tau_dot])
@@ -663,13 +664,17 @@ def _rollout_trajectory(
             delta = state[6]
             tau = state[7]
             
-            tau_braking = -Kp_v * V
-            tau_braking = jnp.minimum(tau_braking, -500.0)
-            tau_des = jnp.where(V > stop_threshold, tau_braking, holding_torque)
-            tau_des = jnp.clip(tau_des, -tau_max, tau_max)
+            # Smooth braking policy - linear in velocity with saturation
+            # At V=10, tau_des = -10000 (saturates to -tau_max)
+            # At V=0, tau_des = holding_torque
+            tau_braking = -Kp_v * V + holding_torque
+            tau_des = jnp.clip(tau_braking, -tau_max, tau_max)
             
+            # Smooth tau_dot controller - linear proportional control
+            # (avoids sign() which has zero gradient)
+            # Use lower gain to avoid gradient explosion
             tau_error = tau_des - tau
-            tau_dot = 5000.0 * jnp.sign(tau_error) * jnp.minimum(jnp.abs(tau_error) / 50.0, 1.0)
+            tau_dot = 2.0 * tau_error  # Lower gain for stable gradients
             tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
             
             delta_des = -Kd_theta * r
@@ -885,6 +890,9 @@ class PCBF:
         self.dt = dt
         self.backup_horizon = backup_horizon
         self.backup_horizon_steps = int(backup_horizon / dt)
+        # Shorter horizon for stopping (3 seconds) - keeps gradients well-conditioned
+        self.stop_backup_horizon = 3.0
+        self.stop_backup_horizon_steps = int(self.stop_backup_horizon / dt)
         self.cbf_alpha = cbf_alpha
         self.ax = ax
         
@@ -1109,6 +1117,14 @@ class PCBF:
                 static_argnums=(4, 5)
             )
         
+        # Use shorter horizon for stopping backup to get well-conditioned gradients
+        # The stopping dynamics are very sensitive to velocity, so a shorter horizon
+        # prevents gradient explosion while still capturing the braking behavior
+        if self.policy_type == 'stop':
+            horizon_steps = self.stop_backup_horizon_steps
+        else:
+            horizon_steps = self.backup_horizon_steps
+        
         # Call JIT-compiled functions
         V, grad_V = self._jit_value_and_grad(
             x0_jax,
@@ -1116,20 +1132,20 @@ class PCBF:
             self.policy_params,
             obstacles_array,
             self.policy_type,
-            self.backup_horizon_steps,
+            horizon_steps,
             robot_radius,
             self.current_friction,
             self.dt
         )
         
-        # Get trajectory for visualization
+        # Get trajectory for visualization (use full horizon for better viz)
         _, trajectory = self._jit_value_fn(
             x0_jax,
             self.dynamics_params,
             self.policy_params,
             obstacles_array,
             self.policy_type,
-            self.backup_horizon_steps,
+            self.backup_horizon_steps,  # Full horizon for visualization
             robot_radius,
             self.current_friction,
             self.dt
@@ -1285,22 +1301,24 @@ class PCBF:
         # Check gradient magnitude and value function
         grad_norm = np.linalg.norm(grad_V)
         
-        # If V is very positive (> 2.0), the backup trajectory is well within safe region
-        # No need to enforce CBF constraint - use nominal
-        if V > 2.0:
+        # Determine thresholds based on backup policy type
+        if self.policy_type == 'stop':
+            # For stopping backup: use normal CBF-QP but with appropriate thresholds
+            v_threshold = 5.0  # Activate when backup trajectory gets close
+            max_grad_norm = 50.0
+        else:
+            # For lane change: normal CBF-QP approach
+            v_threshold = 2.0
+            max_grad_norm = 50.0
+        
+        # If V is above threshold, backup trajectory is safe - use nominal
+        if V > v_threshold:
             self.status = 'safe'
             self._update_visualization(trajectory)
             return u_nom.reshape(-1, 1)
         
-        # If gradient is very large (>1000), the minimum is far in the future
-        # and the gradient direction may be unstable - skip CBF
-        if grad_norm > 1000.0:
-            self.status = 'safe_grad'
-            self._update_visualization(trajectory)
-            return u_nom.reshape(-1, 1)
-        
-        # Clip gradient if large (>50) to improve stability
-        max_grad_norm = 50.0
+        # Normalize gradient to max_grad_norm
+        # This keeps the gradient direction but controls magnitude
         if grad_norm > max_grad_norm:
             grad_V = grad_V * (max_grad_norm / grad_norm)
         
