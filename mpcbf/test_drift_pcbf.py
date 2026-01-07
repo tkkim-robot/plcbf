@@ -89,7 +89,7 @@ ALGO_TYPES = ['gatekeeper', 'mps', 'pcbf']
 # Backup Controller Types
 # =============================================================================
 
-BACKUP_TYPES = ['lane_change', 'stop']
+BACKUP_TYPES = ['lane_change', 'lane_change_left', 'lane_change_right', 'stop']
 
 
 # =============================================================================
@@ -241,7 +241,8 @@ def setup_vehicle(config: TestConfig, env: DriftingEnv, ax: plt.Axes) -> Tuple[D
     """Setup the vehicle and get lane positions."""
     middle_lane = env.get_middle_lane_idx()
     middle_lane_y = env.get_lane_center(middle_lane)
-    left_lane_y = env.get_lane_center(middle_lane - 1)
+    left_lane_y = env.get_lane_center(middle_lane - 1)  # Positive y (above middle)
+    right_lane_y = env.get_lane_center(middle_lane + 1)  # Negative y (below middle)
     
     # Initial state in middle lane
     X0 = np.array([
@@ -256,7 +257,7 @@ def setup_vehicle(config: TestConfig, env: DriftingEnv, ax: plt.Axes) -> Tuple[D
     robot_spec = config.vehicle.to_dict()
     car = DriftingCar(X0, robot_spec, config.simulation.dt, ax)
     
-    return car, X0, middle_lane_y, left_lane_y
+    return car, X0, middle_lane_y, left_lane_y, right_lane_y
 
 
 def setup_controllers(
@@ -265,6 +266,7 @@ def setup_controllers(
     env: DriftingEnv,
     middle_lane_y: float,
     left_lane_y: float,
+    right_lane_y: float,
     ax: plt.Axes
 ) -> Tuple[MPCC, Union[Gatekeeper, MPS, PCBF]]:
     """Setup MPCC and shielding controller (Gatekeeper, MPS, or PCBF)."""
@@ -295,12 +297,26 @@ def setup_controllers(
         backup_controller = StoppingController(car.robot_spec, sim.dt)
         backup_target = None  # Stopping doesn't need a target
         print(f"  Using STOPPING backup controller")
-    else:  # 'lane_change' (default)
-        backup_controller = LaneChangeController(car.robot_spec, sim.dt, direction='left')
-        # Target y needs to be above collision boundary (obs_y=0 + combined_radius=4.0)
-        # Use 5.0 to provide safety margin above the 4.0 boundary
-        backup_target = max(left_lane_y, 5.0)  # At least 5.0 to clear obstacle
-        print(f"  Using LANE CHANGE backup controller (target y={backup_target:.2f})")
+    else:  # lane_change variants
+        # Determine direction based on backup type
+        if config.backup_type == 'lane_change_left':
+            direction = 'left'
+            backup_target = max(left_lane_y, 5.0)  # At least 5.0 to clear obstacle
+        elif config.backup_type == 'lane_change_right':
+            direction = 'right'
+            backup_target = min(right_lane_y, -5.0)  # At least -5.0 to clear obstacle
+        else:  # 'lane_change' - auto-select based on number of obstacles
+            # With 2 obstacles (middle lane + left lane), go right
+            # With 1 obstacle (middle lane only), go left
+            if config.num_obstacles >= 2:
+                direction = 'right'
+                backup_target = min(right_lane_y, -5.0)
+            else:
+                direction = 'left'
+                backup_target = max(left_lane_y, 5.0)
+        
+        backup_controller = LaneChangeController(car.robot_spec, sim.dt, direction=direction)
+        print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
     if config.algo_type == 'pcbf':
@@ -344,7 +360,8 @@ def setup_obstacles_and_puddles(
     config: TestConfig, 
     env: DriftingEnv, 
     middle_lane_y: float,
-    left_lane_y: float
+    left_lane_y: float,
+    right_lane_y: float
 ):
     """Add obstacles and puddles to the environment."""
     # Add obstacles (up to num_obstacles)
@@ -375,7 +392,8 @@ def setup_visualization(
     ax: plt.Axes, 
     env: DriftingEnv, 
     middle_lane_y: float, 
-    left_lane_y: float
+    left_lane_y: float,
+    right_lane_y: float
 ) -> Tuple:
     """Setup visualization elements."""
     ref_x = env.centerline[:, 0]
@@ -547,10 +565,10 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     
     # Setup
     env, ax, fig = setup_environment(config)
-    car, X0, middle_lane_y, left_lane_y = setup_vehicle(config, env, ax)
-    mpcc, shielding = setup_controllers(config, car, env, middle_lane_y, left_lane_y, ax)
-    setup_obstacles_and_puddles(config, env, middle_lane_y, left_lane_y)
-    ref_horizon_line, mpc_pred_line = setup_visualization(ax, env, middle_lane_y, left_lane_y)
+    car, X0, middle_lane_y, left_lane_y, right_lane_y = setup_vehicle(config, env, ax)
+    mpcc, shielding = setup_controllers(config, car, env, middle_lane_y, left_lane_y, right_lane_y, ax)
+    setup_obstacles_and_puddles(config, env, middle_lane_y, left_lane_y, right_lane_y)
+    ref_horizon_line, mpc_pred_line = setup_visualization(ax, env, middle_lane_y, left_lane_y, right_lane_y)
     
     simulator = DriftingCarSimulator(car, env, show_animation=True)
     
@@ -708,10 +726,6 @@ def main():
     # Key: (backup_type, num_obstacles, test_name) -> expected_collision
     def get_expected_collision(test_name, backup_type, num_obstacles):
         """Determine expected collision based on test configuration."""
-        # With 2 obstacles, lane change backup will fail (left lane blocked)
-        if num_obstacles == 2 and backup_type == 'lane_change':
-            return True  # Both lanes blocked - collision expected
-        
         # With stopping backup
         if backup_type == 'stop':
             if test_name == 'puddle_surprise':
@@ -719,10 +733,25 @@ def main():
             else:
                 return False  # Should be able to stop with high/low friction
         
-        # Default: lane change with 1 obstacle
+        # Lane change backup variants:
+        if backup_type == 'lane_change_left':
+            # Left lane change fails with 2 obstacles (left lane is blocked)
+            if num_obstacles >= 2:
+                return True  # Left lane blocked by 2nd obstacle
+            if test_name == 'puddle_surprise':
+                return True  # Puddle causes failure
+            return False
+        
+        if backup_type == 'lane_change_right':
+            # Right lane change works even with 2 obstacles (2nd obs is in left lane)
+            if test_name == 'puddle_surprise':
+                return True  # Puddle causes failure
+            return False
+        
+        # 'lane_change' (auto-select): always works since it picks the right direction
         if test_name == 'puddle_surprise':
-            return True  # Puddle causes failure
-        return False  # Lane change should work
+            return True  # Puddle causes failure even with lane change
+        return False  # Auto lane change should work for any number of obstacles
     
     results = {}
     
