@@ -74,15 +74,16 @@ from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
-# Import PCBF from mpcbf
+# Import PCBF and MPCBF from mpcbf
 from mpcbf.pcbf import PCBF
+from mpcbf.mpcbf import MPCBF
 
 
 # =============================================================================
 # Algorithm Types
 # =============================================================================
 
-ALGO_TYPES = ['gatekeeper', 'mps', 'pcbf']
+ALGO_TYPES = ['gatekeeper', 'mps', 'pcbf', 'mpcbf']
 
 
 # =============================================================================
@@ -268,8 +269,8 @@ def setup_controllers(
     left_lane_y: float,
     right_lane_y: float,
     ax: plt.Axes
-) -> Tuple[MPCC, Union[Gatekeeper, MPS, PCBF]]:
-    """Setup MPCC and shielding controller (Gatekeeper, MPS, or PCBF)."""
+) -> Tuple[MPCC, Union[Gatekeeper, MPS, PCBF, MPCBF]]:
+    """Setup MPCC and shielding controller (Gatekeeper, MPS, PCBF, or MPCBF)."""
     sim = config.simulation
     robot_spec = config.vehicle.to_dict()
     
@@ -319,7 +320,21 @@ def setup_controllers(
         print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
-    if config.algo_type == 'pcbf':
+    if config.algo_type == 'mpcbf':
+        # MPCBF uses multiple policies internally (left/right lane change + stop)
+        shielding = MPCBF(
+            robot=car,
+            robot_spec=car.robot_spec,
+            dt=sim.dt,
+            backup_horizon=sim.backup_horizon_time,
+            cbf_alpha=sim.pcbf_alpha,
+            left_lane_y=max(left_lane_y, 5.0),
+            right_lane_y=min(right_lane_y, -5.0),
+            ax=ax
+        )
+        print(f"  Using MPCBF algorithm (multi-policy CBF-QP)")
+        print(f"    Policies: lane_change_left (y={left_lane_y:.1f}), lane_change_right (y={right_lane_y:.1f}), mpcc")
+    elif config.algo_type == 'pcbf':
         shielding = PCBF(
             robot=car,
             robot_spec=car.robot_spec,
@@ -350,7 +365,9 @@ def setup_controllers(
         )
         print(f"  Using GATEKEEPER algorithm (backward search)")
     
-    shielding.set_backup_controller(backup_controller, target=backup_target)
+    # Set backup controller (not needed for MPCBF which has built-in multi-policy)
+    if not isinstance(shielding, MPCBF):
+        shielding.set_backup_controller(backup_controller, target=backup_target)
     shielding.set_environment(env)
     
     return mpcc, shielding
@@ -454,8 +471,8 @@ def run_simulation(
         current_friction = env.get_friction_at_position(pos, default_friction=robot_spec['mu'])
         if abs(current_friction - car.get_friction()) > 0.01:
             car.set_friction(current_friction)
-            # Also update PCBF's friction if using PCBF
-            if isinstance(shielding, PCBF):
+            # Also update PCBF/MPCBF's friction
+            if isinstance(shielding, (PCBF, MPCBF)):
                 shielding.set_friction(current_friction)
             if abs(current_friction - last_friction) > 0.01:
                 if current_friction < robot_spec['mu']:
@@ -479,7 +496,16 @@ def run_simulation(
             pred_states, pred_controls = None, None
         
         # Shielding validates and returns committed control
-        if isinstance(shielding, PCBF):
+        if isinstance(shielding, MPCBF):
+            # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
+            control_ref = {'u_ref': mpcc_control}
+            U = shielding.solve_control_problem(
+                state, 
+                control_ref=control_ref, 
+                friction=car.get_friction(),
+                mpcc_trajectory=pred_states.T if pred_states is not None else None
+            )
+        elif isinstance(shielding, PCBF):
             # PCBF uses nominal control as reference
             control_ref = {'u_ref': mpcc_control}
             U = shielding.solve_control_problem(state, control_ref=control_ref, friction=car.get_friction())
@@ -516,7 +542,10 @@ def run_simulation(
         if step % 50 == 0:
             V = car.get_velocity()
             status = shielding.get_status()
-            if isinstance(shielding, PCBF):
+            if isinstance(shielding, MPCBF):
+                best = status.get('best_policy', 'unknown')
+                mode = f"MPCBF (status={status['status']}, best={best})"
+            elif isinstance(shielding, PCBF):
                 mode = f"PCBF (status={status['status']})"
             else:
                 mode = "BACKUP" if status['using_backup'] else "NOMINAL"
@@ -724,8 +753,17 @@ def main():
     
     # Expected collision matrix based on (backup_type, num_obstacles)
     # Key: (backup_type, num_obstacles, test_name) -> expected_collision
-    def get_expected_collision(test_name, backup_type, num_obstacles):
+    def get_expected_collision(test_name, backup_type, num_obstacles, algo_type='pcbf'):
         """Determine expected collision based on test configuration."""
+        # MPCBF has multiple policies - generally safer
+        # It will pick the best policy (max V) among: left, right, stop, mpcc
+        if algo_type == 'mpcbf':
+            # MPCBF should only fail in puddle_surprise 
+            # (all policies fail when friction estimate is wrong)
+            if test_name == 'puddle_surprise':
+                return True  # All policies fail with wrong friction estimate
+            return False  # MPCBF should handle all other cases
+        
         # With stopping backup
         if backup_type == 'stop':
             if test_name == 'puddle_surprise':
@@ -767,7 +805,7 @@ def main():
             config.backup_type = args.backup
             config.num_obstacles = args.obs
             # Update expected collision based on configuration
-            config.expected_collision = get_expected_collision(name, args.backup, args.obs)
+            config.expected_collision = get_expected_collision(name, args.backup, args.obs, args.algo)
             # Update name to include algo, backup type and obstacle count
             config.name = f"{config.name} ({args.algo}, {args.backup}, {args.obs} obs)"
             results[name] = run_test(config)
@@ -793,7 +831,7 @@ def main():
         config.backup_type = args.backup
         config.num_obstacles = args.obs
         # Update expected collision based on configuration
-        config.expected_collision = get_expected_collision(args.test, args.backup, args.obs)
+        config.expected_collision = get_expected_collision(args.test, args.backup, args.obs, args.algo)
         # Update name to include algo, backup type and obstacle count
         config.name = f"{config.name} ({args.algo}, {args.backup}, {args.obs} obs)"
         results[args.test] = run_test(config)
