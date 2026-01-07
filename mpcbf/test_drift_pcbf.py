@@ -90,7 +90,7 @@ ALGO_TYPES = ['gatekeeper', 'mps', 'pcbf', 'mpcbf']
 # Backup Controller Types
 # =============================================================================
 
-BACKUP_TYPES = ['lane_change', 'lane_change_left', 'lane_change_right', 'stop']
+BACKUP_TYPES = ['lane_change', 'lane_change_left', 'lane_change_right', 'lane_change_left_2', 'stop']
 
 
 # =============================================================================
@@ -303,6 +303,13 @@ def setup_controllers(
         if config.backup_type == 'lane_change_left':
             direction = 'left'
             backup_target = max(left_lane_y, 5.0)  # At least 5.0 to clear obstacle
+        elif config.backup_type == 'lane_change_left_2':
+            direction = 'left_2'
+            # Assuming lane width is 4.0, or derived from difference
+            lane_width = abs(left_lane_y - middle_lane_y)
+            # Target is one lane further left than left_lane_y
+            backup_target = left_lane_y + lane_width
+            print(f"  Using LANE CHANGE LEFT 2 (target y={backup_target:.2f})")
         elif config.backup_type == 'lane_change_right':
             direction = 'right'
             backup_target = min(right_lane_y, -5.0)  # At least -5.0 to clear obstacle
@@ -316,7 +323,12 @@ def setup_controllers(
                 direction = 'left'
                 backup_target = max(left_lane_y, 5.0)
         
-        backup_controller = LaneChangeController(car.robot_spec, sim.dt, direction=direction)
+        
+        # For left_2, we use explicit target with 'left' direction controller logic
+        # Ideally the controller class handles 'left' generally if given a target
+        ctrl_direction = 'left' if config.backup_type == 'lane_change_left_2' else direction
+        
+        backup_controller = LaneChangeController(car.robot_spec, sim.dt, direction=ctrl_direction)
         print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
@@ -744,6 +756,28 @@ def create_straight_safe_test() -> TestConfig:
     )
 
 
+def create_far_left_safe_test() -> TestConfig:
+    """Test Case 5: Far Left Safe - obstacle in left lane, middle empty. Target 2nd left lane."""
+    # Increase lanes to 7 so 2nd left lane is valid (inside track boundaries)
+    track = TrackConfig(num_lanes=7)
+    half_width = track.lane_width * track.num_lanes / 2
+    middle_lane_y = half_width - (track.num_lanes // 2 + 0.5) * track.lane_width
+    left_lane_y = middle_lane_y + track.lane_width
+    
+    return TestConfig(
+        name="Far Left Safe",
+        description="Obstacle in left lane. Middle lane empty. Testing ability to reach 2nd left lane.",
+        track=track,
+        vehicle=VehicleConfig(mu=1.0),
+        simulation=SimulationConfig(backup_horizon_time=6.0),  # Longer horizon for double lane change
+        obstacles=[
+            ObstacleConfig(x=80.0, y=left_lane_y, radius=2.2),   # Obstacle in Left Lane (reduced radius to avoid adjacent lane collision)
+        ],
+        puddles=[],
+        expected_collision=False,
+    )
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -753,7 +787,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/PCBF)')
     parser.add_argument('--test', type=str, default='high_friction',
-                        choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'all'],
+                        choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'far_left_safe', 'all'],
                         help='Which test to run')
     parser.add_argument('--algo', type=str, default='pcbf',
                         choices=ALGO_TYPES,
@@ -777,12 +811,23 @@ def main():
         'low_friction': create_low_friction_test,
         'puddle_surprise': create_puddle_surprise_test,
         'straight_safe': create_straight_safe_test,
+        'far_left_safe': create_far_left_safe_test,
     }
     
     # Expected collision matrix based on (backup_type, num_obstacles)
     # Key: (backup_type, num_obstacles, test_name) -> expected_collision
     def get_expected_collision(test_name, backup_type, num_obstacles, algo_type='pcbf'):
         """Determine expected collision based on test configuration."""
+        
+        if test_name == 'far_left_safe':
+            # far_left_safe has obstacle in Left Lane. 
+            # lane_change_left -> Collision (hits obs)
+            # lane_change_left_2 -> Safe (goes past obs)
+            # mpcc -> Safe (middle empty)
+            # lane_change_right -> Safe (right empty)
+            if backup_type == 'lane_change_left': return True
+            return False
+
         # For straight_safe test, all algorithms should be safe if they pick straight
         if test_name == 'straight_safe':
             if algo_type == 'mpcbf':

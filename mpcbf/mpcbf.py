@@ -209,6 +209,24 @@ class MPCBF(PCBF):
                     'theta_des_max': float(np.deg2rad(15)),
                 },
             },
+            'lane_change_left_2': {
+                'type': 'lane_change',
+                'horizon': uniform_horizon,
+                'params': {
+                    'target_y': self.left_lane_y + (abs(self.left_lane_y - self.right_lane_y) / 2.0 if abs(self.left_lane_y - self.right_lane_y) > 1.0 else 4.0),
+                    'Kp_y': 0.15,
+                    'Kp_theta': 1.5,
+                    'Kd_theta': 0.3,
+                    'Kp_delta': 3.0,
+                    'Kp_v': 500.0,
+                    'target_velocity': target_velocity,
+                    'delta_max': delta_max,
+                    'delta_dot_max': delta_dot_max,
+                    'tau_max': tau_max,
+                    'tau_dot_max': tau_dot_max,
+                    'theta_des_max': float(np.deg2rad(15)),
+                },
+            },
             # NOTE: Stopping policy removed for now to focus on lane change behavior
             # Can be re-added later once lane change is verified working
         }
@@ -217,6 +235,7 @@ class MPCBF(PCBF):
         self.jax_policies = {
             'lane_change_left': LaneChangeControllerJAX(self.robot_spec, target_y=self.left_lane_y),
             'lane_change_right': LaneChangeControllerJAX(self.robot_spec, target_y=self.right_lane_y),
+            'lane_change_left_2': LaneChangeControllerJAX(self.robot_spec, target_y=self.left_lane_y + (abs(self.left_lane_y - self.right_lane_y) / 2.0 if abs(self.left_lane_y - self.right_lane_y) > 1.0 else 4.0)),
         }
         
         # Initialize trajectory storage
