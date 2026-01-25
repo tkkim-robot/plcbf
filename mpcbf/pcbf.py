@@ -1293,26 +1293,11 @@ class PCBF:
             self.status = 'error'
             return u_nom.reshape(-1, 1)
         
-        # Check gradient magnitude and value function
+        # Check gradient magnitude for numerical stability
         grad_norm = np.linalg.norm(grad_V)
+        max_grad_norm = 50.0
         
-        # Determine thresholds based on backup policy type
-        if self.policy_type == 'stop':
-            # For stopping backup: use normal CBF-QP but with appropriate thresholds
-            v_threshold = 5.0  # Activate when backup trajectory gets close
-            max_grad_norm = 50.0
-        else:
-            # For lane change: normal CBF-QP approach
-            v_threshold = 2.0
-            max_grad_norm = 50.0
-        
-        # If V is above threshold, backup trajectory is safe - use nominal
-        if V > v_threshold:
-            self.status = 'safe'
-            self._update_visualization(trajectory)
-            return u_nom.reshape(-1, 1)
-        
-        # Normalize gradient to max_grad_norm
+        # Normalize gradient to max_grad_norm if too large
         # This keeps the gradient direction but controls magnitude
         if grad_norm > max_grad_norm:
             grad_V = grad_V * (max_grad_norm / grad_norm)
