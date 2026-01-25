@@ -72,6 +72,7 @@ class LaneChangePolicyParams(NamedTuple):
     Kd_theta: float
     Kp_delta: float
     Kp_v: float
+    Kp_tau_dot: float      # Torque rate gain (smooth control, gradient-safe)
     target_velocity: float
     delta_max: float
     delta_dot_max: float
@@ -85,6 +86,7 @@ class StopPolicyParams(NamedTuple):
     Kd_theta: float
     Kp_delta: float
     Kp_v: float
+    Kp_tau_dot: float      # Torque rate gain (smooth control, gradient-safe)
     delta_max: float
     delta_dot_max: float
     tau_max: float
@@ -355,6 +357,8 @@ class LaneChangeControllerJAX:
     
     This controller steers the vehicle to change to a target lane Y position
     and stabilize there using cascaded PD control.
+    
+    All control laws are smooth and differentiable for gradient computation.
     """
     
     def __init__(self, robot_spec: dict, target_y: float = 4.0):
@@ -366,15 +370,14 @@ class LaneChangeControllerJAX:
         self.target_y = target_y
         
         # Cascaded control gains (tuned for smooth lane change)
-        self.Kp_y = 0.15      # Proportional gain for lateral error -> heading
-        self.Kd_y = 0.8       # Derivative gain
+        self.Kp_y = 0.15          # Proportional gain: lateral error -> heading
+        self.Kp_theta = 1.5       # Proportional gain: heading error -> steering
+        self.Kd_theta = 0.3       # Derivative gain (using yaw rate)
+        self.Kp_delta = 3.0       # Proportional gain: steering error -> steering rate
+        self.Kp_v = 500.0         # Proportional gain: velocity error -> torque
+        self.Kp_tau_dot = 2.0     # Proportional gain: torque error -> torque rate
+                                  # (smooth control, gradient-safe)
         
-        self.Kp_theta = 1.5   # Proportional gain for heading error -> steering
-        self.Kd_theta = 0.3   # Derivative gain (using yaw rate)
-        
-        self.Kp_delta = 3.0   # Proportional gain for steering error -> steering rate
-        
-        self.Kp_v = 500.0     # Proportional gain for velocity tracking
         self.target_velocity = robot_spec.get('v_ref', 8.0)
         
         # Limits
@@ -382,15 +385,36 @@ class LaneChangeControllerJAX:
         self.delta_dot_max = robot_spec.get('delta_dot_max', np.deg2rad(15))
         self.tau_max = robot_spec.get('tau_max', 4000.0)
         self.tau_dot_max = robot_spec.get('tau_dot_max', 8000.0)
-        
         self.theta_des_max = np.deg2rad(15)
     
     def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+        """Compute control (instance method wrapper)."""
+        # Create params tuple from instance attributes
+        params = LaneChangePolicyParams(
+            target_y=self.target_y,
+            Kp_y=self.Kp_y,
+            Kp_theta=self.Kp_theta,
+            Kd_theta=self.Kd_theta,
+            Kp_delta=self.Kp_delta,
+            Kp_v=self.Kp_v,
+            Kp_tau_dot=self.Kp_tau_dot,
+            target_velocity=self.target_velocity,
+            delta_max=self.delta_max,
+            delta_dot_max=self.delta_dot_max,
+            tau_max=self.tau_max,
+            tau_dot_max=self.tau_dot_max,
+            theta_des_max=self.theta_des_max,
+        )
+        return LaneChangeControllerJAX.compute(state, params)
+    
+    @staticmethod
+    def compute(state: jnp.ndarray, params: LaneChangePolicyParams) -> jnp.ndarray:
         """
-        Compute control input for lane change.
+        Compute lane change control input (static method for JIT compatibility).
         
         Args:
             state: JAX array [x, y, theta, r, beta, V, delta, tau] (8,)
+            params: LaneChangePolicyParams NamedTuple
             
         Returns:
             u: JAX array [delta_dot, tau_dot] (2,)
@@ -399,37 +423,34 @@ class LaneChangeControllerJAX:
         y = state[1]
         theta = state[2]
         r = state[3]
-        V = state[5]
+        V = jnp.maximum(state[5], 0.1)  # Minimum velocity for stability
         delta = state[6]
         tau = state[7]
         
-        # Ensure minimum velocity for stability
-        V = jnp.maximum(V, 0.1)
-        
         # ===== Outer loop: Lateral position control =====
-        y_error = self.target_y - y
-        theta_des = jnp.arctan(self.Kp_y * y_error)
-        theta_des = jnp.clip(theta_des, -self.theta_des_max, self.theta_des_max)
+        y_error = params.target_y - y
+        theta_des = jnp.arctan(params.Kp_y * y_error)
+        theta_des = jnp.clip(theta_des, -params.theta_des_max, params.theta_des_max)
         
         # ===== Inner loop: Heading control =====
-        theta_error = angle_normalize_jax(theta_des - theta)
-        delta_des = self.Kp_theta * theta_error - self.Kd_theta * r
-        delta_des = jnp.clip(delta_des, -self.delta_max, self.delta_max)
+        theta_error = jnp.mod(theta_des - theta + jnp.pi, 2 * jnp.pi) - jnp.pi
+        delta_des = params.Kp_theta * theta_error - params.Kd_theta * r
+        delta_des = jnp.clip(delta_des, -params.delta_max, params.delta_max)
         
         # ===== Actuator loop: Steering rate control =====
         delta_error = delta_des - delta
-        delta_dot = self.Kp_delta * delta_error
-        delta_dot = jnp.clip(delta_dot, -self.delta_dot_max, self.delta_dot_max)
+        delta_dot = params.Kp_delta * delta_error
+        delta_dot = jnp.clip(delta_dot, -params.delta_dot_max, params.delta_dot_max)
         
         # ===== Velocity control =====
-        V_error = self.target_velocity - V
-        tau_des = self.Kp_v * V_error
-        tau_des = jnp.clip(tau_des, -self.tau_max, self.tau_max)
+        V_error = params.target_velocity - V
+        tau_des = params.Kp_v * V_error
+        tau_des = jnp.clip(tau_des, -params.tau_max, params.tau_max)
         
-        # Torque rate
+        # ===== Torque rate control (smooth proportional, gradient-safe) =====
         tau_error = tau_des - tau
-        tau_dot = 2000.0 * jnp.sign(tau_error) * jnp.minimum(jnp.abs(tau_error), 1.0)
-        tau_dot = jnp.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
+        tau_dot = params.Kp_tau_dot * tau_error
+        tau_dot = jnp.clip(tau_dot, -params.tau_dot_max, params.tau_dot_max)
         
         return jnp.array([delta_dot, tau_dot])
 
@@ -439,6 +460,8 @@ class StoppingControllerJAX:
     Pure JAX implementation of stopping controller for PCBF.
     
     This controller brings the vehicle to a complete stop.
+    
+    All control laws are smooth and differentiable for gradient computation.
     """
     
     def __init__(self, robot_spec: dict):
@@ -447,11 +470,13 @@ class StoppingControllerJAX:
             robot_spec: Robot specification dictionary
         """
         # Braking control gains
-        self.Kp_v = 1000.0     # Proportional gain for velocity -> torque
+        self.Kp_v = 1000.0         # Proportional gain: velocity -> torque
+        self.Kp_tau_dot = 2.0      # Proportional gain: torque error -> torque rate
+                                   # (smooth control, gradient-safe)
         
         # Steering control gains
-        self.Kd_theta = 0.5    # Derivative gain (yaw rate damping)
-        self.Kp_delta = 3.0    # Proportional gain for steering rate
+        self.Kd_theta = 0.5        # Derivative gain (yaw rate damping)
+        self.Kp_delta = 3.0        # Proportional gain: steering error -> steering rate
         
         # Limits
         self.delta_max = robot_spec.get('delta_max', np.deg2rad(20))
@@ -463,11 +488,29 @@ class StoppingControllerJAX:
         self.holding_torque = -100.0
     
     def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+        """Compute control (instance method wrapper)."""
+        params = StopPolicyParams(
+            Kd_theta=self.Kd_theta,
+            Kp_delta=self.Kp_delta,
+            Kp_v=self.Kp_v,
+            Kp_tau_dot=self.Kp_tau_dot,
+            delta_max=self.delta_max,
+            delta_dot_max=self.delta_dot_max,
+            tau_max=self.tau_max,
+            tau_dot_max=self.tau_dot_max,
+            stop_threshold=self.stop_velocity_threshold,
+            holding_torque=self.holding_torque,
+        )
+        return StoppingControllerJAX.compute(state, params)
+    
+    @staticmethod
+    def compute(state: jnp.ndarray, params: StopPolicyParams) -> jnp.ndarray:
         """
-        Compute control input for stopping.
+        Compute stopping control input (static method for JIT compatibility).
         
         Args:
             state: JAX array [x, y, theta, r, beta, V, delta, tau] (8,)
+            params: StopPolicyParams NamedTuple
             
         Returns:
             u: JAX array [delta_dot, tau_dot] (2,)
@@ -478,25 +521,22 @@ class StoppingControllerJAX:
         delta = state[6]
         tau = state[7]
         
-        # ===== Braking control =====
-        # Smooth braking policy - linear in velocity with saturation
-        # This is differentiable (unlike sign()-based controllers)
-        tau_braking = -self.Kp_v * V + self.holding_torque
-        tau_des = jnp.clip(tau_braking, -self.tau_max, self.tau_max)
+        # ===== Braking control (smooth proportional, gradient-safe) =====
+        tau_braking = -params.Kp_v * V + params.holding_torque
+        tau_des = jnp.clip(tau_braking, -params.tau_max, params.tau_max)
         
-        # Torque rate - smooth proportional control
-        # Use lower gain to avoid gradient explosion in PCBF
+        # ===== Torque rate control =====
         tau_error = tau_des - tau
-        tau_dot = 2.0 * tau_error  # Lower gain for stable gradients
-        tau_dot = jnp.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
+        tau_dot = params.Kp_tau_dot * tau_error
+        tau_dot = jnp.clip(tau_dot, -params.tau_dot_max, params.tau_dot_max)
         
         # ===== Steering control =====
-        delta_des = -self.Kd_theta * r
-        delta_des = jnp.clip(delta_des, -self.delta_max, self.delta_max)
+        delta_des = -params.Kd_theta * r
+        delta_des = jnp.clip(delta_des, -params.delta_max, params.delta_max)
         
         delta_error = delta_des - delta
-        delta_dot = self.Kp_delta * delta_error
-        delta_dot = jnp.clip(delta_dot, -self.delta_dot_max, self.delta_dot_max)
+        delta_dot = params.Kp_delta * delta_error
+        delta_dot = jnp.clip(delta_dot, -params.delta_dot_max, params.delta_dot_max)
         
         return jnp.array([delta_dot, tau_dot])
 
@@ -657,84 +697,12 @@ def _rollout_trajectory(
         
         return jnp.array([x_next, y_next, theta_next, r_next, beta_next, V_next, delta_next, tau_next])
     
-    # Policy function (using NamedTuple attribute access)
+    # Policy function: call the appropriate static controller method
     def policy_fn(state: jnp.ndarray) -> jnp.ndarray:
         if policy_type == 'lane_change':
-            target_y = policy_params.target_y
-            Kp_y = policy_params.Kp_y
-            Kp_theta = policy_params.Kp_theta
-            Kd_theta = policy_params.Kd_theta
-            Kp_delta = policy_params.Kp_delta
-            Kp_v = policy_params.Kp_v
-            target_velocity = policy_params.target_velocity
-            delta_max = policy_params.delta_max
-            delta_dot_max = policy_params.delta_dot_max
-            tau_max = policy_params.tau_max
-            tau_dot_max = policy_params.tau_dot_max
-            theta_des_max = policy_params.theta_des_max
-            
-            y = state[1]
-            theta = state[2]
-            r = state[3]
-            V = jnp.maximum(state[5], 0.1)
-            delta = state[6]
-            tau = state[7]
-            
-            y_error = target_y - y
-            theta_des = jnp.arctan(Kp_y * y_error)
-            theta_des = jnp.clip(theta_des, -theta_des_max, theta_des_max)
-            
-            theta_error = jnp.mod(theta_des - theta + jnp.pi, 2 * jnp.pi) - jnp.pi
-            delta_des = Kp_theta * theta_error - Kd_theta * r
-            delta_des = jnp.clip(delta_des, -delta_max, delta_max)
-            
-            delta_error = delta_des - delta
-            delta_dot = Kp_delta * delta_error
-            delta_dot = jnp.clip(delta_dot, -delta_dot_max, delta_dot_max)
-            
-            V_error = target_velocity - V
-            tau_des = Kp_v * V_error
-            tau_des = jnp.clip(tau_des, -tau_max, tau_max)
-            
-            tau_error = tau_des - tau
-            # Smooth proportional control (avoids sign() which has zero gradient)
-            tau_dot = 2.0 * tau_error
-            tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
-            
-            return jnp.array([delta_dot, tau_dot])
+            return LaneChangeControllerJAX.compute(state, policy_params)
         else:  # stop
-            Kd_theta = policy_params.Kd_theta
-            Kp_delta = policy_params.Kp_delta
-            Kp_v = policy_params.Kp_v
-            delta_max = policy_params.delta_max
-            delta_dot_max = policy_params.delta_dot_max
-            tau_max = policy_params.tau_max
-            tau_dot_max = policy_params.tau_dot_max
-            stop_threshold = policy_params.stop_threshold
-            holding_torque = policy_params.holding_torque
-            
-            r = state[3]
-            V = state[5]
-            delta = state[6]
-            tau = state[7]
-            
-            # Smooth braking policy - linear in velocity with saturation
-            tau_braking = -Kp_v * V + holding_torque
-            tau_des = jnp.clip(tau_braking, -tau_max, tau_max)
-            
-            # Smooth tau_dot controller
-            tau_error = tau_des - tau
-            tau_dot = 2.0 * tau_error
-            tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
-            
-            delta_des = -Kd_theta * r
-            delta_des = jnp.clip(delta_des, -delta_max, delta_max)
-            
-            delta_error = delta_des - delta
-            delta_dot = Kp_delta * delta_error
-            delta_dot = jnp.clip(delta_dot, -delta_dot_max, delta_dot_max)
-            
-            return jnp.array([delta_dot, tau_dot])
+            return StoppingControllerJAX.compute(state, policy_params)
     
     def body_fn(carry, _):
         x = carry
@@ -1045,6 +1013,7 @@ class PCBF:
                 Kd_theta=0.3,
                 Kp_delta=3.0,
                 Kp_v=500.0,
+                Kp_tau_dot=2.0,  # Torque rate gain (smooth control, gradient-safe)
                 target_velocity=float(self.robot_spec.get('v_ref', 8.0)),
                 delta_max=float(self.robot_spec.get('delta_max', np.deg2rad(20))),
                 delta_dot_max=float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
@@ -1059,6 +1028,7 @@ class PCBF:
                 Kd_theta=0.5,
                 Kp_delta=3.0,
                 Kp_v=1000.0,
+                Kp_tau_dot=2.0,  # Torque rate gain (smooth control, gradient-safe)
                 delta_max=float(self.robot_spec.get('delta_max', np.deg2rad(20))),
                 delta_dot_max=float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
                 tau_max=float(self.robot_spec.get('tau_max', 4000.0)),
