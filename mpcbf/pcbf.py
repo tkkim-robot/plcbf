@@ -714,9 +714,7 @@ def _rollout_trajectory(
     return jnp.vstack([x0[None, :], trajectory])
 
 
-# JIT-compiled value function computation
-@partial(jax.jit, static_argnums=(4, 5))
-def _compute_value_jit(
+def _compute_value_pure(
     x0: jnp.ndarray,
     dynamics_params: dict,
     policy_params: dict,
@@ -726,12 +724,13 @@ def _compute_value_jit(
     robot_radius: float,
     mu: float,
     dt: float,
+    track_width: float = 1000.0,
 ) -> Tuple[float, jnp.ndarray]:
     """
-    JIT-compiled value function computation.
+    Pure JAX value function computation (no JIT).
     
     V(x0) = min_{t ∈ [0, T]} h(x(t))
-    where h(x) = min_{obs} (dist_to_obs - combined_radius)
+    where h(x) = min(dist_to_obs - combined_radius, dist_to_bound)
     h > 0 means SAFE
     """
     # Rollout trajectory
@@ -740,19 +739,38 @@ def _compute_value_jit(
     
     # Compute h values along trajectory
     def compute_h_at_state(state: jnp.ndarray) -> float:
-        """Compute barrier h(x) = min over obstacles of (dist - combined_radius)."""
+        """Compute barrier h(x) = smooth_min(obstacle_safe_margin, boundary_safe_margin)."""
         x, y = state[0], state[1]
         
+        # Obstacle constraints
         def h_single_obs(obs):
             obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
             combined_r = obs_r + robot_radius
             dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
             return dist - combined_r  # Positive when safe
         
-        # Compute h for all obstacles
-        h_vals = jax.vmap(h_single_obs)(obstacles_array)
-        # Take min over obstacles (most dangerous obstacle)
-        return jnp.min(h_vals)
+        # If obstacles exist, check them
+        # Use smooth_min for obstacles
+        h_obs = jnp.where(
+            obstacles_array.shape[0] > 0,
+            smooth_min(jax.vmap(h_single_obs)(obstacles_array), temperature=5.0),
+            100.0 # Safe if no obstacles
+        )
+        
+        # Boundary constraints: y <= y_max - r, y >= y_min + r
+        # y_max = track_width/2, y_min = -track_width/2
+        y_max = track_width / 2.0 - robot_radius
+        y_min = -track_width / 2.0 + robot_radius
+        
+        h_bound_upper = y_max - y
+        h_bound_lower = y - y_min
+        
+        # smooth_min for boundaries
+        h_bound = smooth_min(jnp.array([h_bound_upper, h_bound_lower]), temperature=5.0)
+        
+        # Combine obstacle and boundary constraints (taking smooth_min = safety)
+        # Use large track_width (e.g. 1000) to disable boundary check effectively
+        return smooth_min(jnp.array([h_obs, h_bound]), temperature=5.0)
     
     # Compute h for all states in trajectory
     h_all = jax.vmap(compute_h_at_state)(trajectory)
@@ -761,6 +779,12 @@ def _compute_value_jit(
     V = smooth_min(h_all, temperature=20.0)
     
     return V, trajectory
+
+# JIT-compiled version for direct use
+_compute_value_jit = jax.jit(
+    _compute_value_pure,
+    static_argnums=(4, 5)
+)
 
 
 def compute_value_function(
@@ -833,6 +857,7 @@ def compute_value_function_multi_obs(
     robot_radius: float,
     horizon: int,
     mu: float = 1.0,
+    track_width: float = 1000.0,
 ) -> Tuple[float, jnp.ndarray]:
     """
     Compute value function with multiple obstacles.
@@ -850,7 +875,21 @@ def compute_value_function_multi_obs(
             dist = jnp.sqrt(dist_sq + 1e-8)
             h_vals.append(dist - combined_radius)  # Positive when safe
         # Take min over obstacles (most dangerous)
-        return jnp.min(jnp.array(h_vals))
+        # Take min over obstacles (most dangerous)
+        h_obs = jnp.min(jnp.array(h_vals)) if h_vals else 100.0
+        
+        # Boundary constraints: y <= y_max - r, y >= y_min + r
+        # y_max = track_width/2, y_min = -track_width/2
+        # h_bound1 = (track_width/2 - robot_radius) - y
+        # h_bound2 = y - (-track_width/2 + robot_radius)
+        if track_width < 900.0:  # If track width is set (arbitrary large check)
+            y_limit = track_width / 2.0 - robot_radius
+            h_bound1 = y_limit - y
+            h_bound2 = y - (-y_limit)
+            h_bounds = jnp.min(jnp.array([h_bound1, h_bound2]))
+            return jnp.minimum(h_obs, h_bounds)
+        else:
+            return h_obs
     
     def body_fn(carry, _):
         x = carry
@@ -890,6 +929,7 @@ class PCBF:
         dt: float = 0.05,
         backup_horizon: float = 10.0,
         cbf_alpha: float = 1.0,
+        safety_margin: float = 0.0,
         ax=None,
     ):
         """
@@ -901,6 +941,7 @@ class PCBF:
             dt: Time step
             backup_horizon: Horizon for backup policy rollout (seconds)
             cbf_alpha: CBF class-K function parameter
+            safety_margin: Extra margin added to robot radius for collision checking
             ax: Matplotlib axis for visualization
         """
         self.robot = robot
@@ -912,6 +953,7 @@ class PCBF:
         self.stop_backup_horizon = 3.0
         self.stop_backup_horizon_steps = int(self.stop_backup_horizon / dt)
         self.cbf_alpha = cbf_alpha
+        self.safety_margin = safety_margin
         self.ax = ax
         
         # JAX dynamics
@@ -954,6 +996,9 @@ class PCBF:
         
         # JIT-compiled functions (created on first use)
         self._jit_value_and_grad = None
+        
+        # Track boundaries
+        self.track_width = None
         
         if ax is not None:
             self._setup_visualization()
@@ -1054,6 +1099,8 @@ class PCBF:
             env: DriftingEnv instance
         """
         self.env = env
+        if hasattr(env, 'track_width'):
+            self.track_width = float(env.track_width)
         self._update_obstacles()
     
     def _update_obstacles(self):
@@ -1088,7 +1135,7 @@ class PCBF:
             grad_V: Gradient of V w.r.t. x (8,)
             trajectory: Backup rollout trajectory (horizon+1, 8)
         """
-        robot_radius = self.robot_spec.get('radius', 1.5)
+        robot_radius = self.robot_spec.get('radius', 1.5) + self.safety_margin
         
         if len(self.obstacles) == 0:
             # No obstacles - return a large POSITIVE value (safe)
@@ -1099,41 +1146,22 @@ class PCBF:
         
         # Create JIT-compiled value_and_grad function if not exists
         if self._jit_value_and_grad is None:
-            # Create the JIT-compiled function with static arguments
-            @partial(jax.jit, static_argnums=(4, 5))
-            def _value_fn_jit(x0, dynamics_params, policy_params, obstacles_arr, 
-                             policy_type, horizon, robot_r, mu, dt):
-                """JIT-compiled value function."""
-                trajectory = _rollout_trajectory(
-                    dynamics_params, policy_params, policy_type,
-                    x0, horizon, mu, dt
+            # Create value_and_grad wrapper using the module-level pure function
+            def value_only(x0, dynamics_params, policy_params, obstacles_arr,
+                          policy_type, horizon, robot_r, mu, dt, track_width):
+                # Call the pure function (not JIT yet inside value_and_grad)
+                V, trajectory = _compute_value_pure(
+                    x0, dynamics_params, policy_params, obstacles_arr,
+                    policy_type, horizon, robot_r, mu, dt, track_width
                 )
-                
-                # Compute h values along trajectory
-                def compute_h_at_state(state):
-                    x, y = state[0], state[1]
-                    def h_single_obs(obs):
-                        obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
-                        combined_r = obs_r + robot_r
-                        dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
-                        return dist - combined_r
-                    h_vals = jax.vmap(h_single_obs)(obstacles_arr)
-                    return jnp.min(h_vals)
-                
-                h_all = jax.vmap(compute_h_at_state)(trajectory)
-                V = smooth_min(h_all, temperature=20.0)
                 return V, trajectory
             
-            # Create value_and_grad wrapper
-            def value_only(x0, dynamics_params, policy_params, obstacles_arr,
-                          policy_type, horizon, robot_r, mu, dt):
-                V, _ = _value_fn_jit(x0, dynamics_params, policy_params, obstacles_arr,
-                                     policy_type, horizon, robot_r, mu, dt)
-                return V
+            # Use the module-level JIT function for value only calls
+            self._jit_value_fn = _compute_value_jit
             
-            self._jit_value_fn = _value_fn_jit
+            # Create JIT-compiled value_and_grad
             self._jit_value_and_grad = jax.jit(
-                jax.value_and_grad(value_only),
+                jax.value_and_grad(value_only, has_aux=True),
                 static_argnums=(4, 5)
             )
         
@@ -1146,7 +1174,7 @@ class PCBF:
             horizon_steps = self.backup_horizon_steps
         
         # Call JIT-compiled functions
-        V, grad_V = self._jit_value_and_grad(
+        (V, trajectory), grad_V = self._jit_value_and_grad(
             x0_jax,
             self.dynamics_params,
             self.policy_params,
@@ -1155,7 +1183,8 @@ class PCBF:
             horizon_steps,
             robot_radius,
             self.current_friction,
-            self.dt
+            self.dt,
+            self.track_width if self.track_width is not None else 1000.0,
         )
         
         # Get trajectory for visualization (use full horizon for better viz)
@@ -1168,7 +1197,8 @@ class PCBF:
             self.backup_horizon_steps,  # Full horizon for visualization
             robot_radius,
             self.current_friction,
-            self.dt
+            self.dt,
+            self.track_width if self.track_width is not None else 1000.0,  # Pass track width
         )
         
         return V, grad_V, trajectory
@@ -1202,44 +1232,59 @@ class PCBF:
         """
         nu = 2
         
-        # Decision variable
-        u = cp.Variable(nu)
+        # Scaling factors (normalize decision variables to roughly [-1, 1])
+        # This is critical for SCS performance when inputs have vastly different scales
+        # (steering ~0.2 vs torque ~8000)
+        u_scale = self.u_max
         
-        # QP cost: ||u - u_nom||^2
-        cost = cp.sum_squares(u - u_nom)
+        # Normalized nominal control
+        u_nom_scaled = u_nom / u_scale
         
-        # CBF constraint: ∇V^T (f + Gu) + α V ≥ 0
-        # Rearranged: -∇V^T G u ≤ ∇V^T f + α V
+        # Normalized decision variable
+        u_scaled = cp.Variable(nu)
+        
+        # QP cost: ||W * (u_scaled - u_nom_scaled)||^2
+        # We want to encourage steering (avoidance) over braking (stopping)
+        # So we penalize torque deviation (braking) more heavily
+        # u[0] is steering, u[1] is torque
+        weights = np.array([1.0, 10.0])
+        weighted_diff = cp.multiply(weights, u_scaled - u_nom_scaled)
+        cost = cp.sum_squares(weighted_diff)
+        
+        # CBF constraint: -∇V^T G (u_scale * u_scaled) <= cbf_rhs
         grad_V_G = grad_V @ G  # (2,)
         grad_V_f = grad_V @ f  # scalar
         
         cbf_rhs = grad_V_f + self.cbf_alpha * V
         
+        # Scale the gradient matrix by u_scale component-wise
+        A_cbf = -grad_V_G * u_scale
+        
         constraints = [
-            -grad_V_G @ u <= cbf_rhs + 1e-4,  # Small margin for numerical stability
-            u >= self.u_min,
-            u <= self.u_max,
+            A_cbf @ u_scaled <= cbf_rhs + 1e-4,
+            u_scaled >= -1.0,  # Limits are now [-1, 1] since symmetric
+            u_scaled <= 1.0,
         ]
         
-        # Solve QP with OSQP
+        # Solve QP with SCS
         try:
             problem = cp.Problem(cp.Minimize(cost), constraints)
-            problem.solve(solver=cp.OSQP, verbose=False, max_iter=10000,
-                         eps_abs=1e-5, eps_rel=1e-5, polish=True)
+            problem.solve(solver=cp.SCS, verbose=False, max_iters=2000, eps=1e-4)
             
             if problem.status in ['optimal', 'optimal_inaccurate']:
                 self.status = 'optimal'
-                return u.value
-            elif problem.status == 'infeasible':
+                # Unscale the result
+                return u_scaled.value * u_scale
+            elif problem.status in ['infeasible', 'infeasible_inaccurate']:
                 self.status = 'infeasible'
-                return np.clip(u_nom, self.u_min, self.u_max)
+                raise ValueError(f"CBF-QP infeasible: backup trajectory cannot guarantee safety")
             else:
                 self.status = problem.status
-                return np.clip(u_nom, self.u_min, self.u_max)
+                raise ValueError(f"CBF-QP failed with status: {problem.status}")
                 
-        except Exception as e:
+        except cp.error.SolverError as e:
             self.status = 'error'
-            return np.clip(u_nom, self.u_min, self.u_max)
+            raise ValueError(f"CBF-QP solver error: {e}")
     
     def solve_control_problem(
         self,
