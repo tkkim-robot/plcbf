@@ -170,7 +170,7 @@ class SimulationConfig:
     safety_margin: float = 1.5           # Collision checking margin [m]
     initial_velocity: float = 10.0        # Starting velocity [m/s]
     target_velocity: float = 10.0         # Target velocity [m/s]
-    pcbf_alpha: float = 0.3              # PCBF class-K function parameter (lower = activates earlier)
+    pcbf_alpha: float = 5.0              # PCBF class-K function parameter (lower = activates earlier)
 
 
 @dataclass
@@ -353,6 +353,7 @@ def setup_controllers(
             dt=sim.dt,
             backup_horizon=sim.backup_horizon_time,
             cbf_alpha=sim.pcbf_alpha,
+            safety_margin=1.0,
             ax=ax
         )
         print(f"  Using PCBF algorithm (CBF-QP with backup rollout)")
@@ -520,7 +521,30 @@ def run_simulation(
         elif isinstance(shielding, PCBF):
             # PCBF uses nominal control as reference
             control_ref = {'u_ref': mpcc_control}
-            U = shielding.solve_control_problem(state, control_ref=control_ref, friction=car.get_friction())
+            try:
+                U = shielding.solve_control_problem(state, control_ref=control_ref, friction=car.get_friction())
+            except ValueError as e:
+                print(f"\n*** INFEASIBLE: {e} ***")
+                # Visualize error like test_drift.py
+                if getattr(simulator, 'ax', None):
+                    # Draw a large red exclamation mark
+                    simulator.ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
+                                     ha='center', va='center', zorder=100)
+                    plt.draw()
+                plt.pause(3.0)
+                
+                # Return failure result
+                result = {
+                    'collision': False,
+                    'infeasible': True,
+                    'total_steps': step,
+                    'nominal_steps': nominal_steps,
+                    'backup_steps': backup_steps,
+                    'nominal_ratio': nominal_steps / max(step, 1),
+                    'backup_ratio': backup_steps / max(step, 1),
+                    'passed': False
+                }
+                return result
         else:
             # Gatekeeper/MPS
             U = shielding.solve_control_problem(state, friction=car.get_friction())
@@ -659,8 +683,11 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     
     print("-" * 50)
     
+    # Pause to see the result if failed or finished
+    plt.pause(3.0)
+    
     plt.ioff()
-    plt.show()
+    plt.close('all')
     
     return results
 
