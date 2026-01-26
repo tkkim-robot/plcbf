@@ -20,6 +20,7 @@ from safe_control.robots.drifting_car import DriftingCar
 from safe_control.position_control.mpcc import MPCC
 from safe_control.position_control.backup_controller import LaneChangeController
 from mpcbf.pcbf import PCBF
+from mpcbf.mpcbf import MPCBF
 
 
 def create_test_setup():
@@ -100,19 +101,35 @@ def create_test_setup():
     
     # Backup controller
     backup_controller = LaneChangeController(car.robot_spec, dt, direction='left')
+    right_lane_y = env.get_lane_center(middle_lane + 1)
     pcbf.set_backup_controller(backup_controller, target=left_lane_y)
     pcbf.set_environment(env)
     
-    return car, mpcc, pcbf, env, robot_spec
+    # MPCBF controller
+    mpcbf = MPCBF(
+        robot=car,
+        robot_spec=car.robot_spec,
+        dt=dt,
+        backup_horizon=3.0,
+        cbf_alpha=5.0,
+        left_lane_y=left_lane_y,
+        right_lane_y=right_lane_y,
+        safety_margin=1.0,
+        ax=None  # No visualization
+    )
+    mpcbf.set_environment(env)
+    
+    return car, mpcc, pcbf, mpcbf, env, robot_spec
 
 
 def run_benchmark(num_steps=200, warmup_steps=10):
     """Run benchmark and return timing statistics."""
     print("Setting up benchmark...")
-    car, mpcc, pcbf, env, robot_spec = create_test_setup()
+    car, mpcc, pcbf, mpcbf, env, robot_spec = create_test_setup()
     
     # Storage for timing
     pcbf_times = []
+    mpcbf_times = []
     mpcc_times = []
     
     print(f"Running {num_steps} steps (+ {warmup_steps} warmup)...")
@@ -124,23 +141,39 @@ def run_benchmark(num_steps=200, warmup_steps=10):
         t0 = time.perf_counter()
         try:
             mpcc_control = mpcc.solve_control_problem(state)
+            pred_states, pred_controls = mpcc.get_full_predictions()
         except:
             mpcc_control = np.zeros((2, 1))
+            pred_states, pred_controls = None, None
         t1 = time.perf_counter()
         
         # Time PCBF
         control_ref = {'u_ref': mpcc_control}
         t2 = time.perf_counter()
         try:
-            u_safe = pcbf.solve_control_problem(state, control_ref=control_ref)
+            u_pcbf = pcbf.solve_control_problem(state, control_ref=control_ref)
         except ValueError:
             pass  # Ignore infeasibility for timing benchmark
         t3 = time.perf_counter()
+        
+        # Time MPCBF
+        t4 = time.perf_counter()
+        try:
+            u_mpcbf = mpcbf.solve_control_problem(
+                state, 
+                control_ref=control_ref,
+                nominal_trajectory=pred_states.T if pred_states is not None else None,
+                nominal_controls=pred_controls.T if pred_controls is not None else None
+            )
+        except ValueError:
+            pass  # Ignore infeasibility for timing benchmark
+        t5 = time.perf_counter()
         
         # Record times (skip warmup)
         if step >= warmup_steps:
             mpcc_times.append(t1 - t0)
             pcbf_times.append(t3 - t2)
+            mpcbf_times.append(t5 - t4)
         
         # Simple state update (no full simulation)
         # Just move forward slightly to test different states
@@ -154,6 +187,7 @@ def run_benchmark(num_steps=200, warmup_steps=10):
     
     # Compute statistics
     pcbf_times = np.array(pcbf_times) * 1000  # Convert to ms
+    mpcbf_times = np.array(mpcbf_times) * 1000
     mpcc_times = np.array(mpcc_times) * 1000
     
     results = {
@@ -162,6 +196,11 @@ def run_benchmark(num_steps=200, warmup_steps=10):
         'pcbf_min': np.min(pcbf_times),
         'pcbf_max': np.max(pcbf_times),
         'pcbf_median': np.median(pcbf_times),
+        'mpcbf_mean': np.mean(mpcbf_times),
+        'mpcbf_std': np.std(mpcbf_times),
+        'mpcbf_min': np.min(mpcbf_times),
+        'mpcbf_max': np.max(mpcbf_times),
+        'mpcbf_median': np.median(mpcbf_times),
         'mpcc_mean': np.mean(mpcc_times),
         'mpcc_std': np.std(mpcc_times),
         'num_steps': num_steps,
@@ -173,15 +212,21 @@ def run_benchmark(num_steps=200, warmup_steps=10):
 def print_results(results, label=""):
     """Print benchmark results."""
     print(f"\n{'=' * 60}")
-    print(f"  PCBF Benchmark Results {label}")
+    print(f"  PCBF/MPCBF Benchmark Results {label}")
     print(f"{'=' * 60}")
     print(f"  Steps tested: {results['num_steps']}")
-    print(f"\n  PCBF Timing:")
+    print(f"\n  PCBF Timing (single policy):")
     print(f"    Mean:   {results['pcbf_mean']:.3f} ms")
     print(f"    Std:    {results['pcbf_std']:.3f} ms")
     print(f"    Median: {results['pcbf_median']:.3f} ms")
     print(f"    Min:    {results['pcbf_min']:.3f} ms")
     print(f"    Max:    {results['pcbf_max']:.3f} ms")
+    print(f"\n  MPCBF Timing (4 policies):")
+    print(f"    Mean:   {results['mpcbf_mean']:.3f} ms")
+    print(f"    Std:    {results['mpcbf_std']:.3f} ms")
+    print(f"    Median: {results['mpcbf_median']:.3f} ms")
+    print(f"    Min:    {results['mpcbf_min']:.3f} ms")
+    print(f"    Max:    {results['mpcbf_max']:.3f} ms")
     print(f"\n  MPCC Timing (reference):")
     print(f"    Mean:   {results['mpcc_mean']:.3f} ms")
     print(f"    Std:    {results['mpcc_std']:.3f} ms")
@@ -189,7 +234,7 @@ def print_results(results, label=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Benchmark PCBF performance')
+    parser = argparse.ArgumentParser(description='Benchmark PCBF/MPCBF performance')
     parser.add_argument('--steps', type=int, default=200,
                         help='Number of steps to benchmark (default: 200)')
     parser.add_argument('--warmup', type=int, default=10,

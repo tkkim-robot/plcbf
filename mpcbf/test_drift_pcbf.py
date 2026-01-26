@@ -165,7 +165,7 @@ class SimulationConfig:
     dt: float = 0.05
     tf: float = 14.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
-    backup_horizon_time: float = 3.0     # Backup trajectory horizon [s]
+    backup_horizon_time: float = 6.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
     safety_margin: float = 1.5           # Collision checking margin [m]
     initial_velocity: float = 10.0        # Starting velocity [m/s]
@@ -181,7 +181,7 @@ class ObstacleConfig:
     theta: float = 0.0          # Heading angle
     body_length: float = 4.5
     body_width: float = 2.0
-    radius: float = 2.5         # Collision radius
+    radius: float = 2.0         # Collision radius (reduced for MPCBF lane change margin)
 
 
 # Number of obstacles options
@@ -340,13 +340,15 @@ def setup_controllers(
             dt=sim.dt,
             backup_horizon=sim.backup_horizon_time,
             cbf_alpha=sim.pcbf_alpha,
-            left_lane_y=max(left_lane_y, 5.0),
-            right_lane_y=min(right_lane_y, -5.0),
+            left_lane_y=max(left_lane_y, 6.5),
+            right_lane_y=min(right_lane_y, -6.5),
             safety_margin=1.0,
             ax=ax
         )
+        actual_left = max(left_lane_y, 6.5)
+        actual_right = min(right_lane_y, -6.5)
         print(f"  Using MPCBF algorithm (multi-policy CBF-QP)")
-        print(f"    Policies: lane_change_left (y={left_lane_y:.1f}), lane_change_right (y={right_lane_y:.1f}), mpcc")
+        print(f"    Policies: lane_change_left (y={actual_left:.1f}), lane_change_right (y={actual_right:.1f}), stop, nominal")
     elif config.algo_type == 'pcbf':
         shielding = PCBF(
             robot=car,
@@ -517,7 +519,8 @@ def run_simulation(
                 state, 
                 control_ref=control_ref, 
                 friction=car.get_friction(),
-                mpcc_trajectory=pred_states.T if pred_states is not None else None
+                nominal_trajectory=pred_states.T if pred_states is not None else None,
+                nominal_controls=pred_controls.T if pred_controls is not None else None
             )
         elif isinstance(shielding, PCBF):
             # PCBF uses nominal control as reference

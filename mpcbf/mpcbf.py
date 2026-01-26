@@ -42,7 +42,8 @@ from .pcbf import (
     PCBF,
     DriftingCarDynamicsJAX,
     LaneChangeControllerJAX,
-    # StoppingControllerJAX,  # Disabled for now
+    StoppingControllerJAX,
+    StopPolicyParams,
     smooth_min,
     _rollout_trajectory,
     _compute_value_pure,
@@ -62,11 +63,20 @@ from .pcbf import (
 POLICY_COLORS = {
     'lane_change_left': '#2196F3',   # Blue
     'lane_change_right': '#FF9800',  # Orange
-    'mpcc': '#9C27B0',               # Purple
-    # 'stop': '#F44336',             # Red (disabled for now)
+    'nominal': '#9C27B0',            # Purple (nominal controller trajectory)
+    'stop': '#F44336',               # Red
 }
 
 SELECTED_COLOR = '#00E676'  # Bright green for selected policy
+
+# Per-policy alpha values (smaller alpha = more conservative = less likely to be selected)
+# Use smaller alpha for stop to prefer lane change when both are safe
+POLICY_ALPHA = {
+    'lane_change_left': 5.0,
+    'lane_change_right': 5.0,
+    'nominal': 5.0,
+    'stop': 0.5,  # Smaller alpha makes stop less attractive
+}
 
 
 # =============================================================================
@@ -103,8 +113,9 @@ class MPCBF(PCBF):
         self.left_lane_y = left_lane_y
         self.right_lane_y = right_lane_y
         
-        # MPCC trajectory (updated each step)
-        self.mpcc_trajectory = None
+        # Nominal controller trajectory (updated each step)
+        self.nominal_trajectory = None
+        self.nominal_controls = None
         
         # For visualization - store trajectories from all policies
         self.multi_backup_trajs = {}  # policy_name -> list of trajectories
@@ -171,21 +182,36 @@ class MPCBF(PCBF):
                     theta_des_max=float(np.deg2rad(15)),
                 ),
             },
-            # NOTE: Stopping policy removed for now to focus on lane change behavior
-            # Can be re-added later once lane change is verified working
+            'stop': {
+                'type': 'stop',
+                'horizon': uniform_horizon,
+                'params': StopPolicyParams(
+                    Kd_theta=0.5,
+                    Kp_delta=3.0,
+                    Kp_v=1000.0,
+                    Kp_tau_dot=2.0,
+                    delta_max=delta_max,
+                    delta_dot_max=delta_dot_max,
+                    tau_max=tau_max,
+                    tau_dot_max=tau_dot_max,
+                    stop_threshold=0.05,
+                    holding_torque=-100.0,
+                ),
+            },
         }
         
         # Create JAX policy instances (for reference, not used in pure function)
         self.jax_policies = {
             'lane_change_left': LaneChangeControllerJAX(self.robot_spec, target_y=self.left_lane_y),
             'lane_change_right': LaneChangeControllerJAX(self.robot_spec, target_y=self.right_lane_y),
+            'stop': StoppingControllerJAX(self.robot_spec),
         }
         
         # JIT cache for value functions (policy_type -> jit_fn)
         self._jit_policy_fns = {}
         
         # Initialize trajectory storage
-        for name in list(self.policy_configs.keys()) + ['mpcc']:
+        for name in list(self.policy_configs.keys()) + ['nominal']:
             self.multi_backup_trajs[name] = []
     
     def _setup_multi_visualization(self):
@@ -220,17 +246,26 @@ class MPCBF(PCBF):
             self.robot_spec, target_y=right_y
         )
     
-    def set_mpcc_trajectory(self, trajectory: np.ndarray):
-        """Set the MPCC predicted trajectory for this step."""
+    def set_nominal_trajectory(self, trajectory: np.ndarray, controls: Optional[np.ndarray] = None):
+        """Set the nominal controller's predicted trajectory and controls for this step."""
         if trajectory is None:
-            self.mpcc_trajectory = None
+            self.nominal_trajectory = None
+            self.nominal_controls = None
             return
             
         traj = np.array(trajectory)
         if traj.shape[0] < traj.shape[1]:
             traj = traj.T
         
-        self.mpcc_trajectory = jnp.array(traj)
+        self.nominal_trajectory = jnp.array(traj)
+        
+        if controls is not None:
+            ctrl = np.array(controls)
+            if ctrl.shape[0] < ctrl.shape[1]:
+                ctrl = ctrl.T
+            self.nominal_controls = jnp.array(ctrl)
+        else:
+            self.nominal_controls = None
     
     def _compute_multi_value_and_grad(
         self, 
@@ -254,10 +289,12 @@ class MPCBF(PCBF):
             V_dict = {name: default_V for name in self.policy_configs}
             grad_V_dict = {name: np.zeros(8) for name in self.policy_configs}
             traj_dict = {name: np.array(x0_jax)[None, :] for name in self.policy_configs}
-            if self.mpcc_trajectory is not None:
-                traj_dict['mpcc'] = np.array(self.mpcc_trajectory)
+            if self.nominal_trajectory is not None:
+                traj_dict['nominal'] = np.array(self.nominal_trajectory)
+                V_dict['nominal'] = default_V # Considered safe if no obstacles
             else:
-                traj_dict['mpcc'] = None
+                traj_dict['nominal'] = None
+                V_dict['nominal'] = default_V 
             return V_dict, grad_V_dict, traj_dict
         
         obstacles_array = jnp.array(self.obstacles)
@@ -323,16 +360,91 @@ class MPCBF(PCBF):
             grad_V_dict[name] = np.array(grad_V)
             traj_dict[name] = np.array(trajectory)
         
-        # Store MPCC trajectory for visualization only
-        # We do NOT include it in V_dict/grad_V_dict because the Nominal trajectory
-        # is often short-sighted (horizon 1.5s) compared to backups (3.0s).
-        # Treating it as a safety candidate causes false confidence and late switching.
-        if self.mpcc_trajectory is not None and len(self.mpcc_trajectory) > 0:
-            traj_dict['mpcc'] = np.array(self.mpcc_trajectory)
+        # Compute value for nominal controller trajectory (with padding if needed)
+        # We perform a FULL rollout using the nominal controls (padded) to ensure consistent horizon
+        if self.nominal_controls is not None and len(self.nominal_controls) > 0:
+            def nominal_padded_value_fn(x0, controls_input):
+                # 1. Pad controls to match backup horizon
+                # controls_input: (nominal_horizon, 2)
+                # target length: backup_horizon_steps
+                
+                curr_len = controls_input.shape[0]
+                target_len = self.backup_horizon_steps
+                
+                # Zero-order hold pad: repeat last control
+                last_u = controls_input[-1]
+                
+                def get_u_at_t(i, _):
+                    # If i < curr_len, use controls[i]
+                    # Else use last_u
+                    is_valid = i < curr_len
+                    u = jax.lax.select(is_valid, controls_input[jnp.minimum(i, curr_len-1)], last_u)
+                    return u
+                
+                # Rollout dynamics with padded controls
+                def body_fn(carry, i):
+                    x = carry
+                    u = get_u_at_t(i, None)
+                    x_next = self.dynamics_jax.step_full_state(x, u, self.current_friction)
+                    
+                    # Compute h
+                    x_curr, y_curr = x_next[0], x_next[1]
+                    def h_single_obs(obs):
+                        obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
+                        combined_r = obs_r + robot_radius
+                        dist = jnp.sqrt((x_curr - obs_x)**2 + (y_curr - obs_y)**2 + 1e-8)
+                        return dist - combined_r
+                    
+                    h_vals = jax.vmap(h_single_obs)(obstacles_array)
+                    h_obs = jnp.min(h_vals) if n_obs > 0 else 100.0
+                    
+                    # Boundary check
+                    if self.track_width < 900.0:
+                        y_limit = self.track_width / 2.0 - robot_radius
+                        h_bound = jnp.minimum(y_limit - y_curr, y_curr - (-y_limit))
+                        h_val = jnp.minimum(h_obs, h_bound)
+                    else:
+                        h_val = h_obs
+                        
+                    return x_next, (x_next, h_val)
+                
+                _, (traj, h_values) = lax.scan(body_fn, x0, jnp.arange(target_len))
+                
+                trajectory_full = jnp.vstack([x0[None, :], traj])
+                
+                # Compute V
+                h0_vals = jax.vmap(lambda obs: jnp.sqrt((x0[0]-obs[0])**2 + (x0[1]-obs[1])**2 + 1e-8) - (obs[2]+robot_radius))(obstacles_array)
+                h0 = jnp.min(h0_vals) if n_obs > 0 else 100.0
+                
+                h_all = jnp.concatenate([h0[None], h_values])
+                V = smooth_min(h_all, temperature=20.0)
+                
+                return V, trajectory_full
+
+            # Call JIT function
+            nominal_jit_key = f"nominal_{self.backup_horizon_steps}"
+            if nominal_jit_key not in self._jit_policy_fns:
+                # Wrap with JIT
+                val_grad_fn_nominal = jax.jit(jax.value_and_grad(nominal_padded_value_fn, has_aux=True))
+                self._jit_policy_fns[nominal_jit_key] = val_grad_fn_nominal
+            
+            val_grad_fn_nominal = self._jit_policy_fns[nominal_jit_key]
+            
+            (V_nominal, traj_nominal), grad_V_nominal = val_grad_fn_nominal(x0_jax, self.nominal_controls)
+            
+            V_dict['nominal'] = float(V_nominal)
+            grad_V_dict['nominal'] = np.array(grad_V_nominal)
+            traj_dict['nominal'] = np.array(traj_nominal)
+            
+        elif self.nominal_trajectory is not None and len(self.nominal_trajectory) > 0:
+            # Fallback if no controls provided: exclude from safety but keep for vis
+            traj_dict['nominal'] = np.array(self.nominal_trajectory)
+            V_dict['nominal'] = -np.inf # Mark as unsafe/unknown
+            grad_V_dict['nominal'] = np.zeros(8)
         else:
-            traj_dict['mpcc'] = None
-        
-        return V_dict, grad_V_dict, traj_dict
+            V_dict['nominal'] = -np.inf
+            grad_V_dict['nominal'] = np.zeros(8)
+            traj_dict['nominal'] = None
         
         return V_dict, grad_V_dict, traj_dict
     
@@ -382,11 +494,14 @@ class MPCBF(PCBF):
             Lf_V = grad_V @ f
             Lg_V = grad_V @ G
             
+            # Use per-policy alpha from POLICY_ALPHA (smaller alpha for stop makes it less attractive)
+            policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
+            
             # Constraint value at u_nom: c = Lf_V + Lg_V @ u_nom + alpha * V
-            constraint_value = Lf_V + Lg_V @ u_nom + self.cbf_alpha * V
+            constraint_value = Lf_V + Lg_V @ u_nom + policy_alpha * V
             constraint_dict[name] = float(constraint_value)
         
-        # Get all policies including mpcc
+        # Get all policies including nominal
         backup_policies = list(constraint_dict.keys())
         
         # Filter for safe policies (V > 0)
@@ -439,7 +554,8 @@ class MPCBF(PCBF):
         robot_state: np.ndarray,
         control_ref: Optional[dict] = None,
         friction: Optional[float] = None,
-        mpcc_trajectory: Optional[np.ndarray] = None,
+        nominal_trajectory: Optional[np.ndarray] = None,
+        nominal_controls: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Main MPCBF control loop - compute safe control using multi-policy CBF.
@@ -452,8 +568,8 @@ class MPCBF(PCBF):
         if friction is not None:
             self.set_friction(friction)
         
-        if mpcc_trajectory is not None:
-            self.set_mpcc_trajectory(mpcc_trajectory)
+        if nominal_trajectory is not None:
+            self.set_nominal_trajectory(nominal_trajectory, nominal_controls)
         
         if control_ref is not None and 'u_ref' in control_ref:
             u_nom = np.array(control_ref['u_ref']).flatten()
@@ -501,18 +617,15 @@ class MPCBF(PCBF):
         # Debug output (can be disabled by setting self.debug = False)
         if getattr(self, 'debug', True) and self.curr_step % 50 == 0:
             c_str = ", ".join([f"{k}:{constraint_dict[k]:.2f}" for k in sorted(constraint_dict.keys()) if constraint_dict[k] > -np.inf])
+            v_str = ", ".join([f"{k}:{V_dict[k]:.2f}" for k in sorted(V_dict.keys()) if V_dict[k] > -np.inf])
+            print(f"  [MPCBF] V: {v_str}")
             print(f"  [MPCBF] CBF(u_nom): {c_str} -> best={best_policy}")
         
         self.curr_step += 1
         
         # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
-        # This prevents unnecessary braking when far from obstacles.
-        # (v_threshold logic removed as requested)
-        
-        # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.
         # If constraint < 0 at u_nom, the QP will find minimal deviation to satisfy constraint.
-        # This is the correct CBF formulation - no heuristic shortcuts.
         
         # Solve CBF-QP with best policy's constraint
         u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
