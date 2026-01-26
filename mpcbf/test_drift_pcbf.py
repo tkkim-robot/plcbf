@@ -165,7 +165,7 @@ class SimulationConfig:
     dt: float = 0.05
     tf: float = 14.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
-    backup_horizon_time: float = 6.0     # Backup trajectory horizon [s]
+    backup_horizon_time: float = 2.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
     safety_margin: float = 1.5           # Collision checking margin [m]
     initial_velocity: float = 10.0        # Starting velocity [m/s]
@@ -512,46 +512,45 @@ def run_simulation(
             pred_states, pred_controls = None, None
         
         # Shielding validates and returns committed control
-        if isinstance(shielding, MPCBF):
-            # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
-            control_ref = {'u_ref': mpcc_control}
-            U = shielding.solve_control_problem(
-                state, 
-                control_ref=control_ref, 
-                friction=car.get_friction(),
-                nominal_trajectory=pred_states.T if pred_states is not None else None,
-                nominal_controls=pred_controls.T if pred_controls is not None else None
-            )
-        elif isinstance(shielding, PCBF):
-            # PCBF uses nominal control as reference
-            control_ref = {'u_ref': mpcc_control}
-            try:
+        # Shielding validates and returns committed control
+        try:
+            if isinstance(shielding, MPCBF):
+                # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
+                control_ref = {'u_ref': mpcc_control}
+                U = shielding.solve_control_problem(
+                    state, 
+                    control_ref=control_ref, 
+                    friction=car.get_friction(),
+                    nominal_trajectory=pred_states.T if pred_states is not None else None,
+                    nominal_controls=pred_controls.T if pred_controls is not None else None
+                )
+            elif isinstance(shielding, PCBF):
+                # PCBF uses nominal control as reference
+                control_ref = {'u_ref': mpcc_control}
                 U = shielding.solve_control_problem(state, control_ref=control_ref, friction=car.get_friction())
-            except ValueError as e:
-                print(f"\n*** INFEASIBLE: {e} ***")
-                # Visualize error like test_drift.py
-                if getattr(simulator, 'ax', None):
-                    # Draw a large red exclamation mark
-                    simulator.ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
-                                     ha='center', va='center', zorder=100)
-                    plt.draw()
-                plt.pause(3.0)
-                
-                # Return failure result
-                result = {
-                    'collision': False,
-                    'infeasible': True,
-                    'total_steps': step,
-                    'nominal_steps': nominal_steps,
-                    'backup_steps': backup_steps,
-                    'nominal_ratio': nominal_steps / max(step, 1),
-                    'backup_ratio': backup_steps / max(step, 1),
-                    'passed': False
-                }
-                return result
-        else:
-            # Gatekeeper/MPS
-            U = shielding.solve_control_problem(state, friction=car.get_friction())
+            else:
+                # Gatekeeper/MPS
+                U = shielding.solve_control_problem(state, friction=car.get_friction())
+        except ValueError as e:
+            print(f"\n*** INFEASIBLE: {e} ***")
+            # Draw a large red exclamation mark
+            ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
+                    ha='center', va='center', zorder=100)
+            plt.draw()
+            plt.pause(3.0)
+            
+            # Return failure result
+            result = {
+                'collision': False,
+                'infeasible': True,
+                'total_steps': step,
+                'nominal_steps': nominal_steps,
+                'backup_steps': backup_steps,
+                'nominal_ratio': nominal_steps / max(step, 1),
+                'backup_ratio': backup_steps / max(step, 1),
+                'passed': False
+            }
+            return result
         
         # Track mode
         if shielding.is_using_backup():
