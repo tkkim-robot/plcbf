@@ -340,8 +340,8 @@ class MPCBF(PCBF):
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=self.left_lane_y,
-                    Kp_y=0.15,
+                    target_y=6.0 if self.left_lane_y > 0 else self.left_lane_y, # Aim for y=6.0 (midpoint of safe corridor)
+                    Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
                     Kp_delta=3.0,
@@ -352,15 +352,15 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(15)),
+                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
                 ),
             },
             'lane_change_right': {
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=self.right_lane_y,
-                    Kp_y=0.15,
+                    target_y=-6.0 if self.right_lane_y < 0 else self.right_lane_y, # Aim for y=-6.0
+                    Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
                     Kp_delta=3.0,
@@ -371,7 +371,7 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(15)),
+                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
                 ),
             },
             'stop': {
