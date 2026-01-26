@@ -165,7 +165,7 @@ class SimulationConfig:
     dt: float = 0.05
     tf: float = 14.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
-    backup_horizon_time: float = 2.0     # Backup trajectory horizon [s]
+    backup_horizon_time: float = 3.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
     safety_margin: float = 1.5           # Collision checking margin [m]
     initial_velocity: float = 10.0        # Starting velocity [m/s]
@@ -212,6 +212,7 @@ class TestConfig:
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
+    max_operator: str = 'c'  # MPCBF selection operator: 'c', 'v', or 'input_space'
 
 
 # =============================================================================
@@ -343,11 +344,12 @@ def setup_controllers(
             left_lane_y=max(left_lane_y, 6.5),
             right_lane_y=min(right_lane_y, -6.5),
             safety_margin=1.0,
+            max_operator=config.max_operator,
             ax=ax
         )
         actual_left = max(left_lane_y, 6.5)
         actual_right = min(right_lane_y, -6.5)
-        print(f"  Using MPCBF algorithm (multi-policy CBF-QP)")
+        print(f"  Using MPCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
         print(f"    Policies: lane_change_left (y={actual_left:.1f}), lane_change_right (y={actual_right:.1f}), stop, nominal")
     elif config.algo_type == 'pcbf':
         shielding = PCBF(
@@ -677,7 +679,15 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     print(f"  Backup: {results['backup_steps']} ({100*results['backup_ratio']:.1f}%)")
     
     # Check expectation
-    if results['collision'] == config.expected_collision:
+    # Test FAILS if:
+    # 1. Infeasibility occurred (results already has passed=False), or
+    # 2. Collision didn't match expectation
+    infeasible = results.get('infeasible', False)
+    
+    if infeasible:
+        print(f"\n  ✗ TEST FAILED (infeasibility occurred - QP constraint unsatisfiable)")
+        results['passed'] = False
+    elif results['collision'] == config.expected_collision:
         print(f"\n  ✓ TEST PASSED (collision={'expected' if config.expected_collision else 'avoided'} as expected)")
         results['passed'] = True
     else:
@@ -830,6 +840,9 @@ def main():
                         help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
+    parser.add_argument('--max-operator', type=str, default='c',
+                        choices=['c', 'v', 'input_space'],
+                        help='MPCBF selection operator: c (permissiveness), v (safety margin), input_space (control authority)')
     
     args = parser.parse_args()
     
@@ -918,6 +931,7 @@ def main():
             config.algo_type = args.algo
             config.backup_type = args.backup
             config.num_obstacles = args.obs
+            config.max_operator = getattr(args, 'max_operator', 'c')
             # Update expected collision based on configuration
             config.expected_collision = get_expected_collision(name, args.backup, args.obs, args.algo)
             # Update name to include algo, backup type and obstacle count
@@ -944,6 +958,7 @@ def main():
         config.algo_type = args.algo
         config.backup_type = args.backup
         config.num_obstacles = args.obs
+        config.max_operator = getattr(args, 'max_operator', 'c')
         # Update expected collision based on configuration
         config.expected_collision = get_expected_collision(args.test, args.backup, args.obs, args.algo)
         # Update name to include algo, backup type and obstacle count
