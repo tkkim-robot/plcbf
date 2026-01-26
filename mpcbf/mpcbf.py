@@ -45,6 +45,9 @@ from .pcbf import (
     # StoppingControllerJAX,  # Disabled for now
     smooth_min,
     _rollout_trajectory,
+    _compute_value_pure,
+    DynamicsParams,
+    LaneChangePolicyParams,
 )
 
 
@@ -52,51 +55,7 @@ from .pcbf import (
 # JIT-compiled Multi-Policy Value Functions
 # =============================================================================
 
-def _create_multi_policy_value_fn():
-    """
-    Create JIT-compiled functions for multi-policy value computation.
-    """
-    
-    @partial(jax.jit, static_argnums=(4, 5, 6))
-    def _rollout_and_evaluate(
-        x0: jnp.ndarray,
-        dynamics_params: dict,
-        policy_params: dict,
-        obstacles_arr: jnp.ndarray,
-        policy_type: str,
-        horizon: int,
-        n_obs: int,
-        robot_r: float,
-        mu: float,
-        dt: float,
-    ) -> Tuple[float, jnp.ndarray]:
-        """
-        Rollout a single policy and compute its value function.
-        """
-        trajectory = _rollout_trajectory(
-            dynamics_params, policy_params, policy_type,
-            x0, horizon, mu, dt
-        )
-        
-        def compute_h_at_state(state):
-            x, y = state[0], state[1]
-            def h_single_obs(obs):
-                obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
-                combined_r = obs_r + robot_r
-                dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
-                return dist - combined_r
-            h_vals = jax.vmap(h_single_obs)(obstacles_arr)
-            return jnp.min(h_vals)
-        
-        h_all = jax.vmap(compute_h_at_state)(trajectory)
-        V = smooth_min(h_all, temperature=20.0)
-        return V, trajectory
-    
-    return _rollout_and_evaluate
-
-
-# Pre-create the JIT function
-_ROLLOUT_AND_EVALUATE = _create_multi_policy_value_fn()
+# Pre-create the JIT function NOT NEEDED (we use _compute_value_pure)
 
 
 # Policy colors for visualization
@@ -131,13 +90,14 @@ class MPCBF(PCBF):
         cbf_alpha: float = 1.0,
         left_lane_y: float = 5.0,
         right_lane_y: float = -5.0,
+        safety_margin: float = 0.0,
         ax=None,
     ):
         """
         Initialize the MPCBF controller.
         """
         # Initialize parent PCBF (but don't use its single policy)
-        super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha, ax)
+        super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax)
         
         # Lane targets
         self.left_lane_y = left_lane_y
@@ -176,67 +136,53 @@ class MPCBF(PCBF):
             'lane_change_left': {
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
-                'params': {
-                    'target_y': self.left_lane_y,
-                    'Kp_y': 0.15,
-                    'Kp_theta': 1.5,
-                    'Kd_theta': 0.3,
-                    'Kp_delta': 3.0,
-                    'Kp_v': 500.0,
-                    'target_velocity': target_velocity,
-                    'delta_max': delta_max,
-                    'delta_dot_max': delta_dot_max,
-                    'tau_max': tau_max,
-                    'tau_dot_max': tau_dot_max,
-                    'theta_des_max': float(np.deg2rad(15)),
-                },
+                'params': LaneChangePolicyParams(
+                    target_y=self.left_lane_y,
+                    Kp_y=0.15,
+                    Kp_theta=1.5,
+                    Kd_theta=0.3,
+                    Kp_delta=3.0,
+                    Kp_v=500.0,
+                    Kp_tau_dot=2.0,
+                    target_velocity=target_velocity,
+                    delta_max=delta_max,
+                    delta_dot_max=delta_dot_max,
+                    tau_max=tau_max,
+                    tau_dot_max=tau_dot_max,
+                    theta_des_max=float(np.deg2rad(15)),
+                ),
             },
             'lane_change_right': {
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
-                'params': {
-                    'target_y': self.right_lane_y,
-                    'Kp_y': 0.15,
-                    'Kp_theta': 1.5,
-                    'Kd_theta': 0.3,
-                    'Kp_delta': 3.0,
-                    'Kp_v': 500.0,
-                    'target_velocity': target_velocity,
-                    'delta_max': delta_max,
-                    'delta_dot_max': delta_dot_max,
-                    'tau_max': tau_max,
-                    'tau_dot_max': tau_dot_max,
-                    'theta_des_max': float(np.deg2rad(15)),
-                },
-            },
-            'lane_change_left_2': {
-                'type': 'lane_change',
-                'horizon': uniform_horizon,
-                'params': {
-                    'target_y': self.left_lane_y + (abs(self.left_lane_y - self.right_lane_y) / 2.0 if abs(self.left_lane_y - self.right_lane_y) > 1.0 else 4.0),
-                    'Kp_y': 0.15,
-                    'Kp_theta': 1.5,
-                    'Kd_theta': 0.3,
-                    'Kp_delta': 3.0,
-                    'Kp_v': 500.0,
-                    'target_velocity': target_velocity,
-                    'delta_max': delta_max,
-                    'delta_dot_max': delta_dot_max,
-                    'tau_max': tau_max,
-                    'tau_dot_max': tau_dot_max,
-                    'theta_des_max': float(np.deg2rad(15)),
-                },
+                'params': LaneChangePolicyParams(
+                    target_y=self.right_lane_y,
+                    Kp_y=0.15,
+                    Kp_theta=1.5,
+                    Kd_theta=0.3,
+                    Kp_delta=3.0,
+                    Kp_v=500.0,
+                    Kp_tau_dot=2.0,
+                    target_velocity=target_velocity,
+                    delta_max=delta_max,
+                    delta_dot_max=delta_dot_max,
+                    tau_max=tau_max,
+                    tau_dot_max=tau_dot_max,
+                    theta_des_max=float(np.deg2rad(15)),
+                ),
             },
             # NOTE: Stopping policy removed for now to focus on lane change behavior
             # Can be re-added later once lane change is verified working
         }
         
-        # Create JAX policy instances
+        # Create JAX policy instances (for reference, not used in pure function)
         self.jax_policies = {
             'lane_change_left': LaneChangeControllerJAX(self.robot_spec, target_y=self.left_lane_y),
             'lane_change_right': LaneChangeControllerJAX(self.robot_spec, target_y=self.right_lane_y),
-            'lane_change_left_2': LaneChangeControllerJAX(self.robot_spec, target_y=self.left_lane_y + (abs(self.left_lane_y - self.right_lane_y) / 2.0 if abs(self.left_lane_y - self.right_lane_y) > 1.0 else 4.0)),
         }
+        
+        # JIT cache for value functions (policy_type -> jit_fn)
+        self._jit_policy_fns = {}
         
         # Initialize trajectory storage
         for name in list(self.policy_configs.keys()) + ['mpcc']:
@@ -264,8 +210,8 @@ class MPCBF(PCBF):
         self.left_lane_y = left_y
         self.right_lane_y = right_y
         
-        self.policy_configs['lane_change_left']['params']['target_y'] = left_y
-        self.policy_configs['lane_change_right']['params']['target_y'] = right_y
+        self.policy_configs['lane_change_left']['params'] = self.policy_configs['lane_change_left']['params']._replace(target_y=left_y)
+        self.policy_configs['lane_change_right']['params'] = self.policy_configs['lane_change_right']['params']._replace(target_y=right_y)
         
         self.jax_policies['lane_change_left'] = LaneChangeControllerJAX(
             self.robot_spec, target_y=left_y
@@ -298,16 +244,20 @@ class MPCBF(PCBF):
             grad_V_dict: {policy_name: grad_V}
             traj_dict: {policy_name: trajectory}
         """
-        robot_radius = self.robot_spec.get('radius', 1.5)
+        if self.safety_margin > 0:
+            robot_radius = self.robot_spec.get('radius', 1.5) + self.safety_margin
+        else:
+            robot_radius = self.robot_spec.get('radius', 1.5)
         
         if len(self.obstacles) == 0:
             default_V = 100.0
             V_dict = {name: default_V for name in self.policy_configs}
-            V_dict['mpcc'] = default_V
             grad_V_dict = {name: np.zeros(8) for name in self.policy_configs}
-            grad_V_dict['mpcc'] = np.zeros(8)
             traj_dict = {name: np.array(x0_jax)[None, :] for name in self.policy_configs}
-            traj_dict['mpcc'] = np.array(x0_jax)[None, :]
+            if self.mpcc_trajectory is not None:
+                traj_dict['mpcc'] = np.array(self.mpcc_trajectory)
+            else:
+                traj_dict['mpcc'] = None
             return V_dict, grad_V_dict, traj_dict
         
         obstacles_array = jnp.array(self.obstacles)
@@ -323,56 +273,66 @@ class MPCBF(PCBF):
             horizon = config['horizon']
             policy_params = config['params']
             
-            def value_fn(x0):
-                V, _ = _ROLLOUT_AND_EVALUATE(
-                    x0, self.dynamics_params, policy_params, obstacles_array,
-                    policy_type, horizon, n_obs, robot_radius,
-                    self.current_friction, self.dt,
+            # Create JIT-compiled value_and_grad function for this policy if not exists
+            # We use _compute_value_pure from pcbf.py which is JAX-optimizable
+            # Since policy_params is a NamedTuple (hashable) and policy_type is string (static),
+            # we can use them effectively in JIT
+            cache_key = f"{policy_type}_{horizon}"
+            if cache_key not in self._jit_policy_fns:
+                def value_only_fn(x0, dyn_params, pol_params, obs_arr, pol_type, hor, n_o, r_rad, mu_val, dt_val):
+                    V, _ = _compute_value_pure(
+                        x0, dyn_params, pol_params, obs_arr, pol_type, hor, r_rad, mu_val, dt_val,
+                        track_width=self.track_width if self.track_width is not None else 1000.0
+                    )
+                    return V
+                
+                # Create value_and_grad wrapper
+                val_and_grad_fn = jax.jit(
+                    jax.value_and_grad(value_only_fn),
+                    static_argnums=(4, 5, 6) # pol_type, hor, n_o (implied by shape for obs array?)
                 )
-                return V
+                
+                # Also create trajectory wrapper
+                traj_fn = jax.jit(
+                    lambda x0, dp, pp, oa, pt, h, no, rr, m, dt: _compute_value_pure(
+                        x0, dp, pp, oa, pt, h, rr, m, dt, 
+                        track_width=self.track_width if self.track_width is not None else 1000.0
+                    )[1],
+                    static_argnums=(4, 5, 6)
+                )
+                
+                self._jit_policy_fns[cache_key] = (val_and_grad_fn, traj_fn)
             
-            V, grad_V = jax.value_and_grad(value_fn)(x0_jax)
+            val_and_grad_fn, traj_fn = self._jit_policy_fns[cache_key]
             
-            # Get trajectory for visualization (use full horizon)
-            _, trajectory = _ROLLOUT_AND_EVALUATE(
+            # Call JIT function
+            V, grad_V = val_and_grad_fn(
                 x0_jax, self.dynamics_params, policy_params, obstacles_array,
-                policy_type, self.backup_horizon_steps, n_obs, robot_radius,
-                self.current_friction, self.dt,
+                policy_type, horizon, n_obs,
+                robot_radius, self.current_friction, self.dt
+            )
+            
+            # Get trajectory for visualization
+            trajectory = traj_fn(
+                x0_jax, self.dynamics_params, policy_params, obstacles_array,
+                policy_type, self.backup_horizon_steps, n_obs,
+                robot_radius, self.current_friction, self.dt
             )
             
             V_dict[name] = float(V)
             grad_V_dict[name] = np.array(grad_V)
             traj_dict[name] = np.array(trajectory)
         
-        # Compute value for MPCC trajectory
+        # Store MPCC trajectory for visualization only
+        # We do NOT include it in V_dict/grad_V_dict because the Nominal trajectory
+        # is often short-sighted (horizon 1.5s) compared to backups (3.0s).
+        # Treating it as a safety candidate causes false confidence and late switching.
         if self.mpcc_trajectory is not None and len(self.mpcc_trajectory) > 0:
-            def mpcc_value_fn(x0):
-                traj = self.mpcc_trajectory
-                traj_with_x0 = jnp.vstack([x0[None, :2], traj[:, :2]])
-                
-                def compute_h_at_xy(xy):
-                    x, y = xy[0], xy[1]
-                    def h_single_obs(obs):
-                        obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
-                        combined_r = obs_r + robot_radius
-                        dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
-                        return dist - combined_r
-                    h_vals = jax.vmap(h_single_obs)(obstacles_array)
-                    return jnp.min(h_vals)
-                
-                h_all = jax.vmap(compute_h_at_xy)(traj_with_x0)
-                return smooth_min(h_all, temperature=20.0)
-            
-            V_mpcc, grad_V_mpcc = jax.value_and_grad(mpcc_value_fn)(x0_jax)
-            V_dict['mpcc'] = float(V_mpcc)
-            grad_full = np.zeros(8)
-            grad_full[:2] = np.array(grad_V_mpcc)[:2]
-            grad_V_dict['mpcc'] = grad_full
             traj_dict['mpcc'] = np.array(self.mpcc_trajectory)
         else:
-            V_dict['mpcc'] = -np.inf
-            grad_V_dict['mpcc'] = np.zeros(8)
             traj_dict['mpcc'] = None
+        
+        return V_dict, grad_V_dict, traj_dict
         
         return V_dict, grad_V_dict, traj_dict
     
@@ -545,26 +505,14 @@ class MPCBF(PCBF):
         
         self.curr_step += 1
         
-        # PCBF Threshold Check:
-        # If the best backup policy provides sufficient safety margin (V > threshold),
-        # we can skip the strict CBF constraint and allow nominal control.
+        # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # This prevents unnecessary braking when far from obstacles.
-        v_threshold = 2.0
-        if V_best > v_threshold:
-            self.status = 'safe'
-            self._update_multi_visualization(traj_dict, best_policy)
-            return u_nom.reshape(-1, 1)
+        # (v_threshold logic removed as requested)
         
         # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.
         # If constraint < 0 at u_nom, the QP will find minimal deviation to satisfy constraint.
         # This is the correct CBF formulation - no heuristic shortcuts.
-        
-        # Normalize gradient to prevent numerical issues
-        max_grad_norm = 50.0
-        grad_norm = np.linalg.norm(grad_V_best)
-        if grad_norm > max_grad_norm:
-            grad_V_best = grad_V_best * (max_grad_norm / grad_norm)
         
         # Solve CBF-QP with best policy's constraint
         u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)

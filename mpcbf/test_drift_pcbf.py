@@ -342,6 +342,7 @@ def setup_controllers(
             cbf_alpha=sim.pcbf_alpha,
             left_lane_y=max(left_lane_y, 5.0),
             right_lane_y=min(right_lane_y, -5.0),
+            safety_margin=1.0,
             ax=ax
         )
         print(f"  Using MPCBF algorithm (multi-policy CBF-QP)")
