@@ -28,13 +28,71 @@ Sign Convention (consistent with safe_control repo):
 
 import functools as ft
 from functools import partial
-from typing import Callable, Optional, Tuple, Any
+from typing import Callable, Optional, Tuple, Any, NamedTuple
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
+import jaxopt
 import cvxpy as cp
+
+
+# =============================================================================
+# NamedTuple Definitions for JAX PyTree Compatibility
+# =============================================================================
+
+class DynamicsParams(NamedTuple):
+    """Dynamics parameters as a NamedTuple for JAX PyTree compatibility.
+    
+    Using NamedTuple avoids JIT recompilation when parameter values change,
+    since JAX treats NamedTuples as data (PyTree nodes) rather than static config.
+    """
+    a: float           # Front axle to CG
+    b: float           # Rear axle to CG
+    m: float           # Vehicle mass
+    Iz: float          # Yaw moment of inertia
+    Cc_f: float        # Front cornering stiffness
+    Cc_r: float        # Rear cornering stiffness
+    r_w: float         # Wheel radius
+    gamma: float       # Numeric stability parameter
+    delta_max: float   # Max steering angle
+    tau_max: float     # Max torque
+    v_max: float       # Max velocity
+    v_min: float       # Min velocity
+    r_max: float       # Max yaw rate
+    beta_max: float    # Max slip angle
+
+
+class LaneChangePolicyParams(NamedTuple):
+    """Lane change policy parameters for JAX PyTree compatibility."""
+    target_y: float
+    Kp_y: float
+    Kp_theta: float
+    Kd_theta: float
+    Kp_delta: float
+    Kp_v: float
+    Kp_tau_dot: float      # Torque rate gain (smooth control, gradient-safe)
+    target_velocity: float
+    delta_max: float
+    delta_dot_max: float
+    tau_max: float
+    tau_dot_max: float
+    theta_des_max: float
+
+
+class StopPolicyParams(NamedTuple):
+    """Stopping policy parameters for JAX PyTree compatibility."""
+    Kd_theta: float
+    Kp_delta: float
+    Kp_v: float
+    Kp_tau_dot: float      # Torque rate gain (smooth control, gradient-safe)
+    delta_max: float
+    delta_dot_max: float
+    tau_max: float
+    tau_dot_max: float
+    stop_threshold: float
+    holding_torque: float
 
 
 def angle_normalize_jax(x):
@@ -299,6 +357,8 @@ class LaneChangeControllerJAX:
     
     This controller steers the vehicle to change to a target lane Y position
     and stabilize there using cascaded PD control.
+    
+    All control laws are smooth and differentiable for gradient computation.
     """
     
     def __init__(self, robot_spec: dict, target_y: float = 4.0):
@@ -310,15 +370,14 @@ class LaneChangeControllerJAX:
         self.target_y = target_y
         
         # Cascaded control gains (tuned for smooth lane change)
-        self.Kp_y = 0.15      # Proportional gain for lateral error -> heading
-        self.Kd_y = 0.8       # Derivative gain
+        self.Kp_y = 0.15          # Proportional gain: lateral error -> heading
+        self.Kp_theta = 1.5       # Proportional gain: heading error -> steering
+        self.Kd_theta = 0.3       # Derivative gain (using yaw rate)
+        self.Kp_delta = 3.0       # Proportional gain: steering error -> steering rate
+        self.Kp_v = 500.0         # Proportional gain: velocity error -> torque
+        self.Kp_tau_dot = 2.0     # Proportional gain: torque error -> torque rate
+                                  # (smooth control, gradient-safe)
         
-        self.Kp_theta = 1.5   # Proportional gain for heading error -> steering
-        self.Kd_theta = 0.3   # Derivative gain (using yaw rate)
-        
-        self.Kp_delta = 3.0   # Proportional gain for steering error -> steering rate
-        
-        self.Kp_v = 500.0     # Proportional gain for velocity tracking
         self.target_velocity = robot_spec.get('v_ref', 8.0)
         
         # Limits
@@ -326,15 +385,36 @@ class LaneChangeControllerJAX:
         self.delta_dot_max = robot_spec.get('delta_dot_max', np.deg2rad(15))
         self.tau_max = robot_spec.get('tau_max', 4000.0)
         self.tau_dot_max = robot_spec.get('tau_dot_max', 8000.0)
-        
         self.theta_des_max = np.deg2rad(15)
     
     def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+        """Compute control (instance method wrapper)."""
+        # Create params tuple from instance attributes
+        params = LaneChangePolicyParams(
+            target_y=self.target_y,
+            Kp_y=self.Kp_y,
+            Kp_theta=self.Kp_theta,
+            Kd_theta=self.Kd_theta,
+            Kp_delta=self.Kp_delta,
+            Kp_v=self.Kp_v,
+            Kp_tau_dot=self.Kp_tau_dot,
+            target_velocity=self.target_velocity,
+            delta_max=self.delta_max,
+            delta_dot_max=self.delta_dot_max,
+            tau_max=self.tau_max,
+            tau_dot_max=self.tau_dot_max,
+            theta_des_max=self.theta_des_max,
+        )
+        return LaneChangeControllerJAX.compute(state, params)
+    
+    @staticmethod
+    def compute(state: jnp.ndarray, params: LaneChangePolicyParams) -> jnp.ndarray:
         """
-        Compute control input for lane change.
+        Compute lane change control input (static method for JIT compatibility).
         
         Args:
             state: JAX array [x, y, theta, r, beta, V, delta, tau] (8,)
+            params: LaneChangePolicyParams NamedTuple
             
         Returns:
             u: JAX array [delta_dot, tau_dot] (2,)
@@ -343,37 +423,34 @@ class LaneChangeControllerJAX:
         y = state[1]
         theta = state[2]
         r = state[3]
-        V = state[5]
+        V = jnp.maximum(state[5], 0.1)  # Minimum velocity for stability
         delta = state[6]
         tau = state[7]
         
-        # Ensure minimum velocity for stability
-        V = jnp.maximum(V, 0.1)
-        
         # ===== Outer loop: Lateral position control =====
-        y_error = self.target_y - y
-        theta_des = jnp.arctan(self.Kp_y * y_error)
-        theta_des = jnp.clip(theta_des, -self.theta_des_max, self.theta_des_max)
+        y_error = params.target_y - y
+        theta_des = jnp.arctan(params.Kp_y * y_error)
+        theta_des = jnp.clip(theta_des, -params.theta_des_max, params.theta_des_max)
         
         # ===== Inner loop: Heading control =====
-        theta_error = angle_normalize_jax(theta_des - theta)
-        delta_des = self.Kp_theta * theta_error - self.Kd_theta * r
-        delta_des = jnp.clip(delta_des, -self.delta_max, self.delta_max)
+        theta_error = jnp.mod(theta_des - theta + jnp.pi, 2 * jnp.pi) - jnp.pi
+        delta_des = params.Kp_theta * theta_error - params.Kd_theta * r
+        delta_des = jnp.clip(delta_des, -params.delta_max, params.delta_max)
         
         # ===== Actuator loop: Steering rate control =====
         delta_error = delta_des - delta
-        delta_dot = self.Kp_delta * delta_error
-        delta_dot = jnp.clip(delta_dot, -self.delta_dot_max, self.delta_dot_max)
+        delta_dot = params.Kp_delta * delta_error
+        delta_dot = jnp.clip(delta_dot, -params.delta_dot_max, params.delta_dot_max)
         
         # ===== Velocity control =====
-        V_error = self.target_velocity - V
-        tau_des = self.Kp_v * V_error
-        tau_des = jnp.clip(tau_des, -self.tau_max, self.tau_max)
+        V_error = params.target_velocity - V
+        tau_des = params.Kp_v * V_error
+        tau_des = jnp.clip(tau_des, -params.tau_max, params.tau_max)
         
-        # Torque rate
+        # ===== Torque rate control (smooth proportional, gradient-safe) =====
         tau_error = tau_des - tau
-        tau_dot = 2000.0 * jnp.sign(tau_error) * jnp.minimum(jnp.abs(tau_error), 1.0)
-        tau_dot = jnp.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
+        tau_dot = params.Kp_tau_dot * tau_error
+        tau_dot = jnp.clip(tau_dot, -params.tau_dot_max, params.tau_dot_max)
         
         return jnp.array([delta_dot, tau_dot])
 
@@ -383,6 +460,8 @@ class StoppingControllerJAX:
     Pure JAX implementation of stopping controller for PCBF.
     
     This controller brings the vehicle to a complete stop.
+    
+    All control laws are smooth and differentiable for gradient computation.
     """
     
     def __init__(self, robot_spec: dict):
@@ -391,11 +470,13 @@ class StoppingControllerJAX:
             robot_spec: Robot specification dictionary
         """
         # Braking control gains
-        self.Kp_v = 1000.0     # Proportional gain for velocity -> torque
+        self.Kp_v = 1000.0         # Proportional gain: velocity -> torque
+        self.Kp_tau_dot = 2.0      # Proportional gain: torque error -> torque rate
+                                   # (smooth control, gradient-safe)
         
         # Steering control gains
-        self.Kd_theta = 0.5    # Derivative gain (yaw rate damping)
-        self.Kp_delta = 3.0    # Proportional gain for steering rate
+        self.Kd_theta = 0.5        # Derivative gain (yaw rate damping)
+        self.Kp_delta = 3.0        # Proportional gain: steering error -> steering rate
         
         # Limits
         self.delta_max = robot_spec.get('delta_max', np.deg2rad(20))
@@ -407,11 +488,29 @@ class StoppingControllerJAX:
         self.holding_torque = -100.0
     
     def __call__(self, state: jnp.ndarray) -> jnp.ndarray:
+        """Compute control (instance method wrapper)."""
+        params = StopPolicyParams(
+            Kd_theta=self.Kd_theta,
+            Kp_delta=self.Kp_delta,
+            Kp_v=self.Kp_v,
+            Kp_tau_dot=self.Kp_tau_dot,
+            delta_max=self.delta_max,
+            delta_dot_max=self.delta_dot_max,
+            tau_max=self.tau_max,
+            tau_dot_max=self.tau_dot_max,
+            stop_threshold=self.stop_velocity_threshold,
+            holding_torque=self.holding_torque,
+        )
+        return StoppingControllerJAX.compute(state, params)
+    
+    @staticmethod
+    def compute(state: jnp.ndarray, params: StopPolicyParams) -> jnp.ndarray:
         """
-        Compute control input for stopping.
+        Compute stopping control input (static method for JIT compatibility).
         
         Args:
             state: JAX array [x, y, theta, r, beta, V, delta, tau] (8,)
+            params: StopPolicyParams NamedTuple
             
         Returns:
             u: JAX array [delta_dot, tau_dot] (2,)
@@ -422,25 +521,22 @@ class StoppingControllerJAX:
         delta = state[6]
         tau = state[7]
         
-        # ===== Braking control =====
-        # Smooth braking policy - linear in velocity with saturation
-        # This is differentiable (unlike sign()-based controllers)
-        tau_braking = -self.Kp_v * V + self.holding_torque
-        tau_des = jnp.clip(tau_braking, -self.tau_max, self.tau_max)
+        # ===== Braking control (smooth proportional, gradient-safe) =====
+        tau_braking = -params.Kp_v * V + params.holding_torque
+        tau_des = jnp.clip(tau_braking, -params.tau_max, params.tau_max)
         
-        # Torque rate - smooth proportional control
-        # Use lower gain to avoid gradient explosion in PCBF
+        # ===== Torque rate control =====
         tau_error = tau_des - tau
-        tau_dot = 2.0 * tau_error  # Lower gain for stable gradients
-        tau_dot = jnp.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
+        tau_dot = params.Kp_tau_dot * tau_error
+        tau_dot = jnp.clip(tau_dot, -params.tau_dot_max, params.tau_dot_max)
         
         # ===== Steering control =====
-        delta_des = -self.Kd_theta * r
-        delta_des = jnp.clip(delta_des, -self.delta_max, self.delta_max)
+        delta_des = -params.Kd_theta * r
+        delta_des = jnp.clip(delta_des, -params.delta_max, params.delta_max)
         
         delta_error = delta_des - delta
-        delta_dot = self.Kp_delta * delta_error
-        delta_dot = jnp.clip(delta_dot, -self.delta_dot_max, self.delta_dot_max)
+        delta_dot = params.Kp_delta * delta_error
+        delta_dot = jnp.clip(delta_dot, -params.delta_dot_max, params.delta_dot_max)
         
         return jnp.array([delta_dot, tau_dot])
 
@@ -497,10 +593,9 @@ def _create_single_obs_h_func(obstacle_x: float, obstacle_y: float, combined_rad
         return dist - combined_radius  # Positive when safe (far from obstacle)
     return h_func
 
-
 def _rollout_trajectory(
-    dynamics_params: dict,
-    policy_params: dict,
+    dynamics_params: DynamicsParams,
+    policy_params,  # LaneChangePolicyParams or StopPolicyParams
     policy_type: str,
     x0: jnp.ndarray,
     horizon: int,
@@ -511,8 +606,8 @@ def _rollout_trajectory(
     Rollout trajectory using backup policy. JIT-compiled.
     
     Args:
-        dynamics_params: Dictionary of dynamics parameters
-        policy_params: Dictionary of policy parameters
+        dynamics_params: DynamicsParams NamedTuple
+        policy_params: LaneChangePolicyParams or StopPolicyParams NamedTuple
         policy_type: 'lane_change' or 'stop'
         x0: Initial state (8,)
         horizon: Number of steps
@@ -522,27 +617,27 @@ def _rollout_trajectory(
     Returns:
         trajectory: (horizon+1, 8) array of states
     """
-    # Create dynamics step function with parameters
+    # Create dynamics step function with parameters (using NamedTuple attribute access)
     def step_fn(x: jnp.ndarray, u: jnp.ndarray) -> jnp.ndarray:
         """Single dynamics step."""
-        # Extract parameters
-        a = dynamics_params['a']
-        b = dynamics_params['b']
-        m = dynamics_params['m']
-        Iz = dynamics_params['Iz']
-        Cc_f = dynamics_params['Cc_f']
-        Cc_r = dynamics_params['Cc_r']
-        r_w = dynamics_params['r_w']
-        gamma = dynamics_params['gamma']
+        # Extract parameters via NamedTuple attributes
+        a = dynamics_params.a
+        b = dynamics_params.b
+        m = dynamics_params.m
+        Iz = dynamics_params.Iz
+        Cc_f = dynamics_params.Cc_f
+        Cc_r = dynamics_params.Cc_r
+        r_w = dynamics_params.r_w
+        gamma = dynamics_params.gamma
         gravity = 9.81
         
         # Limits
-        delta_max = dynamics_params['delta_max']
-        tau_max = dynamics_params['tau_max']
-        v_max = dynamics_params['v_max']
-        v_min = dynamics_params['v_min']
-        r_max = dynamics_params['r_max']
-        beta_max = dynamics_params['beta_max']
+        delta_max = dynamics_params.delta_max
+        tau_max = dynamics_params.tau_max
+        v_max = dynamics_params.v_max
+        v_min = dynamics_params.v_min
+        r_max = dynamics_params.r_max
+        beta_max = dynamics_params.beta_max
         
         # Normal forces
         L = a + b
@@ -602,89 +697,12 @@ def _rollout_trajectory(
         
         return jnp.array([x_next, y_next, theta_next, r_next, beta_next, V_next, delta_next, tau_next])
     
-    # Policy function
+    # Policy function: call the appropriate static controller method
     def policy_fn(state: jnp.ndarray) -> jnp.ndarray:
         if policy_type == 'lane_change':
-            target_y = policy_params['target_y']
-            Kp_y = policy_params['Kp_y']
-            Kp_theta = policy_params['Kp_theta']
-            Kd_theta = policy_params['Kd_theta']
-            Kp_delta = policy_params['Kp_delta']
-            Kp_v = policy_params['Kp_v']
-            target_velocity = policy_params['target_velocity']
-            delta_max = policy_params['delta_max']
-            delta_dot_max = policy_params['delta_dot_max']
-            tau_max = policy_params['tau_max']
-            tau_dot_max = policy_params['tau_dot_max']
-            theta_des_max = policy_params['theta_des_max']
-            
-            y = state[1]
-            theta = state[2]
-            r = state[3]
-            V = jnp.maximum(state[5], 0.1)
-            delta = state[6]
-            tau = state[7]
-            
-            y_error = target_y - y
-            theta_des = jnp.arctan(Kp_y * y_error)
-            theta_des = jnp.clip(theta_des, -theta_des_max, theta_des_max)
-            
-            theta_error = jnp.mod(theta_des - theta + jnp.pi, 2 * jnp.pi) - jnp.pi
-            delta_des = Kp_theta * theta_error - Kd_theta * r
-            delta_des = jnp.clip(delta_des, -delta_max, delta_max)
-            
-            delta_error = delta_des - delta
-            delta_dot = Kp_delta * delta_error
-            delta_dot = jnp.clip(delta_dot, -delta_dot_max, delta_dot_max)
-            
-            V_error = target_velocity - V
-            tau_des = Kp_v * V_error
-            tau_des = jnp.clip(tau_des, -tau_max, tau_max)
-            
-            tau_error = tau_des - tau
-            # Smooth proportional control (avoids sign() which has zero gradient)
-            # Use lower gain to avoid gradient explosion in PCBF
-            tau_dot = 2.0 * tau_error
-            tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
-            
-            return jnp.array([delta_dot, tau_dot])
+            return LaneChangeControllerJAX.compute(state, policy_params)
         else:  # stop
-            Kd_theta = policy_params['Kd_theta']
-            Kp_delta = policy_params['Kp_delta']
-            Kp_v = policy_params['Kp_v']
-            delta_max = policy_params['delta_max']
-            delta_dot_max = policy_params['delta_dot_max']
-            tau_max = policy_params['tau_max']
-            tau_dot_max = policy_params['tau_dot_max']
-            stop_threshold = policy_params['stop_threshold']
-            holding_torque = policy_params['holding_torque']
-            
-            r = state[3]
-            V = state[5]
-            delta = state[6]
-            tau = state[7]
-            
-            # Smooth braking policy - linear in velocity with saturation
-            # At V=10, tau_des = -10000 (saturates to -tau_max)
-            # At V=0, tau_des = holding_torque
-            tau_braking = -Kp_v * V + holding_torque
-            tau_des = jnp.clip(tau_braking, -tau_max, tau_max)
-            
-            # Smooth tau_dot controller - linear proportional control
-            # (avoids sign() which has zero gradient)
-            # Use lower gain to avoid gradient explosion
-            tau_error = tau_des - tau
-            tau_dot = 2.0 * tau_error  # Lower gain for stable gradients
-            tau_dot = jnp.clip(tau_dot, -tau_dot_max, tau_dot_max)
-            
-            delta_des = -Kd_theta * r
-            delta_des = jnp.clip(delta_des, -delta_max, delta_max)
-            
-            delta_error = delta_des - delta
-            delta_dot = Kp_delta * delta_error
-            delta_dot = jnp.clip(delta_dot, -delta_dot_max, delta_dot_max)
-            
-            return jnp.array([delta_dot, tau_dot])
+            return StoppingControllerJAX.compute(state, policy_params)
     
     def body_fn(carry, _):
         x = carry
@@ -696,9 +714,7 @@ def _rollout_trajectory(
     return jnp.vstack([x0[None, :], trajectory])
 
 
-# JIT-compiled value function computation
-@partial(jax.jit, static_argnums=(4, 5))
-def _compute_value_jit(
+def _compute_value_pure(
     x0: jnp.ndarray,
     dynamics_params: dict,
     policy_params: dict,
@@ -708,12 +724,13 @@ def _compute_value_jit(
     robot_radius: float,
     mu: float,
     dt: float,
+    track_width: float = 1000.0,
 ) -> Tuple[float, jnp.ndarray]:
     """
-    JIT-compiled value function computation.
+    Pure JAX value function computation (no JIT).
     
     V(x0) = min_{t ∈ [0, T]} h(x(t))
-    where h(x) = min_{obs} (dist_to_obs - combined_radius)
+    where h(x) = min(dist_to_obs - combined_radius, dist_to_bound)
     h > 0 means SAFE
     """
     # Rollout trajectory
@@ -722,19 +739,38 @@ def _compute_value_jit(
     
     # Compute h values along trajectory
     def compute_h_at_state(state: jnp.ndarray) -> float:
-        """Compute barrier h(x) = min over obstacles of (dist - combined_radius)."""
+        """Compute barrier h(x) = smooth_min(obstacle_safe_margin, boundary_safe_margin)."""
         x, y = state[0], state[1]
         
+        # Obstacle constraints
         def h_single_obs(obs):
             obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
             combined_r = obs_r + robot_radius
             dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
             return dist - combined_r  # Positive when safe
         
-        # Compute h for all obstacles
-        h_vals = jax.vmap(h_single_obs)(obstacles_array)
-        # Take min over obstacles (most dangerous obstacle)
-        return jnp.min(h_vals)
+        # If obstacles exist, check them
+        # Use smooth_min for obstacles
+        h_obs = jnp.where(
+            obstacles_array.shape[0] > 0,
+            smooth_min(jax.vmap(h_single_obs)(obstacles_array), temperature=5.0),
+            100.0 # Safe if no obstacles
+        )
+        
+        # Boundary constraints: y <= y_max - r, y >= y_min + r
+        # y_max = track_width/2, y_min = -track_width/2
+        y_max = track_width / 2.0 - robot_radius
+        y_min = -track_width / 2.0 + robot_radius
+        
+        h_bound_upper = y_max - y
+        h_bound_lower = y - y_min
+        
+        # smooth_min for boundaries
+        h_bound = smooth_min(jnp.array([h_bound_upper, h_bound_lower]), temperature=5.0)
+        
+        # Combine obstacle and boundary constraints (taking smooth_min = safety)
+        # Use large track_width (e.g. 1000) to disable boundary check effectively
+        return smooth_min(jnp.array([h_obs, h_bound]), temperature=5.0)
     
     # Compute h for all states in trajectory
     h_all = jax.vmap(compute_h_at_state)(trajectory)
@@ -743,6 +779,12 @@ def _compute_value_jit(
     V = smooth_min(h_all, temperature=20.0)
     
     return V, trajectory
+
+# JIT-compiled version for direct use
+_compute_value_jit = jax.jit(
+    _compute_value_pure,
+    static_argnums=(4, 5)
+)
 
 
 def compute_value_function(
@@ -815,6 +857,7 @@ def compute_value_function_multi_obs(
     robot_radius: float,
     horizon: int,
     mu: float = 1.0,
+    track_width: float = 1000.0,
 ) -> Tuple[float, jnp.ndarray]:
     """
     Compute value function with multiple obstacles.
@@ -832,7 +875,21 @@ def compute_value_function_multi_obs(
             dist = jnp.sqrt(dist_sq + 1e-8)
             h_vals.append(dist - combined_radius)  # Positive when safe
         # Take min over obstacles (most dangerous)
-        return jnp.min(jnp.array(h_vals))
+        # Take min over obstacles (most dangerous)
+        h_obs = jnp.min(jnp.array(h_vals)) if h_vals else 100.0
+        
+        # Boundary constraints: y <= y_max - r, y >= y_min + r
+        # y_max = track_width/2, y_min = -track_width/2
+        # h_bound1 = (track_width/2 - robot_radius) - y
+        # h_bound2 = y - (-track_width/2 + robot_radius)
+        if track_width < 900.0:  # If track width is set (arbitrary large check)
+            y_limit = track_width / 2.0 - robot_radius
+            h_bound1 = y_limit - y
+            h_bound2 = y - (-y_limit)
+            h_bounds = jnp.min(jnp.array([h_bound1, h_bound2]))
+            return jnp.minimum(h_obs, h_bounds)
+        else:
+            return h_obs
     
     def body_fn(carry, _):
         x = carry
@@ -872,6 +929,7 @@ class PCBF:
         dt: float = 0.05,
         backup_horizon: float = 10.0,
         cbf_alpha: float = 1.0,
+        safety_margin: float = 0.0,
         ax=None,
     ):
         """
@@ -883,6 +941,7 @@ class PCBF:
             dt: Time step
             backup_horizon: Horizon for backup policy rollout (seconds)
             cbf_alpha: CBF class-K function parameter
+            safety_margin: Extra margin added to robot radius for collision checking
             ax: Matplotlib axis for visualization
         """
         self.robot = robot
@@ -894,6 +953,7 @@ class PCBF:
         self.stop_backup_horizon = 3.0
         self.stop_backup_horizon_steps = int(self.stop_backup_horizon / dt)
         self.cbf_alpha = cbf_alpha
+        self.safety_margin = safety_margin
         self.ax = ax
         
         # JAX dynamics
@@ -937,27 +997,30 @@ class PCBF:
         # JIT-compiled functions (created on first use)
         self._jit_value_and_grad = None
         
+        # Track boundaries
+        self.track_width = None
+        
         if ax is not None:
             self._setup_visualization()
     
     def _setup_dynamics_params(self):
-        """Setup dynamics parameters dictionary for JIT compilation."""
-        self.dynamics_params = {
-            'a': float(self.robot_spec.get('a', 1.4)),
-            'b': float(self.robot_spec.get('b', 1.4)),
-            'm': float(self.robot_spec.get('m', 2500.0)),
-            'Iz': float(self.robot_spec.get('Iz', 5000.0)),
-            'Cc_f': float(self.robot_spec.get('Cc_f', 80000.0)),
-            'Cc_r': float(self.robot_spec.get('Cc_r', 100000.0)),
-            'r_w': float(self.robot_spec.get('r_w', 0.35)),
-            'gamma': float(self.robot_spec.get('gamma', 0.95)),
-            'delta_max': float(self.robot_spec.get('delta_max', np.deg2rad(20))),
-            'tau_max': float(self.robot_spec.get('tau_max', 4000.0)),
-            'v_max': float(self.robot_spec.get('v_max', 20.0)),
-            'v_min': float(self.robot_spec.get('v_min', 0.0)),
-            'r_max': float(self.robot_spec.get('r_max', 2.0)),
-            'beta_max': float(self.robot_spec.get('beta_max', np.deg2rad(45))),
-        }
+        """Setup dynamics parameters as NamedTuple for JIT compilation."""
+        self.dynamics_params = DynamicsParams(
+            a=float(self.robot_spec.get('a', 1.4)),
+            b=float(self.robot_spec.get('b', 1.4)),
+            m=float(self.robot_spec.get('m', 2500.0)),
+            Iz=float(self.robot_spec.get('Iz', 5000.0)),
+            Cc_f=float(self.robot_spec.get('Cc_f', 80000.0)),
+            Cc_r=float(self.robot_spec.get('Cc_r', 100000.0)),
+            r_w=float(self.robot_spec.get('r_w', 0.35)),
+            gamma=float(self.robot_spec.get('gamma', 0.95)),
+            delta_max=float(self.robot_spec.get('delta_max', np.deg2rad(20))),
+            tau_max=float(self.robot_spec.get('tau_max', 4000.0)),
+            v_max=float(self.robot_spec.get('v_max', 20.0)),
+            v_min=float(self.robot_spec.get('v_min', 0.0)),
+            r_max=float(self.robot_spec.get('r_max', 2.0)),
+            beta_max=float(self.robot_spec.get('beta_max', np.deg2rad(45))),
+        )
     
     def _setup_visualization(self):
         """Setup visualization handles."""
@@ -988,39 +1051,41 @@ class PCBF:
         if 'LaneChange' in controller_name:
             self.backup_policy_jax = LaneChangeControllerJAX(self.robot_spec, target_y=target)
             self.policy_type = 'lane_change'
-            self.policy_params = {
-                'target_y': float(target),
-                'Kp_y': 0.15,
-                'Kp_theta': 1.5,
-                'Kd_theta': 0.3,
-                'Kp_delta': 3.0,
-                'Kp_v': 500.0,
-                'target_velocity': float(self.robot_spec.get('v_ref', 8.0)),
-                'delta_max': float(self.robot_spec.get('delta_max', np.deg2rad(20))),
-                'delta_dot_max': float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
-                'tau_max': float(self.robot_spec.get('tau_max', 4000.0)),
-                'tau_dot_max': float(self.robot_spec.get('tau_dot_max', 8000.0)),
-                'theta_des_max': float(np.deg2rad(15)),
-            }
+            self.policy_params = LaneChangePolicyParams(
+                target_y=float(target),
+                Kp_y=0.15,
+                Kp_theta=1.5,
+                Kd_theta=0.3,
+                Kp_delta=3.0,
+                Kp_v=500.0,
+                Kp_tau_dot=2.0,  # Torque rate gain (smooth control, gradient-safe)
+                target_velocity=float(self.robot_spec.get('v_ref', 8.0)),
+                delta_max=float(self.robot_spec.get('delta_max', np.deg2rad(20))),
+                delta_dot_max=float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
+                tau_max=float(self.robot_spec.get('tau_max', 4000.0)),
+                tau_dot_max=float(self.robot_spec.get('tau_dot_max', 8000.0)),
+                theta_des_max=float(np.deg2rad(15)),
+            )
         elif 'Stop' in controller_name:
             self.backup_policy_jax = StoppingControllerJAX(self.robot_spec)
             self.policy_type = 'stop'
-            self.policy_params = {
-                'Kd_theta': 0.5,
-                'Kp_delta': 3.0,
-                'Kp_v': 1000.0,
-                'delta_max': float(self.robot_spec.get('delta_max', np.deg2rad(20))),
-                'delta_dot_max': float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
-                'tau_max': float(self.robot_spec.get('tau_max', 4000.0)),
-                'tau_dot_max': float(self.robot_spec.get('tau_dot_max', 8000.0)),
-                'stop_threshold': 0.05,
-                'holding_torque': -100.0,
-            }
+            self.policy_params = StopPolicyParams(
+                Kd_theta=0.5,
+                Kp_delta=3.0,
+                Kp_v=1000.0,
+                Kp_tau_dot=2.0,  # Torque rate gain (smooth control, gradient-safe)
+                delta_max=float(self.robot_spec.get('delta_max', np.deg2rad(20))),
+                delta_dot_max=float(self.robot_spec.get('delta_dot_max', np.deg2rad(15))),
+                tau_max=float(self.robot_spec.get('tau_max', 4000.0)),
+                tau_dot_max=float(self.robot_spec.get('tau_dot_max', 8000.0)),
+                stop_threshold=0.05,
+                holding_torque=-100.0,
+            )
         else:
             # Fallback to wrapper (won't work with gradients, but can still be used for simulation)
             self.backup_policy_jax = BackupPolicyJAX(backup_controller, target)
             self.policy_type = 'custom'
-            self.policy_params = {}
+            self.policy_params = None
             print(f"Warning: Using BackupPolicyJAX wrapper for {controller_name}. Gradients may not work.")
         
         # Reset JIT cache when controller changes
@@ -1034,6 +1099,8 @@ class PCBF:
             env: DriftingEnv instance
         """
         self.env = env
+        if hasattr(env, 'track_width'):
+            self.track_width = float(env.track_width)
         self._update_obstacles()
     
     def _update_obstacles(self):
@@ -1068,7 +1135,7 @@ class PCBF:
             grad_V: Gradient of V w.r.t. x (8,)
             trajectory: Backup rollout trajectory (horizon+1, 8)
         """
-        robot_radius = self.robot_spec.get('radius', 1.5)
+        robot_radius = self.robot_spec.get('radius', 1.5) + self.safety_margin
         
         if len(self.obstacles) == 0:
             # No obstacles - return a large POSITIVE value (safe)
@@ -1079,41 +1146,22 @@ class PCBF:
         
         # Create JIT-compiled value_and_grad function if not exists
         if self._jit_value_and_grad is None:
-            # Create the JIT-compiled function with static arguments
-            @partial(jax.jit, static_argnums=(4, 5))
-            def _value_fn_jit(x0, dynamics_params, policy_params, obstacles_arr, 
-                             policy_type, horizon, robot_r, mu, dt):
-                """JIT-compiled value function."""
-                trajectory = _rollout_trajectory(
-                    dynamics_params, policy_params, policy_type,
-                    x0, horizon, mu, dt
+            # Create value_and_grad wrapper using the module-level pure function
+            def value_only(x0, dynamics_params, policy_params, obstacles_arr,
+                          policy_type, horizon, robot_r, mu, dt, track_width):
+                # Call the pure function (not JIT yet inside value_and_grad)
+                V, trajectory = _compute_value_pure(
+                    x0, dynamics_params, policy_params, obstacles_arr,
+                    policy_type, horizon, robot_r, mu, dt, track_width
                 )
-                
-                # Compute h values along trajectory
-                def compute_h_at_state(state):
-                    x, y = state[0], state[1]
-                    def h_single_obs(obs):
-                        obs_x, obs_y, obs_r = obs[0], obs[1], obs[2]
-                        combined_r = obs_r + robot_r
-                        dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
-                        return dist - combined_r
-                    h_vals = jax.vmap(h_single_obs)(obstacles_arr)
-                    return jnp.min(h_vals)
-                
-                h_all = jax.vmap(compute_h_at_state)(trajectory)
-                V = smooth_min(h_all, temperature=20.0)
                 return V, trajectory
             
-            # Create value_and_grad wrapper
-            def value_only(x0, dynamics_params, policy_params, obstacles_arr,
-                          policy_type, horizon, robot_r, mu, dt):
-                V, _ = _value_fn_jit(x0, dynamics_params, policy_params, obstacles_arr,
-                                     policy_type, horizon, robot_r, mu, dt)
-                return V
+            # Use the module-level JIT function for value only calls
+            self._jit_value_fn = _compute_value_jit
             
-            self._jit_value_fn = _value_fn_jit
+            # Create JIT-compiled value_and_grad
             self._jit_value_and_grad = jax.jit(
-                jax.value_and_grad(value_only),
+                jax.value_and_grad(value_only, has_aux=True),
                 static_argnums=(4, 5)
             )
         
@@ -1126,7 +1174,7 @@ class PCBF:
             horizon_steps = self.backup_horizon_steps
         
         # Call JIT-compiled functions
-        V, grad_V = self._jit_value_and_grad(
+        (V, trajectory), grad_V = self._jit_value_and_grad(
             x0_jax,
             self.dynamics_params,
             self.policy_params,
@@ -1135,7 +1183,8 @@ class PCBF:
             horizon_steps,
             robot_radius,
             self.current_friction,
-            self.dt
+            self.dt,
+            self.track_width if self.track_width is not None else 1000.0,
         )
         
         # Get trajectory for visualization (use full horizon for better viz)
@@ -1148,7 +1197,8 @@ class PCBF:
             self.backup_horizon_steps,  # Full horizon for visualization
             robot_radius,
             self.current_friction,
-            self.dt
+            self.dt,
+            self.track_width if self.track_width is not None else 1000.0,  # Pass track width
         )
         
         return V, grad_V, trajectory
@@ -1162,16 +1212,13 @@ class PCBF:
         G: np.ndarray,
     ) -> np.ndarray:
         """
-        Solve the CBF-QP to find safe control.
+        Solve the CBF-QP using CVXPY.
         
         With sign convention h > 0 = SAFE:
         
         min_u ||u - u_nom||^2
         s.t.  ∇V^T (f + Gu) + α V ≥ 0  (CBF constraint: V_dot ≥ -α V)
               u_min ≤ u ≤ u_max
-        
-        Rearranging for QP:
-              -∇V^T G u ≤ ∇V^T f + α V
         
         Args:
             u_nom: Nominal control (2,)
@@ -1185,66 +1232,59 @@ class PCBF:
         """
         nu = 2
         
-        # Decision variable
-        u = cp.Variable(nu)
+        # Scaling factors (normalize decision variables to roughly [-1, 1])
+        # This is critical for SCS performance when inputs have vastly different scales
+        # (steering ~0.2 vs torque ~8000)
+        u_scale = self.u_max
         
-        # QP cost: ||u - u_nom||^2
-        cost = cp.sum_squares(u - u_nom)
+        # Normalized nominal control
+        u_nom_scaled = u_nom / u_scale
         
-        # CBF constraint: ∇V^T (f + Gu) + α V ≥ 0
-        # Rearranged: -∇V^T G u ≤ ∇V^T f + α V
-        # Or equivalently: ∇V^T G u ≥ -∇V^T f - α V
+        # Normalized decision variable
+        u_scaled = cp.Variable(nu)
+        
+        # QP cost: ||W * (u_scaled - u_nom_scaled)||^2
+        # We want to encourage steering (avoidance) over braking (stopping)
+        # So we penalize torque deviation (braking) more heavily
+        # u[0] is steering, u[1] is torque
+        weights = np.array([1.0, 10.0])
+        weighted_diff = cp.multiply(weights, u_scaled - u_nom_scaled)
+        cost = cp.sum_squares(weighted_diff)
+        
+        # CBF constraint: -∇V^T G (u_scale * u_scaled) <= cbf_rhs
         grad_V_G = grad_V @ G  # (2,)
         grad_V_f = grad_V @ f  # scalar
         
-        # Constraint: -grad_V_G @ u <= grad_V_f + alpha * V
-        # Which is: grad_V_G @ u >= -grad_V_f - alpha * V
         cbf_rhs = grad_V_f + self.cbf_alpha * V
         
+        # Scale the gradient matrix by u_scale component-wise
+        A_cbf = -grad_V_G * u_scale
+        
         constraints = [
-            -grad_V_G @ u <= cbf_rhs + 1e-4,  # Small margin for numerical stability
-            u >= self.u_min,
-            u <= self.u_max,
+            A_cbf @ u_scaled <= cbf_rhs + 1e-4,
+            u_scaled >= -1.0,  # Limits are now [-1, 1] since symmetric
+            u_scaled <= 1.0,
         ]
         
-        # Solve QP with OSQP (robust settings)
+        # Solve QP with SCS
         try:
             problem = cp.Problem(cp.Minimize(cost), constraints)
-            
-            # Use OSQP with more robust settings
-            problem.solve(
-                solver=cp.OSQP, 
-                verbose=False, 
-                max_iter=20000,
-                eps_abs=1e-6, 
-                eps_rel=1e-6,
-                polish=True
-            )
+            problem.solve(solver=cp.SCS, verbose=False, max_iters=2000, eps=1e-4)
             
             if problem.status in ['optimal', 'optimal_inaccurate']:
                 self.status = 'optimal'
-                return u.value
-            elif problem.status == 'infeasible':
+                # Unscale the result
+                return u_scaled.value * u_scale
+            elif problem.status in ['infeasible', 'infeasible_inaccurate']:
                 self.status = 'infeasible'
-                # When infeasible, use backup policy control instead of nominal
-                return np.clip(u_nom, self.u_min, self.u_max)
+                raise ValueError(f"CBF-QP infeasible: backup trajectory cannot guarantee safety")
             else:
-                # For solver failures (user_limit, etc.), try with SCS
-                try:
-                    problem.solve(solver=cp.SCS, verbose=False, max_iters=5000)
-                    if problem.status in ['optimal', 'optimal_inaccurate']:
-                        self.status = 'optimal'
-                        return u.value
-                except:
-                    pass
-                
                 self.status = problem.status
-                return np.clip(u_nom, self.u_min, self.u_max)
+                raise ValueError(f"CBF-QP failed with status: {problem.status}")
                 
-        except Exception as e:
-            # Silently handle solver errors and use nominal
+        except cp.error.SolverError as e:
             self.status = 'error'
-            return np.clip(u_nom, self.u_min, self.u_max)
+            raise ValueError(f"CBF-QP solver error: {e}")
     
     def solve_control_problem(
         self,
@@ -1298,26 +1338,11 @@ class PCBF:
             self.status = 'error'
             return u_nom.reshape(-1, 1)
         
-        # Check gradient magnitude and value function
+        # Check gradient magnitude for numerical stability
         grad_norm = np.linalg.norm(grad_V)
+        max_grad_norm = 50.0
         
-        # Determine thresholds based on backup policy type
-        if self.policy_type == 'stop':
-            # For stopping backup: use normal CBF-QP but with appropriate thresholds
-            v_threshold = 5.0  # Activate when backup trajectory gets close
-            max_grad_norm = 50.0
-        else:
-            # For lane change: normal CBF-QP approach
-            v_threshold = 2.0
-            max_grad_norm = 50.0
-        
-        # If V is above threshold, backup trajectory is safe - use nominal
-        if V > v_threshold:
-            self.status = 'safe'
-            self._update_visualization(trajectory)
-            return u_nom.reshape(-1, 1)
-        
-        # Normalize gradient to max_grad_norm
+        # Normalize gradient to max_grad_norm if too large
         # This keeps the gradient direction but controls magnitude
         if grad_norm > max_grad_norm:
             grad_V = grad_V * (max_grad_norm / grad_norm)
