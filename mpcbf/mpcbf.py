@@ -281,7 +281,7 @@ class MPCBF(PCBF):
         left_lane_y: float = 5.0,
         right_lane_y: float = -5.0,
         safety_margin: float = 0.0,
-        max_operator: str = 'c',  # Selection operator: 'c', 'v', or 'input_space'
+        max_operator: str = 'input_space',  # Selection operator: 'c', 'v', or 'input_space'
         ax=None,
     ):
         """

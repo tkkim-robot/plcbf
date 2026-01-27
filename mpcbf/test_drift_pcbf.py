@@ -840,9 +840,9 @@ def main():
                         help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
-    parser.add_argument('--max-operator', type=str, default='c',
-                        choices=['c', 'v', 'input_space'],
-                        help='MPCBF selection operator: c (permissiveness), v (safety margin), input_space (control authority)')
+    parser.add_argument('--max-operator', type=str, default='input_space',
+                        choices=MAX_OPERATOR_TYPES,
+                        help=f"Selection operator (default: input_space, choices: {MAX_OPERATOR_TYPES})")
     
     args = parser.parse_args()
     

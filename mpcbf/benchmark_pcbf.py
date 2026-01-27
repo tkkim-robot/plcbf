@@ -23,7 +23,7 @@ from mpcbf.pcbf import PCBF
 from mpcbf.mpcbf import MPCBF
 
 
-def create_test_setup():
+def create_test_setup(max_operator='input_space'):
     """Create a minimal test setup for benchmarking."""
     # Track config
     track_type = 'straight'
@@ -115,6 +115,7 @@ def create_test_setup():
         left_lane_y=left_lane_y,
         right_lane_y=right_lane_y,
         safety_margin=1.0,
+        max_operator=max_operator,
         ax=None  # No visualization
     )
     mpcbf.set_environment(env)
@@ -122,10 +123,10 @@ def create_test_setup():
     return car, mpcc, pcbf, mpcbf, env, robot_spec
 
 
-def run_benchmark(num_steps=200, warmup_steps=10):
+def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
     """Run benchmark and return timing statistics."""
-    print("Setting up benchmark...")
-    car, mpcc, pcbf, mpcbf, env, robot_spec = create_test_setup()
+    print(f"Setting up benchmark (max_operator={max_operator})...")
+    car, mpcc, pcbf, mpcbf, env, robot_spec = create_test_setup(max_operator)
     
     # Storage for timing
     pcbf_times = []
@@ -239,9 +240,11 @@ def main():
                         help='Number of steps to benchmark (default: 200)')
     parser.add_argument('--warmup', type=int, default=10,
                         help='Number of warmup steps (default: 10)')
+    parser.add_argument('--max-operator', type=str, default='input_space', choices=['c', 'v', 'input_space'],
+                        help='MPCBF selection operator (default: input_space)')
     args = parser.parse_args()
     
-    results = run_benchmark(num_steps=args.steps, warmup_steps=args.warmup)
+    results = run_benchmark(num_steps=args.steps, warmup_steps=args.warmup, max_operator=args.max_operator)
     print_results(results)
     
     # Return for programmatic use
