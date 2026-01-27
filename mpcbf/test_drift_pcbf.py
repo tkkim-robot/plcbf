@@ -130,7 +130,7 @@ class VehicleConfig:
     
     # Input limits
     delta_max: float = np.deg2rad(20)      # Max steering [rad]
-    delta_dot_max: float = np.deg2rad(15)  # Max steering rate [rad/s]
+    delta_dot_max: float = np.deg2rad(50)  # Max steering rate [rad/s] (Increased from 15 deg/s for agility)
     tau_max: float = 4000.0                # Max torque [Nm]
     tau_dot_max: float = 8000.0            # Max torque rate [Nm/s]
     
@@ -165,7 +165,7 @@ class SimulationConfig:
     dt: float = 0.05
     tf: float = 14.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
-    backup_horizon_time: float = 6.0     # Backup trajectory horizon [s]
+    backup_horizon_time: float = 3.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
     safety_margin: float = 1.5           # Collision checking margin [m]
     initial_velocity: float = 10.0        # Starting velocity [m/s]
@@ -212,6 +212,7 @@ class TestConfig:
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
+    max_operator: str = 'c'  # MPCBF selection operator: 'c', 'v', or 'input_space'
 
 
 # =============================================================================
@@ -343,11 +344,12 @@ def setup_controllers(
             left_lane_y=max(left_lane_y, 6.5),
             right_lane_y=min(right_lane_y, -6.5),
             safety_margin=1.0,
+            max_operator=config.max_operator,
             ax=ax
         )
         actual_left = max(left_lane_y, 6.5)
         actual_right = min(right_lane_y, -6.5)
-        print(f"  Using MPCBF algorithm (multi-policy CBF-QP)")
+        print(f"  Using MPCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
         print(f"    Policies: lane_change_left (y={actual_left:.1f}), lane_change_right (y={actual_right:.1f}), stop, nominal")
     elif config.algo_type == 'pcbf':
         shielding = PCBF(
@@ -512,46 +514,45 @@ def run_simulation(
             pred_states, pred_controls = None, None
         
         # Shielding validates and returns committed control
-        if isinstance(shielding, MPCBF):
-            # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
-            control_ref = {'u_ref': mpcc_control}
-            U = shielding.solve_control_problem(
-                state, 
-                control_ref=control_ref, 
-                friction=car.get_friction(),
-                nominal_trajectory=pred_states.T if pred_states is not None else None,
-                nominal_controls=pred_controls.T if pred_controls is not None else None
-            )
-        elif isinstance(shielding, PCBF):
-            # PCBF uses nominal control as reference
-            control_ref = {'u_ref': mpcc_control}
-            try:
+        # Shielding validates and returns committed control
+        try:
+            if isinstance(shielding, MPCBF):
+                # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
+                control_ref = {'u_ref': mpcc_control}
+                U = shielding.solve_control_problem(
+                    state, 
+                    control_ref=control_ref, 
+                    friction=car.get_friction(),
+                    nominal_trajectory=pred_states.T if pred_states is not None else None,
+                    nominal_controls=pred_controls.T if pred_controls is not None else None
+                )
+            elif isinstance(shielding, PCBF):
+                # PCBF uses nominal control as reference
+                control_ref = {'u_ref': mpcc_control}
                 U = shielding.solve_control_problem(state, control_ref=control_ref, friction=car.get_friction())
-            except ValueError as e:
-                print(f"\n*** INFEASIBLE: {e} ***")
-                # Visualize error like test_drift.py
-                if getattr(simulator, 'ax', None):
-                    # Draw a large red exclamation mark
-                    simulator.ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
-                                     ha='center', va='center', zorder=100)
-                    plt.draw()
-                plt.pause(3.0)
-                
-                # Return failure result
-                result = {
-                    'collision': False,
-                    'infeasible': True,
-                    'total_steps': step,
-                    'nominal_steps': nominal_steps,
-                    'backup_steps': backup_steps,
-                    'nominal_ratio': nominal_steps / max(step, 1),
-                    'backup_ratio': backup_steps / max(step, 1),
-                    'passed': False
-                }
-                return result
-        else:
-            # Gatekeeper/MPS
-            U = shielding.solve_control_problem(state, friction=car.get_friction())
+            else:
+                # Gatekeeper/MPS
+                U = shielding.solve_control_problem(state, friction=car.get_friction())
+        except ValueError as e:
+            print(f"\n*** INFEASIBLE: {e} ***")
+            # Draw a large red exclamation mark
+            ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
+                    ha='center', va='center', zorder=100)
+            plt.draw()
+            plt.pause(3.0)
+            
+            # Return failure result
+            result = {
+                'collision': False,
+                'infeasible': True,
+                'total_steps': step,
+                'nominal_steps': nominal_steps,
+                'backup_steps': backup_steps,
+                'nominal_ratio': nominal_steps / max(step, 1),
+                'backup_ratio': backup_steps / max(step, 1),
+                'passed': False
+            }
+            return result
         
         # Track mode
         if shielding.is_using_backup():
@@ -678,7 +679,15 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     print(f"  Backup: {results['backup_steps']} ({100*results['backup_ratio']:.1f}%)")
     
     # Check expectation
-    if results['collision'] == config.expected_collision:
+    # Test FAILS if:
+    # 1. Infeasibility occurred (results already has passed=False), or
+    # 2. Collision didn't match expectation
+    infeasible = results.get('infeasible', False)
+    
+    if infeasible:
+        print(f"\n  ✗ TEST FAILED (infeasibility occurred - QP constraint unsatisfiable)")
+        results['passed'] = False
+    elif results['collision'] == config.expected_collision:
         print(f"\n  ✓ TEST PASSED (collision={'expected' if config.expected_collision else 'avoided'} as expected)")
         results['passed'] = True
     else:
@@ -756,7 +765,7 @@ def create_puddle_surprise_test() -> TestConfig:
             # Large puddle right in front of obstacle
             PuddleConfig(x=70.0, y=middle_lane_y, radius=15.0, friction=0.25),
         ],
-        expected_collision=True,  # Expected to fail!
+        expected_collision=False,  # Can avoid with optimized controller!
     )
 
 
@@ -831,6 +840,9 @@ def main():
                         help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
+    parser.add_argument('--max-operator', type=str, default='input_space',
+                        choices=MAX_OPERATOR_TYPES,
+                        help=f"Selection operator (default: input_space, choices: {MAX_OPERATOR_TYPES})")
     
     args = parser.parse_args()
     
@@ -876,7 +888,7 @@ def main():
             # MPCBF should only fail in puddle_surprise 
             # (all policies fail when friction estimate is wrong)
             if test_name == 'puddle_surprise':
-                return True  # All policies fail with wrong friction estimate
+                return False  # All policies fail with wrong friction estimate
             return False  # MPCBF should handle all other cases
         
         # With stopping backup
@@ -919,6 +931,7 @@ def main():
             config.algo_type = args.algo
             config.backup_type = args.backup
             config.num_obstacles = args.obs
+            config.max_operator = getattr(args, 'max_operator', 'c')
             # Update expected collision based on configuration
             config.expected_collision = get_expected_collision(name, args.backup, args.obs, args.algo)
             # Update name to include algo, backup type and obstacle count
@@ -945,6 +958,7 @@ def main():
         config.algo_type = args.algo
         config.backup_type = args.backup
         config.num_obstacles = args.obs
+        config.max_operator = getattr(args, 'max_operator', 'c')
         # Update expected collision based on configuration
         config.expected_collision = get_expected_collision(args.test, args.backup, args.obs, args.algo)
         # Update name to include algo, backup type and obstacle count

@@ -53,6 +53,186 @@ from .pcbf import (
 
 
 # =============================================================================
+# Selection Operator Types
+# =============================================================================
+
+MAX_OPERATOR_TYPES = ['c', 'v', 'input_space']
+
+
+# =============================================================================
+# JIT-compiled Feasible Control Area Computation (for input_space operator)
+# =============================================================================
+
+@jax.jit
+def _compute_feasible_area_jit(
+    grad_V_G: jnp.ndarray,      # (2,) - gradient @ G
+    cbf_rhs: float,              # scalar - ∇V·f + α·V
+    u_min: jnp.ndarray,          # (2,) - control lower bounds
+    u_max: jnp.ndarray,          # (2,) - control upper bounds
+) -> float:
+    """
+    Compute area of feasible control polygon (box ∩ half-space).
+    
+    The feasible region is defined by:
+    - Box: u_min ≤ u ≤ u_max
+    - Half-space: grad_V_G @ u ≥ -cbf_rhs  (CBF constraint)
+    
+    Uses Sutherland-Hodgman clipping algorithm for polygon intersection.
+    
+    Args:
+        grad_V_G: Gradient of V times G matrix (2,)
+        cbf_rhs: Right-hand side of CBF constraint (∇V·f + α·V)
+        u_min: Control lower bounds (2,)
+        u_max: Control upper bounds (2,)
+    
+    Returns:
+        area: Area of feasible polygon (0 if infeasible)
+    """
+    # Box vertices (counter-clockwise)
+    # v0 = (u_min[0], u_min[1]), v1 = (u_max[0], u_min[1])
+    # v2 = (u_max[0], u_max[1]), v3 = (u_min[0], u_max[1])
+    box_vertices = jnp.array([
+        [u_min[0], u_min[1]],
+        [u_max[0], u_min[1]],
+        [u_max[0], u_max[1]],
+        [u_min[0], u_max[1]],
+    ])  # (4, 2)
+    
+    # Half-space: a @ u >= b, where a = grad_V_G, b = -cbf_rhs
+    a = grad_V_G  # (2,)
+    b = -cbf_rhs  # scalar
+    
+    # Check if gradient is essentially zero (no constraint - full box is feasible)
+    grad_norm = jnp.linalg.norm(a)
+    
+    def full_box_area():
+        return (u_max[0] - u_min[0]) * (u_max[1] - u_min[1])
+    
+    def clip_polygon():
+        # Sutherland-Hodgman clipping: clip box against half-space a @ u >= b
+        # For each edge (p1 -> p2), compute intersection and keep inside points
+        
+        # Evaluate all vertices: inside if a @ v >= b
+        inside = jax.vmap(lambda v: jnp.dot(a, v) >= b)(box_vertices)  # (4,)
+        
+        # If all inside, return full box area
+        all_inside = jnp.all(inside)
+        # If all outside, return 0
+        all_outside = jnp.all(~inside)
+        
+        # Compute intersection points for each edge
+        n_verts = 4
+        
+        def edge_intersect(i):
+            """Compute intersection of edge i -> (i+1)%4 with half-space boundary."""
+            p1 = box_vertices[i]
+            p2 = box_vertices[(i + 1) % n_verts]
+            
+            # Line: p = p1 + t*(p2 - p1), find t where a @ p = b
+            # a @ p1 + t * a @ (p2 - p1) = b
+            # t = (b - a @ p1) / (a @ (p2 - p1))
+            d = p2 - p1
+            denom = jnp.dot(a, d)
+            t = jnp.where(
+                jnp.abs(denom) > 1e-10,
+                (b - jnp.dot(a, p1)) / denom,
+                0.5  # Default if parallel
+            )
+            t = jnp.clip(t, 0.0, 1.0)
+            return p1 + t * d
+        
+        # Get all edge intersections
+        intersections = jax.vmap(edge_intersect)(jnp.arange(n_verts))  # (4, 2)
+        
+        # Build clipped polygon vertices:
+        # For each edge, output:
+        # - If p1 inside and p2 inside: output p2
+        # - If p1 inside and p2 outside: output intersection
+        # - If p1 outside and p2 inside: output intersection, then p2
+        # - If p1 outside and p2 outside: output nothing
+        
+        # Simplified: collect up to 6 vertices (box can have at most 6 after one clip)
+        # We'll use a fixed-size array and track valid count
+        
+        def process_edge(i):
+            """Process edge i, return (vertex1, vertex2, count)."""
+            p1_in = inside[i]
+            p2_in = inside[(i + 1) % n_verts]
+            p2 = box_vertices[(i + 1) % n_verts]
+            inter = intersections[i]
+            
+            # Case 1: both inside - output p2
+            # Case 2: p1 in, p2 out - output intersection
+            # Case 3: p1 out, p2 in - output intersection, then p2
+            # Case 4: both out - output nothing
+            
+            v1 = jnp.where(p1_in & ~p2_in, inter, p2)  # if exiting, use intersection
+            v2 = jnp.where(~p1_in & p2_in, p2, jnp.zeros(2))  # if entering, also output p2
+            
+            count = jnp.where(
+                p1_in & p2_in, 1,  # both in: 1 vertex
+                jnp.where(
+                    p1_in & ~p2_in, 1,  # exiting: 1 vertex (intersection)
+                    jnp.where(
+                        ~p1_in & p2_in, 2,  # entering: 2 vertices
+                        0  # both out: 0 vertices
+                    )
+                )
+            )
+            
+            return v1, v2, count
+        
+        # Process all edges
+        results = jax.vmap(process_edge)(jnp.arange(n_verts))
+        v1s, v2s, counts = results  # (4, 2), (4, 2), (4,)
+        
+        # Flatten into polygon vertices (max 8, but typically 3-6)
+        # We'll compute area using shoelace formula on collected vertices
+        
+        # Collect valid vertices
+        all_verts = jnp.concatenate([v1s, v2s], axis=0)  # (8, 2)
+        valid_mask = jnp.concatenate([
+            counts >= 1,  # v1 is valid if count >= 1
+            counts >= 2,  # v2 is valid if count >= 2
+        ])  # (8,)
+        
+        # Use shoelace formula with masking
+        # Area = 0.5 * |sum_i (x_i * y_{i+1} - x_{i+1} * y_i)|
+        # We need to handle variable-length polygon, so use weighted sum
+        
+        # Sort vertices by angle from centroid for correct polygon ordering
+        centroid = jnp.sum(all_verts * valid_mask[:, None], axis=0) / jnp.maximum(jnp.sum(valid_mask), 1.0)
+        angles = jnp.arctan2(all_verts[:, 1] - centroid[1], all_verts[:, 0] - centroid[0])
+        # Set invalid vertices to large angle to push them to end
+        angles = jnp.where(valid_mask, angles, 100.0)
+        sorted_indices = jnp.argsort(angles)
+        sorted_verts = all_verts[sorted_indices]
+        sorted_valid = valid_mask[sorted_indices]
+        
+        # Shoelace formula
+        def shoelace_term(i):
+            j = (i + 1) % 8
+            term = sorted_verts[i, 0] * sorted_verts[j, 1] - sorted_verts[j, 0] * sorted_verts[i, 1]
+            # Only count if both vertices are valid
+            return jnp.where(sorted_valid[i] & sorted_valid[j], term, 0.0)
+        
+        area = 0.5 * jnp.abs(jnp.sum(jax.vmap(shoelace_term)(jnp.arange(8))))
+        
+        # Handle edge cases
+        area = jnp.where(all_inside, full_box_area(), area)
+        area = jnp.where(all_outside, 0.0, area)
+        
+        return area
+    
+    # If gradient is zero, return full box
+    return jax.lax.cond(
+        grad_norm < 1e-8,
+        full_box_area,
+        clip_polygon
+    )
+
+
+# =============================================================================
 # JIT-compiled Multi-Policy Value Functions
 # =============================================================================
 
@@ -97,17 +277,29 @@ class MPCBF(PCBF):
         robot_spec: dict,
         dt: float = 0.05,
         backup_horizon: float = 10.0,
-        cbf_alpha: float = 1.0,
+        cbf_alpha: float = 5.0,  # Global permissive alpha for QP execution
         left_lane_y: float = 5.0,
         right_lane_y: float = -5.0,
         safety_margin: float = 0.0,
+        max_operator: str = 'input_space',  # Selection operator: 'c', 'v', or 'input_space'
         ax=None,
     ):
         """
         Initialize the MPCBF controller.
+        
+        Args:
+            max_operator: Selection operator for choosing best policy:
+                - 'c': Constraint value (Vdot + alpha*V) - most permissive
+                - 'v': Value function (V) - maximum safety margin
+                - 'input_space': Feasible control area - maximum control authority
         """
         # Initialize parent PCBF (but don't use its single policy)
         super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax)
+        
+        # Validate and store selection operator
+        if max_operator not in MAX_OPERATOR_TYPES:
+            raise ValueError(f"max_operator must be one of {MAX_OPERATOR_TYPES}, got '{max_operator}'")
+        self.max_operator = max_operator
         
         # Lane targets
         self.left_lane_y = left_lane_y
@@ -148,8 +340,8 @@ class MPCBF(PCBF):
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=self.left_lane_y,
-                    Kp_y=0.15,
+                    target_y=6.0 if self.left_lane_y > 0 else self.left_lane_y, # Aim for y=6.0 (midpoint of safe corridor)
+                    Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
                     Kp_delta=3.0,
@@ -160,15 +352,15 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(15)),
+                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
                 ),
             },
             'lane_change_right': {
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=self.right_lane_y,
-                    Kp_y=0.15,
+                    target_y=-6.0 if self.right_lane_y < 0 else self.right_lane_y, # Aim for y=-6.0
+                    Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
                     Kp_delta=3.0,
@@ -179,7 +371,7 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(15)),
+                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
                 ),
             },
             'stop': {
@@ -455,25 +647,26 @@ class MPCBF(PCBF):
         f: np.ndarray,
         G: np.ndarray,
         u_nom: np.ndarray,
-    ) -> Tuple[str, Dict[str, float]]:
+    ) -> Tuple[str, Dict[str, float], Dict[str, float]]:
         """
-        Select the policy with maximum CBF constraint value.
+        Select the best policy based on the configured max_operator.
         
-        CBF constraint: ∇V^T (f + Gu) + α V ≥ 0
-        Constraint value at nominal: c = ∇V^T f + ∇V^T G @ u_nom + α V
+        Selection operators:
+        - 'c': Constraint value (Vdot + alpha*V) - most permissive constraint
+        - 'v': Value function (V) - maximum safety margin  
+        - 'input_space': Feasible control area - maximum control authority
         
-        Key insight: With multiple policies, we select max(c_i).
-        - If max(c_i) > 0: nominal control already satisfies the most relaxed constraint
-        - If max(c_i) < 0: need CBF-QP to modify control
-        
-        This means MPCBF activates LESS frequently than single-policy PCBF,
-        since we only need ONE policy's constraint to be satisfied.
+        For selection, per-policy alphas are used (stop=0.5, others=5.0).
+        For QP execution, global permissive alpha (self.cbf_alpha) is used.
         
         Returns:
             best_policy: Name of selected policy
-            constraint_dict: {policy_name: constraint_value}
+            constraint_dict: {policy_name: constraint_value} using per-policy alphas
+            score_dict: {policy_name: score} based on max_operator
         """
         constraint_dict = {}
+        score_dict = {}
+        area_dict = {}  # Track feasible area for each policy
         max_grad_norm = 50.0
         
         for name in V_dict.keys():
@@ -483,6 +676,7 @@ class MPCBF(PCBF):
             # Skip invalid policies
             if V == -np.inf or np.any(np.isnan(grad_V)):
                 constraint_dict[name] = -np.inf
+                score_dict[name] = -np.inf
                 continue
             
             # Normalize gradient if too large
@@ -494,33 +688,54 @@ class MPCBF(PCBF):
             Lf_V = grad_V @ f
             Lg_V = grad_V @ G
             
-            # Use per-policy alpha from POLICY_ALPHA (smaller alpha for stop makes it less attractive)
+            # Use per-policy alpha for SELECTION (smaller alpha for stop makes it less attractive)
             policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
             
             # Constraint value at u_nom: c = Lf_V + Lg_V @ u_nom + alpha * V
             constraint_value = Lf_V + Lg_V @ u_nom + policy_alpha * V
             constraint_dict[name] = float(constraint_value)
+            
+            # ALWAYS compute feasible area for feasibility check
+            # CBF constraint: Lg_V @ u >= -(Lf_V + alpha * V)
+            # Use GLOBAL alpha for area computation (execution phase perspective)
+            cbf_rhs = Lf_V + self.cbf_alpha * V
+            area = float(_compute_feasible_area_jit(
+                jnp.array(Lg_V),
+                cbf_rhs,
+                jnp.array(self.u_min),
+                jnp.array(self.u_max),
+            ))
+            area_dict[name] = area
+            
+            # Compute score based on operator
+            if self.max_operator == 'c':
+                # Constraint value (permissiveness)
+                score_dict[name] = constraint_value
+                
+            elif self.max_operator == 'v':
+                # Value function (safety margin)
+                score_dict[name] = V
+                
+            elif self.max_operator == 'input_space':
+                # Feasible control area (control authority)
+                score_dict[name] = area
         
         # Get all policies including nominal
         backup_policies = list(constraint_dict.keys())
         
         # Filter for safe policies (V > 0)
-        # Prioritize policies that are currently safe over those that are already in collision.
-        # This prevents switching to a "less violating" unsafe policy when a safe policy exists.
         safe_policies = [k for k in backup_policies if V_dict[k] > 0.0]
         
         if len(safe_policies) > 0:
             candidates = safe_policies
-            # Among safe policies, select the one with MAXIMUM SAFETY MARGIN (V).
-            # This ensures we pick the most robust backup plan, even if it requires
-            # more aggressive control intervention (lower constraint value).
-            best_policy = max(candidates, key=lambda k: V_dict[k])
+            # Among safe policies, select based on max_operator score
+            best_policy = max(candidates, key=lambda k: score_dict[k])
         else:
+            # If all are unsafe, pick the one with highest score (damage mitigation)
             candidates = backup_policies
-            # If all are unsafe, pick the one that violates constraint least (damage mitigation)
-            best_policy = max(candidates, key=lambda k: constraint_dict[k])
+            best_policy = max(candidates, key=lambda k: score_dict[k])
         
-        return best_policy, constraint_dict
+        return best_policy, constraint_dict, score_dict, area_dict
     
     def _update_multi_visualization(
         self, 
@@ -597,8 +812,8 @@ class MPCBF(PCBF):
         f = np.array(self.dynamics_jax.f_full(x0_jax, self.current_friction))
         G = np.array(self.dynamics_jax.g_full(x0_jax))
         
-        # Select best policy based on CBF constraint value (Vdot + alpha*V)
-        best_policy, constraint_dict = self._select_best_policy(
+        # Select best policy based on max_operator (c, v, or input_space)
+        best_policy, constraint_dict, score_dict, area_dict = self._select_best_policy(
             V_dict, grad_V_dict, f, G, u_nom
         )
         
@@ -606,6 +821,13 @@ class MPCBF(PCBF):
         V_best = V_dict[best_policy]
         grad_V_best = grad_V_dict[best_policy].copy()
         constraint_best = constraint_dict[best_policy]
+        
+        # CRITICAL: Normalize gradient to match what was used in _select_best_policy
+        # This ensures consistency between input_space feasibility computation and QP solving
+        max_grad_norm = 50.0
+        grad_norm = np.linalg.norm(grad_V_best)
+        if grad_norm > max_grad_norm:
+            grad_V_best = grad_V_best * (max_grad_norm / grad_norm)
         
         # Store trajectories for animation
         for name, traj in traj_dict.items():
@@ -616,10 +838,12 @@ class MPCBF(PCBF):
         
         # Debug output (can be disabled by setting self.debug = False)
         if getattr(self, 'debug', True) and self.curr_step % 50 == 0:
-            c_str = ", ".join([f"{k}:{constraint_dict[k]:.2f}" for k in sorted(constraint_dict.keys()) if constraint_dict[k] > -np.inf])
             v_str = ", ".join([f"{k}:{V_dict[k]:.2f}" for k in sorted(V_dict.keys()) if V_dict[k] > -np.inf])
+            score_str = ", ".join([f"{k}:{score_dict[k]:.2f}" for k in sorted(score_dict.keys()) if score_dict[k] > -np.inf])
+            area_str = ", ".join([f"{k}:{area_dict.get(k, 0):.0f}" for k in sorted(V_dict.keys()) if k in area_dict])
             print(f"  [MPCBF] V: {v_str}")
-            print(f"  [MPCBF] CBF(u_nom): {c_str} -> best={best_policy}")
+            print(f"  [MPCBF] area: {area_str}")
+            print(f"  [MPCBF] {self.max_operator}: {score_str} -> best={best_policy}")
         
         self.curr_step += 1
         
