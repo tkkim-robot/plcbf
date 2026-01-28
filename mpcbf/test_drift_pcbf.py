@@ -76,7 +76,7 @@ from safe_control.utils.animation import AnimationSaver
 
 # Import PCBF and MPCBF from mpcbf
 from mpcbf.pcbf import PCBF
-from mpcbf.mpcbf import MPCBF
+from mpcbf.mpcbf import MPCBF, MAX_OPERATOR_TYPES
 
 
 # =============================================================================
@@ -809,7 +809,7 @@ def create_far_left_safe_test() -> TestConfig:
         description="Obstacle in left lane. Middle lane empty. Testing ability to reach 2nd left lane.",
         track=track,
         vehicle=VehicleConfig(mu=1.0),
-        simulation=SimulationConfig(backup_horizon_time=6.0),  # Longer horizon for double lane change
+        simulation=SimulationConfig(backup_horizon_time=3.0),  # Reduced horizon as requested
         obstacles=[
             ObstacleConfig(x=80.0, y=left_lane_y, radius=2.2),   # Obstacle in Left Lane (reduced radius to avoid adjacent lane collision)
         ],
