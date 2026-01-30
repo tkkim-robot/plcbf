@@ -1,4 +1,5 @@
 import numpy as np
+import traceback
 from safe_control.robots.double_integrator2D import DoubleIntegrator2D
 from safe_region_plot.backup import StopBackupController, TurnBackupController
 from safe_region_plot.filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper
@@ -8,7 +9,7 @@ def debug_point(x, y, vx, vy, policy_name="stop"):
     print(f"\n--- Debugging Point: ({x}, {y}, {vx}, {vy}) Policy: {policy_name} ---")
     
     # Parameters matches run.py
-    obstacle_pos = [2.0, 0.0]
+    obstacle_pos = [0.0, 0.0]
     obstacle_radius = 1.0
     robot_radius = 0.5
     dt = 0.05
@@ -32,6 +33,16 @@ def debug_point(x, y, vx, vy, policy_name="stop"):
         def __init__(self, obstacles):
             self.obstacles = obstacles
             
+        def check_obstacle_collision(self, position, robot_radius):
+            for obs in self.obstacles:
+                obs_x = obs['x']
+                obs_y = obs['y']
+                obs_r = obs['radius']
+                dist = np.linalg.norm(np.array(position) - np.array([obs_x, obs_y]))
+                if dist < (obs_r + robot_radius):
+                    return True, "Collision"
+            return False, "Safe"
+
     obstacle = {
         'x': obstacle_pos[0],
         'y': obstacle_pos[1],
@@ -74,15 +85,36 @@ def debug_point(x, y, vx, vy, policy_name="stop"):
             
             # Check collision distance
             dist_obs = np.linalg.norm(state[:2].flatten() - np.array(obstacle_pos))
-            print(f"  Dist check: {dist_obs:.3f} vs Rad {obstacle_radius + robot_radius} (Safe? {dist_obs > obstacle_radius + robot_radius})")
+            safe_dist = obstacle_radius + robot_radius
+            print(f"  Dist check: {dist_obs:.3f} vs Rad {safe_dist} (Safe? {dist_obs > safe_dist})")
 
         except Exception as e:
             print(f"  ERROR: {e}")
-            import traceback
             traceback.print_exc()
 
 if __name__ == "__main__":
-    # Sweep X for head-on collision case
-    print("\nXXX SWEEPING X for Head-On Collision (y=0) XXX")
-    for x in np.linspace(-2.0, 1.0, 15):
-        debug_point(x, 0.0, 2.0, 0.0)
+    print("\n=== DEBUGGING SAFE REGION PLOT ===\n")
+    
+    # 1. Head-on collision from distance (-3.0, 0.0)
+    # Should trigger MPS/Gatekeeper to switch if they see the collision
+    debug_point(-3.0, 0.0, 2.0, 0.0, policy_name="stop")
+    
+    # 2. Glancing / Safe (-3.0, 1.2) - User requested
+    # Should be safe
+    debug_point(-3.0, 1.2, 2.0, 0.0, policy_name="stop")
+    
+    # 3. Inside collision zone (-0.5, 0.0) - Obstacle at 0.0, Radius 1.0 + 0.5 = 1.5
+    # Should be UNSAFE / Active
+    debug_point(-0.5, 0.0, 2.0, 0.0, policy_name="stop")
+    
+    # 4. Turn Policy Check: (-3.0, 0.0) with TURN
+    # Should be Active and Turning (u_y != 0)
+    debug_point(-3.0, 0.0, 2.0, 0.0, policy_name="turn")
+    
+    # 5. Post-Obstacle Check: (2.0, 0.0) - Moving AWAY from obstacle
+    # Should be Inactive (Nominal accepted)
+    debug_point(2.0, 0.0, 2.0, 0.0, policy_name="stop")
+
+    # 6. Inside Obstacle Check: (0.0, 0.0)
+    # MUST BE UNSAFE / INFEASIBLE
+    debug_point(0.0, 0.0, 0.0, 0.0, policy_name="stop")

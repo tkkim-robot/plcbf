@@ -34,8 +34,10 @@ class BackupCBFWrapper(SafetyFilterWrapper):
         pass
 
 class MPSWrapper(SafetyFilterWrapper):
-    def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0):
-        self.mps = MPS(robot, robot_spec, dt=dt, backup_horizon=backup_horizon)
+    def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0, horizon_discount=None):
+        self.mps = MPS(robot, robot_spec, dt=dt, backup_horizon=backup_horizon, safety_margin=0.0)
+        if horizon_discount is not None:
+            self.mps.horizon_discount = horizon_discount
         self.mps.set_backup_controller(backup_controller)
         self._u_nom = np.zeros((2, 1))
         self.mps.set_nominal_controller(lambda x: self._u_nom)
@@ -57,8 +59,9 @@ class MPSWrapper(SafetyFilterWrapper):
         self.mps.committed_u_traj = None
 
 class GatekeeperWrapper(SafetyFilterWrapper):
-    def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0):
-        self.gk = Gatekeeper(robot, robot_spec, dt=dt, backup_horizon=backup_horizon)
+    def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0, horizon_discount=None):
+        self.gk = Gatekeeper(robot, robot_spec, dt=dt, backup_horizon=backup_horizon, 
+                             safety_margin=0.0, horizon_discount=horizon_discount)
         self.gk.set_backup_controller(backup_controller)
         self._u_nom = np.zeros((2, 1))
         self.gk.set_nominal_controller(lambda x: self._u_nom)

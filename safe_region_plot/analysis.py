@@ -34,60 +34,76 @@ def compute_viability_kernel(grid_params, obstacle_pos, obstacle_radius, robot_r
     all_values = solve(solver_settings, dynamics, grid, times, initial_values)
     return grid, all_values[-1] # Return grid and final value function
 
-def evaluate_filter(name, filter_wrapper, grid_x, grid_y, fixed_vx, fixed_vy, obstacle_pos, obstacle_radius, robot_radius, robot, dt=0.05, t_sim=2.0):
+def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, obstacle_pos, obstacle_radius, robot_radius, robot, dt=0.05, t_sim=2.0):
     """
     Evaluate a single filter over a grid of X, Y positions with fixed VX, VY.
     """
-    nx, ny = len(grid_x), len(grid_y)
-    
+    # The original function used grid_x and grid_y directly.
+    # The provided snippet uses eval_x and eval_y, implying these might be 2D arrays.
+    # Assuming grid_x and grid_y are 1D arrays as in the original,
+    # and the snippet's eval_x/eval_y are meant to be constructed from them.
+    # To match the snippet's structure, we'll create eval_x/eval_y from grid_x/grid_y.
+    eval_x, eval_y = np.meshgrid(grid_x, grid_y, indexing='ij')
+
     # Nominal input is zero (maintain velocity)
     u_nom = np.zeros((2, 1))
+    # Results grids
+    res_boundary = np.zeros(eval_x.shape)
+    res_safe_set = np.zeros(eval_x.shape)
     
-    boundary_mask = np.zeros((nx, ny), dtype=bool)
-    safe_mask = np.zeros((nx, ny), dtype=bool)
+    total_points = eval_x.shape[0] * eval_x.shape[1]
     
     # Explicit loop over simulation steps
     n_steps = int(t_sim / dt)
     
-    for i in range(nx):
-        for j in range(ny):
-            state = np.array([grid_x[i], grid_y[j], fixed_vx, fixed_vy]).reshape(-1, 1)
+    for i in range(eval_x.shape[0]):
+        for j in range(eval_x.shape[1]):
+            x = eval_x[i, j]
+            y = eval_y[i, j]
+            
+            # 1. Strict Pre-check: Initial Collision
+            # If starting inside obstacle (plus radius), it is fundamentally UNSAFE.
+            dist_obs = np.linalg.norm(np.array([x, y]) - np.array(obstacle_pos))
+            if dist_obs < (obstacle_radius + robot_radius):
+                res_safe_set[i, j] = 0
+                res_boundary[i, j] = 0 # Convention: inside obstacle is not part of boundary
+                continue
+
+            state = np.array([x, y, fixed_vx, fixed_vy]).reshape(-1, 1)
             
             # --- 1. Check Filter Boundary (Activation at Initial State) ---
-            # Reset filter for fresh start at this grid point
-            filter_wrapper.reset()
+            # Instantiate NEW filter instance for this point (Sanity)
+            filter_wrapper = filter_factory()
             
             try:
                 # Solve control problem for first step
                 u_safe = filter_wrapper.get_safe_control(state, u_nom)
                 
-                # If infeasible or None returned, consider it Active (and likely Unsafe, but 'Active' mask usually means 'Intervening')
-                # Wait, if Infeasible, it definitely intervened (failed to track nominal).
+                # If infeasible or None returned, consider it Active (intervening/failed)
                 if u_safe is None:
                      is_active = True
                 else:
                      # Check if output differs from nominal
-                     # Using 1e-4 tolerance as before, but user said "numerically similar"
+                     # Using 1e-4 tolerance
                      diff = np.linalg.norm(u_safe - u_nom)
                      is_active = diff > 1e-4
                      
-            except Exception as e:
-                # If solver crashed (infeasible), mark as active/intervention needed (but failed)
+            except Exception:
                 is_active = True
                 u_safe = None
 
-            boundary_mask[i, j] = is_active
+            res_boundary[i, j] = is_active
             
             # --- 2. Check Safe Set (Simulation Loop) ---
-            # Reset filter AGAIN for fresh simulation
-            filter_wrapper.reset()
+            # Instantiate NEW filter again for fresh simulation
+            filter_wrapper = filter_factory()
             curr_state = state.copy()
             is_safe = True
             
             for k in range(n_steps):
                 # Check collision immediately at current state
                 dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
-                if dist <= (obstacle_radius + robot_radius):
+                if dist < (obstacle_radius + robot_radius):
                     is_safe = False
                     break
                 
@@ -105,16 +121,15 @@ def evaluate_filter(name, filter_wrapper, grid_x, grid_y, fixed_vx, fixed_vy, ob
                 # Step dynamics
                 curr_state = robot.step(curr_state, u_step)
             
-            # Final check after loop
+            # Final check after loop (for the last state reached)
             if is_safe:
-                 # Check final state collision too
                  dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
-                 if dist <= (obstacle_radius + robot_radius):
+                 if dist < (obstacle_radius + robot_radius):
                     is_safe = False
 
-            safe_mask[i, j] = is_safe
+            res_safe_set[i, j] = is_safe
             
     return {
-        'boundary': boundary_mask,
-        'safe_set': safe_mask
+        'boundary': res_boundary,
+        'safe_set': res_safe_set
     }

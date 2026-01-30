@@ -16,6 +16,8 @@ dependencies = [
     "jax",
     "jaxlib",
     # QP solver (cvxpy is already included, use it for QP)
+    "flax>=0.10.7",
+    "tqdm>=4.67.1",
 ]
 
 [build-system]

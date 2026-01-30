@@ -22,3 +22,5 @@ uv.lock
 
 temp.sh
 wandb/
+
+docs/
