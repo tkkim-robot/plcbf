@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--t_max", type=float, default=2.0, help="Simulation/Backup horizon")
     parser.add_argument("--save_path", type=str, default="safe_region_plot/output", help="Directory to save results")
     parser.add_argument("--test", action="store_true", help="Run a quick test with low resolution")
-    parser.add_argument("--subfigures", action="store_true", default=True, help="Plot each method in a separate subfigure")
+    parser.add_argument("--no-subfigures", action="store_false", dest="subfigures", default=True, help="Disable separate subfigures (plot overlay)")
     parser.add_argument("--force", action="store_true", help="Ignore existing results and re-run all")
     parser.add_argument("--plot_only", action="store_true", help="Only generate plot from existing .npz files (skips trajectory viz)")
     parser.add_argument("--method", type=str, default=None, help="Filter to run only specific method (e.g. PCBF)")
@@ -51,7 +51,7 @@ def main():
     
     robot_spec = {
         'model': 'DoubleIntegrator2D',
-        'a_max': args.amax, 
+        'a_max': args.amax * args.mu, 
         'v_max': 5.0, 
         'radius': 0.5,
         'mu': args.mu,
@@ -78,7 +78,7 @@ def main():
     
     robot_spec = {
         'model': 'DoubleIntegrator2D',
-        'a_max': args.amax,
+        'a_max': args.amax * args.mu,
         'v_max': 5.0,
         'radius': robot_radius
     }
@@ -146,14 +146,14 @@ def main():
     if args.method:
         if args.method not in methods:
             print(f"Warning: Method {args.method} not in default list " + str(methods))
-    all_methods = ['BackupCBF', 'MPS', 'Gatekeeper', 'PCBF', 'MPCBF']
+    all_methods = ['MPS', 'Gatekeeper', 'BackupCBF', 'PCBF', 'MPCBF']
     if args.method == 'ALL' or args.method is None:
         methods = all_methods
     else:
         methods = [args.method]
         
     # Policy Selection logic
-    policy_names = ["stop", "turn"]
+    policy_names = ["stop", "turn_up", "turn_down"]
     if args.policy:
         if args.policy not in policy_names:
             print(f"Warning: Policy {args.policy} is not valid. Options: {policy_names}")
@@ -167,15 +167,19 @@ def main():
         elif policy_name == "stop":
             pcbf_alpha = 1.0
             print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
-        else:
+        else: # turn_up / turn_down
             pcbf_alpha = 0.5
             print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
             
         results = {}
         
         # Determine Backup Controller
-        if policy_name == "turn" and args.method != 'MPCBF':
-             backup_controller = TurnBackupController(a_max=robot_spec['a_max'], decision_y=obstacle_pos[1])
+        if policy_name in ["turn_up", "turn_down"] and args.method != 'MPCBF':
+             # Force direction using potential field threshold
+             # turn_up: decision_y = -100 (y > -100 -> UP)
+             # turn_down: decision_y = 100 (y < 100 -> DOWN)
+             decision_y = -100.0 if policy_name == "turn_up" else 100.0
+             backup_controller = TurnBackupController(a_max=robot_spec['a_max'], decision_y=decision_y)
         else:
              backup_controller = StopBackupController(a_max=robot_spec['a_max'])
             
