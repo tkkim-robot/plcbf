@@ -282,7 +282,8 @@ class MPCBF(PCBF):
         right_lane_y: float = -5.0,
         safety_margin: float = 0.0,
         max_operator: str = 'input_space',  # Selection operator: 'c', 'v', or 'input_space'
-        ax=None,
+        debug: bool = False,
+        ax=None
     ):
         """
         Initialize the MPCBF controller.
@@ -316,6 +317,8 @@ class MPCBF(PCBF):
         
         # Visualization handles for multi-policy
         self.policy_traj_lines = {}
+
+        self.debug = debug
         
         # Multiple policies configuration
         self._setup_multi_policies()
