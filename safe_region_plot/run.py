@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--no-subfigures", action="store_false", dest="subfigures", default=True, help="Disable separate subfigures (plot overlay)")
     parser.add_argument("--force", action="store_true", help="Ignore existing results and re-run all")
     parser.add_argument("--plot_only", action="store_true", help="Only generate plot from existing .npz files (skips trajectory viz)")
+    parser.add_argument("--plot_hj_only", action="store_true", help="Only plot HJ reachability boundary and exit")
     parser.add_argument("--method", type=str, default=None, help="Filter to run only specific method (e.g. PCBF)")
     parser.add_argument("--policy", type=str, default=None, help="Filter to run only specific policy (e.g. stop)")
     parser.add_argument('--mu', type=float, default=1.0, help='Friction coefficient (for saturation).')
@@ -120,6 +121,43 @@ def main():
         ivx = np.abs(np.array(grid_hj.coordinate_vectors[2]) - vx).argmin()
         ivy = np.abs(np.array(grid_hj.coordinate_vectors[3]) - vy).argmin()
         return hj_values[:, :, ivx, ivy]
+
+    if args.plot_hj_only:
+        print("Plotting HJ Reachability Boundary only...")
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.set_aspect('equal')
+        ax.set_title(f"HJ Reachability Boundary (Initial Velocity: [{args.vx}, {args.vy}])")
+        
+        hj_slice = get_hj_slice(args.vx, args.vy)
+        hj_x = np.array(grid_hj.coordinate_vectors[0])
+        hj_y = np.array(grid_hj.coordinate_vectors[1])
+        
+        # Plot Obstacle
+        ax.add_patch(plt.Circle(obstacle_pos, obstacle_radius + robot_radius, color='red', alpha=0.3))
+        
+        # Plot HJ
+        ax.contour(hj_x, hj_y, hj_slice.T, levels=[0], colors='black', linestyles='--')
+        
+        # Legend
+        from matplotlib.lines import Line2D
+        import matplotlib.patches as mpatches
+        legend_elements = [
+            Line2D([0], [0], color='black', linestyle='--', label='HJ (Viability Kernel)'),
+            mpatches.Patch(color='red', alpha=0.3, label='Obstacle + Margin')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        ax.set_xlim([-4.0, 2.0])
+        ax.set_ylim([-2.5, 2.5])
+        
+        save_name = "safe_region_hj_only.png"
+        save_path = os.path.join(args.save_path, save_name)
+        plt.savefig(save_path, bbox_inches='tight')
+        print(f"Saved plot: {save_path}")
+        return
+
 
     # Evaluation Grid
     eval_x = np.linspace(-4.0, 2.0, args.res)
