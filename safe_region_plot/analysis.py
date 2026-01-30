@@ -118,16 +118,10 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
             curr_state = state.copy()
             is_safe = True
             
-            # Debug specific point (-4,0)
-            is_target = abs(x - (-4.0)) < 0.1 and abs(y - 0.0) < 0.1
-            if is_target:
-                print(f"DEBUG TARGET (-4,0): Start. State={state.flatten()}")
-
             for k in range(n_steps):
                 # Check collision immediately at current state
                 dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
                 if dist < (obstacle_radius + robot_radius):
-                    if is_target: print(f"DEBUG TARGET: Collision at step {k}. Dist={dist}")
                     is_safe = False
                     break
                 
@@ -135,15 +129,10 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
                 try:
                     state_col = curr_state.reshape(-1, 1)
                     u_step = filter_wrapper.get_safe_control(state_col, u_nom)
-                    if is_target and k < 5: 
-                         # Print first few steps
-                         print(f"DEBUG TARGET Step {k}: u={u_step.flatten() if u_step is not None else 'None'}")
                 except Exception as e:
-                    if is_target: print(f"DEBUG TARGET Exception: {e}")
                     u_step = None
                     
                 if u_step is None:
-                    if is_target: print(f"DEBUG TARGET: Infeasible at step {k}")
                     is_safe = False
                     break
                 
@@ -154,11 +143,8 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
             if is_safe:
                  dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
                  if dist < (obstacle_radius + robot_radius):
-                    if is_target: print(f"DEBUG TARGET: Final Collision. Dist={dist}")
                     is_safe = False
             
-            if is_target: print(f"DEBUG TARGET: End. Safe={is_safe}")
-
             res_safe_set[i, j] = is_safe
 
     print(f"DEBUG ANALYSIS: Total Safe Points: {np.sum(res_safe_set)} / {total_points}", flush=True)

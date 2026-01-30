@@ -112,29 +112,40 @@ def main():
             print(f"Warning: Method {args.method} not in default list " + str(methods))
         methods = [args.method]
         
+    # Policy Selection logic
     policy_names = ["stop", "turn"]
     if args.policy:
         if args.policy not in policy_names:
             print(f"Warning: Policy {args.policy} is not valid. Options: {policy_names}")
         policy_names = [args.policy]
+        
     for policy_name in policy_names:
-        # Adaptive Alpha for PCBF
-        if policy_name == "stop":
+        # Adaptive Alpha Configuration
+        if args.method == 'MPCBF':
+             pcbf_alpha = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+             print(f"Processing policy: {policy_name} (MPCBF Alpha: {pcbf_alpha})")
+        elif policy_name == "stop":
             pcbf_alpha = 1.0
+            print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
         else:
-            pcbf_alpha = 0.5
+            pcbf_alpha = 0.1
+            print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
             
-        print(f"Processing policy: {policy_name} (PCBF Alpha: {pcbf_alpha})")
         results = {}
         
-        # Determine Backup Controller once for initialization if needed
-        if policy_name == "stop":
-            backup_controller = StopBackupController(a_max=args.amax)
+        # Determine Backup Controller
+        if policy_name == "turn" and args.method != 'MPCBF':
+             backup_controller = TurnBackupController(a_max=robot_spec['a_max'], decision_y=obstacle_pos[1])
         else:
-            backup_controller = TurnBackupController(a_max=args.amax, decision_y=obstacle_pos[1])
+             backup_controller = StopBackupController(a_max=robot_spec['a_max'])
             
         for method in methods:
-            method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
+            # File Handling
+            if method == 'MPCBF':
+                # Force shared file for MPCBF
+                method_file = os.path.join(args.save_path, f"result_MPCBF_shared_res{args.res}.npz")
+            else:
+                method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
             
             # Smart Caching: Load if exists and not forced
             if os.path.exists(method_file) and not args.force:

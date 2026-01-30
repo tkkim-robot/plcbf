@@ -156,6 +156,37 @@ class PCBF_DI(PCBF):
         # Overwrite Limits
         self.u_min = np.array([-self.sys_params.a_max, -self.sys_params.a_max])
         self.u_max = np.array([self.sys_params.a_max, self.sys_params.a_max])
+        # Obstacles
+        self.obstacles = [] # Will be updated from env
+        
+        # Alphas
+        if isinstance(cbf_alpha, dict):
+             self.alphas = cbf_alpha
+        else:
+             self.alphas = {'stop': cbf_alpha, 'turn_up': cbf_alpha, 'turn_down': cbf_alpha}
+        self.cbf_alpha = self.alphas['stop'] # Default initialization
+
+        # Parameters
+        # Stop
+        self.params_stop = StopPolicyParams(a_max=robot_spec['a_max'], k_v=backup_controller.k_v)
+        
+        # Turn Up (Force UP by setting decision_y low)
+        self.params_turn_up = TurnPolicyParams(
+            a_max=robot_spec['a_max'], 
+            k_v=1.0, 
+            decision_y=-100.0, # Always y > -100 -> Turn UP
+            target_y=2.0
+        )
+        
+        # Turn Down (Force DOWN by setting decision_y high)
+        self.params_turn_down = TurnPolicyParams(
+            a_max=robot_spec['a_max'], 
+            k_v=1.0, 
+            decision_y=100.0, # Always y < 100 -> Turn DOWN
+            target_y=-2.0
+        )
+        
+        self.backup_policy_jax = True # Bypass base check
         
         # Setup Policy
         from .backup import StopBackupController, TurnBackupController
@@ -201,7 +232,6 @@ class PCBF_DI(PCBF):
              #    # Print once to verify format
              #    pass 
         else:
-             print("DEBUG PCBF: Env is None or no obstacles!", flush=True)
              self.obstacles = []
 
     def _compute_value_and_grad(self, x0_jax):
@@ -220,9 +250,6 @@ class PCBF_DI(PCBF):
                 obs_vals = [obs[0], obs[1], obs[2]]
             obs_jax = jnp.array(obs_vals)
         else:
-            # DEBUG RETURN 100
-            if abs(x0_jax[0] + 4.0) < 0.2 and abs(x0_jax[1]) < 0.2:
-                  print(f"DEBUG JAX: NO OBSTACLES FOUND! Returning V=100", flush=True)
             return 100.0, jnp.zeros(4), x0_jax[None, :]
             
         if self.policy_type == 'stop':
@@ -237,31 +264,14 @@ class PCBF_DI(PCBF):
         return float(V), np.array(grad_V), x0_jax[None, :]
 
     def _solve_cbf_qp(self, u_nom, V, grad_V, f, G):
-         # Debug constraint values for (-4,0)
-         # Reconstruct what solve_cbf_qp_di does but print first
-         grad_V_f = grad_V @ f
-         grad_V_G = grad_V @ G
-         cbf_rhs = grad_V_f + self.cbf_alpha * V
-         
-         # Check if we are near (-4,0) - this is tricky since we don't have x inside _solve
-         # However, we know V roughly. 
-         # Or we can just spam a few lines if V is reasonable range
-         # Let's rely on the print in _compute_value_and_grad to print x.
-         # Actually, we can pass x through if we change signature, but that's invasive.
-         
-         # Let's just print unconditionally if V is low-ish (implying interaction)
-         # Filters run on many points.
-         
-         # Better idea: In _compute_value_and_grad, we have x. WE PRINT THERE.
-         # I will revert this method to clean state and add print to _compute_value_and_grad
-         
          return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
 
 
 class MPCBF_DI(MPCBF):
     def __init__(self, robot, robot_spec, dt, backup_horizon, cbf_alpha, backup_controller):
-        # max_operator default 'c'
-        super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha, max_operator='c')
+        # Handle dict alpha for base class call (pass dummy or first value)
+        base_alpha = cbf_alpha['stop'] if isinstance(cbf_alpha, dict) else cbf_alpha
+        super().__init__(robot, robot_spec, dt, backup_horizon, base_alpha, max_operator='c')
         
         self.sys_params = DoubleIntegratorParams(
             a_max=robot_spec['a_max'],
@@ -273,31 +283,38 @@ class MPCBF_DI(MPCBF):
         self.u_min = np.array([-self.sys_params.a_max, -self.sys_params.a_max])
         self.u_max = np.array([self.sys_params.a_max, self.sys_params.a_max])
         
-        # Setup policies
-        k_v = 5.0 
-        a_max = robot_spec['a_max']
-        # For explicit turn up/down, we can just set both up/down targets to the same value
-        # or rely on the logic if we know where we are.
-        # But 'turn_up' usually means 'go to +2' regardless of where we are (unless we are at +2).
-        # And 'turn_down' means 'go to -2'.
-        
-        # turn_up: Force targets to be positive 2 (or whatever target)
-        # turn_down: Force targets to be negative 2
-        
-        # We assume target lines are at +/- 2.0 based on backup.py defaults
-        tgt_up = 2.0
-        tgt_down = -2.0
+        # Alphas Setup
+        if isinstance(cbf_alpha, dict):
+             self.alphas = cbf_alpha
+        else:
+             self.alphas = {'stop': cbf_alpha, 'turn_up': cbf_alpha, 'turn_down': cbf_alpha}
+
+        # Parameters (Force Turn Directions)
+        # Turn Up (Force UP by setting decision_y low)
+        self.params_turn_up = TurnPolicyParams(
+            a_max=robot_spec['a_max'], 
+            k_v=1.0, 
+            decision_y=-100.0,
+            target_y=2.0,
+            target_y_up=2.0,
+            target_y_down=2.0
+        )
+        # Turn Down (Force DOWN by setting decision_y high)
+        self.params_turn_down = TurnPolicyParams(
+            a_max=robot_spec['a_max'], 
+            k_v=1.0, 
+            decision_y=100.0,
+            target_y=-2.0,
+            target_y_up=-2.0,
+            target_y_down=-2.0
+        )
+        # Stop 
+        self.params_stop = StopPolicyParams(a_max=robot_spec['a_max'], k_v=backup_controller.k_v)
         
         self.di_policies = {
-             'stop': ('stop', StopPolicyParams(a_max, k_v)),
-             'turn_up': ('turn', TurnPolicyParams(
-                 a_max, k_v, decision_y=-3.0, 
-                 target_y=tgt_up, target_y_up=tgt_up, target_y_down=tgt_up # Force UP
-             )),
-             'turn_down': ('turn', TurnPolicyParams(
-                 a_max, k_v, decision_y=3.0, 
-                 target_y=tgt_down, target_y_up=tgt_down, target_y_down=tgt_down # Force DOWN
-             ))
+             'stop': ('stop', self.params_stop),
+             'turn_up': ('turn', self.params_turn_up),
+             'turn_down': ('turn', self.params_turn_down)
         }
 
     def _compute_multi_value_and_grad(self, x0_jax):
@@ -308,12 +325,6 @@ class MPCBF_DI(MPCBF):
                 obs_vals = [obs['x'], obs['y'], obs['radius']]
             else:
                 obs_vals = [obs[0], obs[1], obs[2]]
-            
-            # DEBUG PRINT
-            # Only print for a specific point to avoid spam? 
-            # Or print once. JAX might compile it away if not careful, but this is Python side before JAX call? 
-            # obs_jax creation is Python/JAX boundary.
-            # print(f"DEBUG PCBF: obs type={type(obs)} vals={obs_vals}")
             
             obs_jax = jnp.array(obs_vals)
         else:
@@ -330,8 +341,8 @@ class MPCBF_DI(MPCBF):
                 V, grad_V = compute_value_and_grad_turn(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
             
             # Debug Print for specific point (-4, 0) approx
-            if abs(x0_jax[0] + 4.0) < 0.1 and abs(x0_jax[1]) < 0.1:
-                 print(f"DEBUG PCBF {name}: x={x0_jax} obs={obs_vals} V={V}")
+            # Debug Print Removed
+            pass
                  
             V_dict[name] = float(V)
             grad_V_dict[name] = np.array(grad_V)
