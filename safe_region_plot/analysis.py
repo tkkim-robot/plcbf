@@ -77,8 +77,25 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
             
             try:
                 # Solve control problem for first step
-                u_safe = filter_wrapper.get_safe_control(state, u_nom)
-                
+                # Get safe control
+                try:
+                    u_safe = filter_wrapper.get_safe_control(state, u_nom)
+                    u = np.array(u_safe).flatten()
+                    problem_status = "Optimal"
+                except ValueError as e:
+                    # If infeasible, apply braking or dummy control and mark collision
+                    u = np.zeros(2) # Emergency stop attempt? Or just zero
+                    problem_status = "Infeasible"
+                    print(f"Step {i}: Infeasible ({e})")
+                    # Break? Or continue? Usually implies safety violation.
+                    # We can continue with nominal/braking to see what happens, 
+                    # but usually for safe region plot trigger, we might stop.
+                    # Let's simple apply max braking as fallback? 
+                    # safe_region_plot usually counts "unsafe" if collision happens.
+                    # If we just brake, we might collide.
+                    # For visualization purpose, let's just use zero control.
+                    u_safe = None # Set u_safe to None to trigger is_active = True
+          
                 # If infeasible or None returned, consider it Active (intervening/failed)
                 if u_safe is None:
                      is_active = True

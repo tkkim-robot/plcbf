@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from safe_control.robots.double_integrator2D import DoubleIntegrator2D
 from .dynamics_hj import DoubleIntegratorHJ
 from .backup import StopBackupController, TurnBackupController
-from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper
+from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, MPCBFWrapper
 from .analysis import compute_viability_kernel, evaluate_filter
 
 def main():
@@ -20,6 +20,8 @@ def main():
     parser.add_argument("--subfigures", action="store_true", default=True, help="Plot each method in a separate subfigure")
     parser.add_argument("--force", action="store_true", help="Ignore existing results and re-run all")
     parser.add_argument("--plot_only", action="store_true", help="Only generate plot from existing .npz files (skips trajectory viz)")
+    parser.add_argument("--method", type=str, default=None, help="Filter to run only specific method (e.g. PCBF)")
+    parser.add_argument("--policy", type=str, default=None, help="Filter to run only specific policy (e.g. stop)")
     
     args = parser.parse_args()
     
@@ -86,11 +88,35 @@ def main():
     eval_y = np.linspace(-2.5, 2.5, args.res)
     
     policies = ["stop", "turn"]
-    methods = ["BackupCBF", "MPS", "Gatekeeper"]
-    colors = {'BackupCBF': 'blue', 'MPS': 'green', 'Gatekeeper': 'orange'}
-    fill_alphas = {'BackupCBF': 0.1, 'MPS': 0.2, 'Gatekeeper': 0.3}
+    methods = ["BackupCBF", "MPS", "Gatekeeper", "PCBF", "MPCBF"]
+    colors = {
+        'BackupCBF': 'blue', 
+        'MPS': 'green', 
+        'Gatekeeper': 'orange',
+        'PCBF': 'purple',
+        'MPCBF': 'brown'
+    }
+    fill_alphas = {
+        'BackupCBF': 0.1, 
+        'MPS': 0.2, 
+        'Gatekeeper': 0.3,
+        'PCBF': 0.15,
+        'MPCBF': 0.25
+    }
 
-    for policy_name in policies:
+    # Filter methods/policies if requested
+    if args.method:
+        if args.method not in methods:
+            print(f"Warning: Method {args.method} not in default list " + str(methods))
+        methods = [args.method]
+        
+    policy_names = ["stop", "turn"]
+    if args.policy:
+        if args.policy not in policy_names:
+            print(f"Warning: Policy {args.policy} is not valid. Options: {policy_names}")
+        policy_names = [args.policy]
+        
+    for policy_name in policy_names:
         print(f"Processing policy: {policy_name}")
         results = {}
         
@@ -110,7 +136,13 @@ def main():
                     results[method] = {'boundary': data['boundary'], 'safe_set': data['safe_set']}
             else:
                 print(f"Evaluating {method}...")
-                wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper}[method]
+                wrapper_cls = {
+                    'BackupCBF': BackupCBFWrapper, 
+                    'MPS': MPSWrapper, 
+                    'Gatekeeper': GatekeeperWrapper,
+                    'PCBF': PCBFWrapper,
+                    'MPCBF': MPCBFWrapper
+                }[method]
                 
                 # MockEnv definition (local)
                 class MockEnv:
@@ -134,17 +166,29 @@ def main():
                     
                     if method == "BackupCBF":
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
+                    elif method == "PCBF" or method == "MPCBF":
+                         # PCBF/MPCBF generally don't use horizon_discount in this impl, 
+                         # MPS/GK use it for finer resolution check.
+                         # Pass it if the wrapper accepts it, but my PCBF wrapper above does NOT accept horizon_discount.
+                         # It accepts alpha.
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=5.0)
                     else:
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                     
                     # Create new env
-                    obstacle_dict = {'x': obstacle_pos[0], 'y': obstacle_pos[1], 'radius': obstacle_radius}
+                    obstacle_dict = {
+                        'x': obstacle_pos[0], 
+                        'y': obstacle_pos[1], 
+                        'radius': obstacle_radius,
+                        'spec': {'radius': obstacle_radius} # For PCBF compatibility
+                    }
                     env_mock = MockEnv([obstacle_dict])
                     
                     # Set environment
                     if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock)
                     if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock)
                     if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock)
+                    if hasattr(fw, 'set_environment'): fw.set_environment(env_mock) # For PCBF/MPCBF custom methods
                     
                     return fw
 
@@ -158,7 +202,11 @@ def main():
         
         # Plotting
         if args.subfigures:
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            # 5 methods -> 5 columns? Or 2 rows, 3 cols (one empty)?
+            # User wants: "put these two new figure next to gatekeeeper"
+            # Current: BCBF, MPS, GK. New: PCBF, MPCBF. Total 5.
+            # Layout: 2 rows (Boundary, Safe Set). 5 Columns.
+            fig, axes = plt.subplots(2, 5, figsize=(25, 10))
             fig.suptitle(f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])", fontsize=20)
             
             hj_slice = get_hj_slice(args.vx, args.vy)
@@ -220,14 +268,6 @@ def main():
                     ax.set_ylim([-2.5, 2.5])
                          
                     # --- TRAJECTORY VISUALIZATION ---
-                    # Simulate trajectories for 3 distinct initial points
-                    # Coords: Obstacle at (0,0)
-                    # Points:
-                    # 1. (-3.0, 0.0) - Head on collision from distance
-                    # 2. (-3.0, 1.2) - Glancing / Safe (Requested by user)
-                    # 3. (-1.5, 0.5) - Close call / Inside margin
-                    # 3. (-1.5, 0.5) - Close call / Inside margin
-                    # 3. (-1.5, 0.5) - Close call / Inside margin
                     # User requested dense grid 1m x 1m
                     points_to_debug = []
                     # x: -4, -3, -2, -1, 0, 1, 2
@@ -249,8 +289,12 @@ def main():
                                 if dist < (obs['radius'] + robot_radius):
                                     return True, "Collision"
                             return False, "Safe"
-                    obstacle_dict = {'x': obstacle_pos[0], 'y': obstacle_pos[1], 'radius': obstacle_radius}
-                    env_mock = MockEnv([obstacle_dict])
+                    obst_dict = {
+                        'x': obstacle_pos[0], 'y': obstacle_pos[1], 
+                        'radius': obstacle_radius,
+                        'spec': {'radius': obstacle_radius}
+                    }
+                    env_mock_traj = MockEnv([obst_dict])
                     for pt in points_to_debug:
                         # Setup
                         state = np.array([pt[0], pt[1], args.vx, args.vy]).reshape(-1, 1)
@@ -259,23 +303,26 @@ def main():
                         is_safe_traj = True
                         
                         # Re-init filter for this trajectory
-                        wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper}[method]
+                        wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'MPCBF': MPCBFWrapper}[method]
                         if method == "BackupCBF":
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
+                        elif method == "PCBF" or method == "MPCBF":
+                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=5.0)
                         else:
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                         
                         # IMPORTANT: Set environment for filter!
-                        if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock)
-                        if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock)
-                        if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock)
+                        if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock_traj)
+                        if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock_traj)
+                        if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock_traj)
+                        if hasattr(fw, 'set_environment'): fw.set_environment(env_mock_traj)
 
                         # Simulate
                         n_steps_vis = int(args.t_max / dt)
                         curr_state = state.copy()
                         for k in range(n_steps_vis):
                                 # Check collision
-                                if env_mock.check_obstacle_collision(curr_state[:2], robot_radius)[0]:
+                                if env_mock_traj.check_obstacle_collision(curr_state[:2], robot_radius)[0]:
                                     is_safe_traj = False
                                     break
                                 try:
