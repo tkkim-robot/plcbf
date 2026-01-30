@@ -36,7 +36,9 @@ def main():
     obstacle_pos = [0.0, 0.0]
     obstacle_radius = 1.0
     robot_radius = 0.5
+    robot_radius = 0.5
     dt = 0.05
+    #pcbf_alpha = 1.0 # using backup specified alpha below 
     
     robot_spec = {
         'model': 'DoubleIntegrator2D',
@@ -115,9 +117,14 @@ def main():
         if args.policy not in policy_names:
             print(f"Warning: Policy {args.policy} is not valid. Options: {policy_names}")
         policy_names = [args.policy]
-        
     for policy_name in policy_names:
-        print(f"Processing policy: {policy_name}")
+        # Adaptive Alpha for PCBF
+        if policy_name == "stop":
+            pcbf_alpha = 1.0
+        else:
+            pcbf_alpha = 0.5
+            
+        print(f"Processing policy: {policy_name} (PCBF Alpha: {pcbf_alpha})")
         results = {}
         
         # Determine Backup Controller once for initialization if needed
@@ -171,7 +178,7 @@ def main():
                          # MPS/GK use it for finer resolution check.
                          # Pass it if the wrapper accepts it, but my PCBF wrapper above does NOT accept horizon_discount.
                          # It accepts alpha.
-                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=5.0)
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha) # Matches BackupCBF
                     else:
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                     
@@ -307,7 +314,7 @@ def main():
                         if method == "BackupCBF":
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
                         elif method == "PCBF" or method == "MPCBF":
-                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=5.0)
+                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
                         else:
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                         
@@ -329,10 +336,15 @@ def main():
                                     u = fw.get_safe_control(curr_state, u_nom)
                                     if u is None: u = u_nom # Visual fail
                                     
-                                    # Integrate (simple Euler for viz)
-                                    curr_state[2:] += u * dt # v = v + a*dt
-                                    curr_state[:2] += curr_state[2:] * dt # p = p + v*dt
-                                    traj_x.append(curr_state[:2].flatten())
+                                    # Integrate (Use robot.step to match analysis/gym exactly)
+                                    # robot.step expects column vectors (4,1) and (2,1) or similar
+                                    # output is column vector
+                                    state_col = curr_state.reshape(-1, 1)
+                                    u_col = u.reshape(-1, 1)
+                                    next_state = robot.step(state_col, u_col)
+                                    curr_state = next_state.flatten()
+                                    
+                                    traj_x.append(curr_state[:2])
                                     
                                 except:
                                     is_safe_traj = False

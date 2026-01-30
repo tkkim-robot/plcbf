@@ -44,6 +44,9 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
     # and the snippet's eval_x/eval_y are meant to be constructed from them.
     # To match the snippet's structure, we'll create eval_x/eval_y from grid_x/grid_y.
     eval_x, eval_y = np.meshgrid(grid_x, grid_y, indexing='ij')
+    
+    # Perturb y exactly at 0 to avoid numerical singularities in gradients
+    eval_y[np.abs(eval_y) < 1e-6] = 1e-5
 
     # Nominal input is zero (maintain velocity)
     u_nom = np.zeros((2, 1))
@@ -86,8 +89,6 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
                     # If infeasible, apply braking or dummy control and mark collision
                     u = np.zeros(2) # Emergency stop attempt? Or just zero
                     problem_status = "Infeasible"
-                    print(f"Step {i}: Infeasible ({e})")
-                    # Break? Or continue? Usually implies safety violation.
                     # We can continue with nominal/braking to see what happens, 
                     # but usually for safe region plot trigger, we might stop.
                     # Let's simple apply max braking as fallback? 
@@ -117,21 +118,32 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
             curr_state = state.copy()
             is_safe = True
             
+            # Debug specific point (-4,0)
+            is_target = abs(x - (-4.0)) < 0.1 and abs(y - 0.0) < 0.1
+            if is_target:
+                print(f"DEBUG TARGET (-4,0): Start. State={state.flatten()}")
+
             for k in range(n_steps):
                 # Check collision immediately at current state
                 dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
                 if dist < (obstacle_radius + robot_radius):
+                    if is_target: print(f"DEBUG TARGET: Collision at step {k}. Dist={dist}")
                     is_safe = False
                     break
                 
                 # Get control
                 try:
-                    u_step = filter_wrapper.get_safe_control(curr_state, u_nom)
-                except Exception:
-                    is_safe = False # Solver failure implies Unsafe state
-                    break
+                    state_col = curr_state.reshape(-1, 1)
+                    u_step = filter_wrapper.get_safe_control(state_col, u_nom)
+                    if is_target and k < 5: 
+                         # Print first few steps
+                         print(f"DEBUG TARGET Step {k}: u={u_step.flatten() if u_step is not None else 'None'}")
+                except Exception as e:
+                    if is_target: print(f"DEBUG TARGET Exception: {e}")
+                    u_step = None
                     
                 if u_step is None:
+                    if is_target: print(f"DEBUG TARGET: Infeasible at step {k}")
                     is_safe = False
                     break
                 
@@ -142,10 +154,14 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
             if is_safe:
                  dist = np.linalg.norm(curr_state[:2, 0] - np.array(obstacle_pos))
                  if dist < (obstacle_radius + robot_radius):
+                    if is_target: print(f"DEBUG TARGET: Final Collision. Dist={dist}")
                     is_safe = False
+            
+            if is_target: print(f"DEBUG TARGET: End. Safe={is_safe}")
 
             res_safe_set[i, j] = is_safe
-            
+
+    print(f"DEBUG ANALYSIS: Total Safe Points: {np.sum(res_safe_set)} / {total_points}", flush=True)
     return {
         'boundary': res_boundary,
         'safe_set': res_safe_set

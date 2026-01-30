@@ -121,7 +121,7 @@ def solve_cbf_qp_di(self, u_nom, V, grad_V, f, G):
     
     try:
         problem = cp.Problem(cp.Minimize(cost), constraints)
-        problem.solve(solver=cp.ECOS, verbose=False)
+        problem.solve(solver=cp.OSQP, verbose=False)
         
         if problem.status in ['optimal', 'optimal_inaccurate']:
             self.status = 'optimal'
@@ -184,14 +184,45 @@ class PCBF_DI(PCBF):
         else:
             raise ValueError("Unknown backup controller")
             
-        self._jit_value_and_grad = None
+        # Bypass base class check in solve_control_problem
+        # The base class returns u_nom if this is None.
+        self.backup_policy_jax = True 
         
+        self._jit_value_and_grad = None
+
+    def _update_obstacles(self):
+        """Override to ensure obstacles are loaded from env."""
+        if self.env is not None and hasattr(self.env, 'obstacles'):
+             self.obstacles = self.env.obstacles
+             # DEBUG PRINT to confirm
+             # if len(self.obstacles) == 0:
+             #    print("DEBUG PCBF: Obstacles list is EMPTY!", flush=True)
+             # else:
+             #    # Print once to verify format
+             #    pass 
+        else:
+             print("DEBUG PCBF: Env is None or no obstacles!", flush=True)
+             self.obstacles = []
+
     def _compute_value_and_grad(self, x0_jax):
         horizon_steps = self.backup_horizon_steps
+        
+        # DEBUG OBSTACLE Check
+        # if abs(x0_jax[0] + 4.0) < 0.2:
+        #      print(f"DEBUG JAX: x={x0_jax} len(obs)={len(self.obstacles)}", flush=True)
+
         if len(self.obstacles) > 0:
             obs = self.obstacles[0]
-            obs_jax = jnp.array([obs[0], obs[1], obs[2]])
+            # Handle Dict or List/Tuple
+            if isinstance(obs, dict):
+                obs_vals = [obs['x'], obs['y'], obs['radius']]
+            else:
+                obs_vals = [obs[0], obs[1], obs[2]]
+            obs_jax = jnp.array(obs_vals)
         else:
+            # DEBUG RETURN 100
+            if abs(x0_jax[0] + 4.0) < 0.2 and abs(x0_jax[1]) < 0.2:
+                  print(f"DEBUG JAX: NO OBSTACLES FOUND! Returning V=100", flush=True)
             return 100.0, jnp.zeros(4), x0_jax[None, :]
             
         if self.policy_type == 'stop':
@@ -202,10 +233,29 @@ class PCBF_DI(PCBF):
             V, grad_V = compute_value_and_grad_turn(
                 x0_jax, self.sys_params, self.pol_params, obs_jax, horizon_steps
             )
+
         return float(V), np.array(grad_V), x0_jax[None, :]
 
     def _solve_cbf_qp(self, u_nom, V, grad_V, f, G):
-        return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
+         # Debug constraint values for (-4,0)
+         # Reconstruct what solve_cbf_qp_di does but print first
+         grad_V_f = grad_V @ f
+         grad_V_G = grad_V @ G
+         cbf_rhs = grad_V_f + self.cbf_alpha * V
+         
+         # Check if we are near (-4,0) - this is tricky since we don't have x inside _solve
+         # However, we know V roughly. 
+         # Or we can just spam a few lines if V is reasonable range
+         # Let's rely on the print in _compute_value_and_grad to print x.
+         # Actually, we can pass x through if we change signature, but that's invasive.
+         
+         # Let's just print unconditionally if V is low-ish (implying interaction)
+         # Filters run on many points.
+         
+         # Better idea: In _compute_value_and_grad, we have x. WE PRINT THERE.
+         # I will revert this method to clean state and add print to _compute_value_and_grad
+         
+         return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
 
 
 class MPCBF_DI(MPCBF):
@@ -254,7 +304,18 @@ class MPCBF_DI(MPCBF):
         horizon_steps = self.backup_horizon_steps
         if len(self.obstacles) > 0:
             obs = self.obstacles[0]
-            obs_jax = jnp.array([obs[0], obs[1], obs[2]])
+            if isinstance(obs, dict):
+                obs_vals = [obs['x'], obs['y'], obs['radius']]
+            else:
+                obs_vals = [obs[0], obs[1], obs[2]]
+            
+            # DEBUG PRINT
+            # Only print for a specific point to avoid spam? 
+            # Or print once. JAX might compile it away if not careful, but this is Python side before JAX call? 
+            # obs_jax creation is Python/JAX boundary.
+            # print(f"DEBUG PCBF: obs type={type(obs)} vals={obs_vals}")
+            
+            obs_jax = jnp.array(obs_vals)
         else:
              V_dict = {n: 100.0 for n in self.di_policies}
              grad_V_dict = {n: np.zeros(4) for n in self.di_policies}
@@ -267,6 +328,11 @@ class MPCBF_DI(MPCBF):
                 V, grad_V = compute_value_and_grad_stop(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
             else:
                 V, grad_V = compute_value_and_grad_turn(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
+            
+            # Debug Print for specific point (-4, 0) approx
+            if abs(x0_jax[0] + 4.0) < 0.1 and abs(x0_jax[1]) < 0.1:
+                 print(f"DEBUG PCBF {name}: x={x0_jax} obs={obs_vals} V={V}")
+                 
             V_dict[name] = float(V)
             grad_V_dict[name] = np.array(grad_V)
             

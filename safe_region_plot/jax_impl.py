@@ -105,8 +105,6 @@ def stop_policy(state: jnp.ndarray, params: StopPolicyParams) -> jnp.ndarray:
     u_norm = jnp.linalg.norm(u)
     scale = jnp.where(u_norm > params.a_max, params.a_max / (u_norm + 1e-8), 1.0)
     return u * scale
-    scale = jnp.where(u_norm > params.a_max, params.a_max / (u_norm + 1e-8), 1.0)
-    return u * scale
 
 def turn_policy(state: jnp.ndarray, params: TurnPolicyParams) -> jnp.ndarray:
     """
@@ -114,24 +112,21 @@ def turn_policy(state: jnp.ndarray, params: TurnPolicyParams) -> jnp.ndarray:
     """
     # state: [x, y, vx, vy]
     y = state[1]
-    vy = state[3]
+    vx = state[2]
+    # vy = state[3]
     
-    # Determine target_y based on position (Logic mirroring TurnBackupController roughly)
-    # If closer to UP, go UP.
-    dist_up = jnp.abs(y - params.target_y_up)
-    dist_down = jnp.abs(y - params.target_y_down)
+    # Logic from backup.py:
+    # if y >= dy: ay = a_max
+    # else: ay = -a_max
+    # We use tanh for differentiability
+    dy = params.decision_y
+    k_smooth = 10.0
+    epsilon = 1e-4
+    ay = jnp.tanh(k_smooth * (y - dy + epsilon)) * params.a_max
     
-    # Use jax.lax.select/where for branching
-    target_y = jnp.where(dist_up < dist_down, params.target_y_up, params.target_y_down)
-    
-    # PD Control for Y
-    ay_des = params.k_v * (target_y - y) - params.k_v * vy
-    
-    # Clamp
-    ay = jnp.clip(ay_des, -params.a_max, params.a_max)
-    
-    # X control: coast (ax=0)
-    ax = 0.0
+    # X control: ax = -k_v * vx
+    ax_des = -params.k_v * vx
+    ax = jnp.clip(ax_des, -params.a_max, params.a_max)
     
     return jnp.array([ax, ay])
 
