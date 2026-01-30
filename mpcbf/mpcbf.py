@@ -301,7 +301,7 @@ class MPCBF(PCBF):
         if max_operator not in MAX_OPERATOR_TYPES:
             raise ValueError(f"max_operator must be one of {MAX_OPERATOR_TYPES}, got '{max_operator}'")
         self.max_operator = max_operator
-        
+                
         # Lane targets
         self.left_lane_y = left_lane_y
         self.right_lane_y = right_lane_y
@@ -580,7 +580,7 @@ class MPCBF(PCBF):
                 def body_fn(carry, i):
                     x = carry
                     u = get_u_at_t(i, None)
-                    x_next = self.dynamics_jax.step_full_state(x, u, self.current_friction)
+                    x_next = self.dynamics_jax.step_full_state(x, u, mu=self.current_friction)
                     
                     # Compute h
                     x_curr, y_curr = x_next[0], x_next[1]

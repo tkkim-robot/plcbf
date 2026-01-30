@@ -16,6 +16,8 @@ class DoubleIntegratorParams(NamedTuple):
     v_max: float
     radius: float
     dt: float
+    mu: float = 1.0
+    sidewind: float = 0.0
 
 class StopPolicyParams(NamedTuple):
     a_max: float
@@ -46,22 +48,54 @@ class TurnPolicyParams:
 class DoubleIntegratorDynamicsJAX:
     def __init__(self, params: DoubleIntegratorParams):
         self.params = params
-        
-    def f_full(self, x, mu=None):
-        """Return f(x) for x_dot = f(x) + g(x)u"""
-        # f = [vx, vy, 0, 0]
-        return jnp.array([x[2], x[3], 0.0, 0.0])
-        
-    def g_full(self, x):
-        """Return g(x)"""
-        # g = [[0, 0], [0, 0], [1, 0], [0, 1]]
+
+    def open_loop_dynamics(self, state, control, time=0.0):
+        # state: [x, y, vx, vy]
+        # control: [ax, ay]
+
+        # 1. Input Saturation (Friction)
+        # limit = mu * a_max
+        limit = self.params.mu * self.params.a_max
+        u_sat = jnp.clip(control, -limit, limit)
+
+        # 2. Dynamics with Sidewind
+        # x_dot = [vx, vy, ax + 0, ay + sidewind]
+
+        dq = state[2:] # [vx, vy]
+        u = u_sat
+
+        # f component has sidewind
+        # g component is identity for u
+
+        accel_x = u[0]
+        accel_y = u[1] + self.params.sidewind
+
+        dx = jnp.concatenate([dq, jnp.array([accel_x, accel_y])])
+        return dx
+
+    def get_f_g(self, state):
+        # f: [vx, vy, 0, sidewind]
+        # g: [[0,0], [0,0], [1,0], [0,1]]
+
+        vx = state[2]
+        vy = state[3]
+
+        f = jnp.array([vx, vy, 0.0, self.params.sidewind])
         g = jnp.zeros((4, 2))
         g = g.at[2, 0].set(1.0)
         g = g.at[3, 1].set(1.0)
+        return f, g
+
+    def f_full(self, x, mu=None):
+        f, _ = self.get_f_g(x)
+        return f
+
+    def g_full(self, x):
+        _, g = self.get_f_g(x)
         return g
-        
+
     def step_full_state(self, x, u, mu=None):
-        """Step dynamics x_next = x + f*dt + g*u*dt (Euler)"""
+        """Step dynamics x_next = x + dx * dt (Euler)"""
         # x: [px, py, vx, vy]
         # u: [ax, ay]
         pos = x[:2]

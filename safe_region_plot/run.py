@@ -2,7 +2,7 @@ import argparse
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from safe_control.robots.double_integrator2D import DoubleIntegrator2D
+from .dynamics_sim import DoubleIntegratorSim
 from .dynamics_hj import DoubleIntegratorHJ
 from .backup import StopBackupController, TurnBackupController
 from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, MPCBFWrapper
@@ -22,6 +22,8 @@ def main():
     parser.add_argument("--plot_only", action="store_true", help="Only generate plot from existing .npz files (skips trajectory viz)")
     parser.add_argument("--method", type=str, default=None, help="Filter to run only specific method (e.g. PCBF)")
     parser.add_argument("--policy", type=str, default=None, help="Filter to run only specific policy (e.g. stop)")
+    parser.add_argument('--mu', type=float, default=1.0, help='Friction coefficient (for saturation).')
+    parser.add_argument('--sidewind', type=float, default=0.0, help='Sidewind acceleration component.')
     
     args = parser.parse_args()
     
@@ -32,10 +34,44 @@ def main():
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
         
+    # Scenario & Directory Logic
+    scenario_name = "normal"
+    if args.sidewind != 0.0:
+        scenario_name = "sidewind"
+    elif args.mu != 1.0:
+        scenario_name = f"mu_{args.mu}"
+        
+    # Update save path
+    args.save_path = os.path.join(args.save_path, scenario_name)
+    os.makedirs(args.save_path, exist_ok=True)
+    print(f"Scenario: {scenario_name} | Output Dir: {args.save_path}")
+
+    # --- 1. Setup ---
+    dt = 0.05
+    
+    robot_spec = {
+        'model': 'DoubleIntegrator2D',
+        'a_max': args.amax, 
+        'v_max': 5.0, 
+        'radius': 0.5,
+        'mu': args.mu,
+        'sidewind': args.sidewind
+    }
+    
+    # Dynamics (for HJ)
+    # Note: DoubleIntegratorHJ uses simple box bounds u_max for Hamiltonian.
+    # We update it to support circle/wind internally now.
+    dynamics_hj = DoubleIntegratorHJ(
+        u_max=[args.amax, args.amax], 
+        u_min=[-args.amax, -args.amax],
+        mu=args.mu,
+        sidewind=args.sidewind,
+        u_mode="max",
+        d_mode="min"
+    )
     # Parameters
     obstacle_pos = [0.0, 0.0]
     obstacle_radius = 1.0
-    robot_radius = 0.5
     robot_radius = 0.5
     dt = 0.05
     #pcbf_alpha = 1.0 # using backup specified alpha below 
@@ -47,7 +83,7 @@ def main():
         'radius': robot_radius
     }
     
-    robot = DoubleIntegrator2D(dt, robot_spec)
+    robot = DoubleIntegratorSim(dt, robot_spec)
     
     # HJ Grid - cover new range with margin
     hj_res = min(args.res, 15) if not args.test else 5
@@ -69,7 +105,7 @@ def main():
             grid_hj.coordinate_vectors = coordinate_vectors
     else:
         print(f"Computing Viability Kernel (HJ) with res {hj_res}...")
-        dynamics_hj = DoubleIntegratorHJ(a_max=args.amax)
+        # dynamics_hj already initialized above
         grid_hj, hj_values = compute_viability_kernel(hj_grid_params, obstacle_pos, obstacle_radius, robot_radius, dynamics_hj, t_max=args.t_max)
         
         # Save HJ kernel immediately
@@ -110,6 +146,10 @@ def main():
     if args.method:
         if args.method not in methods:
             print(f"Warning: Method {args.method} not in default list " + str(methods))
+    all_methods = ['BackupCBF', 'MPS', 'Gatekeeper', 'PCBF', 'MPCBF']
+    if args.method == 'ALL' or args.method is None:
+        methods = all_methods
+    else:
         methods = [args.method]
         
     # Policy Selection logic
@@ -128,7 +168,7 @@ def main():
             pcbf_alpha = 1.0
             print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
         else:
-            pcbf_alpha = 0.1
+            pcbf_alpha = 0.5
             print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
             
         results = {}
@@ -153,12 +193,16 @@ def main():
                 with np.load(method_file) as data:
                     results[method] = {'boundary': data['boundary'], 'safe_set': data['safe_set']}
             else:
+                if args.plot_only:
+                    print(f"Skipping {method} (File missing and plot_only=True)")
+                    continue
+
                 print(f"Evaluating {method}...")
                 wrapper_cls = {
                     'BackupCBF': BackupCBFWrapper, 
                     'MPS': MPSWrapper, 
-                    'Gatekeeper': GatekeeperWrapper,
-                    'PCBF': PCBFWrapper,
+                    'Gatekeeper': GatekeeperWrapper, 
+                    'PCBF': PCBFWrapper, 
                     'MPCBF': MPCBFWrapper
                 }[method]
                 

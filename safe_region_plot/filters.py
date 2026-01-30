@@ -167,24 +167,10 @@ class PCBF_DI(PCBF):
         self.cbf_alpha = self.alphas['stop'] # Default initialization
 
         # Parameters
-        # Stop
+        
+        # Stop (Kept for reference if needed, or used by policy setup)
         self.params_stop = StopPolicyParams(a_max=robot_spec['a_max'], k_v=backup_controller.k_v)
-        
-        # Turn Up (Force UP by setting decision_y low)
-        self.params_turn_up = TurnPolicyParams(
-            a_max=robot_spec['a_max'], 
-            k_v=1.0, 
-            decision_y=-100.0, # Always y > -100 -> Turn UP
-            target_y=2.0
-        )
-        
-        # Turn Down (Force DOWN by setting decision_y high)
-        self.params_turn_down = TurnPolicyParams(
-            a_max=robot_spec['a_max'], 
-            k_v=1.0, 
-            decision_y=100.0, # Always y < 100 -> Turn DOWN
-            target_y=-2.0
-        )
+
         
         self.backup_policy_jax = True # Bypass base check
         
