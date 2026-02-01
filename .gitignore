@@ -13,6 +13,7 @@ wandb/
 uv.lock
 .DS_Store
 /output/
+**/output/
 
 *.png
 *.svg
@@ -21,3 +22,5 @@ uv.lock
 
 temp.sh
 wandb/
+
+docs/

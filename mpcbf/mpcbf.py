@@ -282,7 +282,8 @@ class MPCBF(PCBF):
         right_lane_y: float = -5.0,
         safety_margin: float = 0.0,
         max_operator: str = 'input_space',  # Selection operator: 'c', 'v', or 'input_space'
-        ax=None,
+        debug: bool = False,
+        ax=None
     ):
         """
         Initialize the MPCBF controller.
@@ -300,7 +301,7 @@ class MPCBF(PCBF):
         if max_operator not in MAX_OPERATOR_TYPES:
             raise ValueError(f"max_operator must be one of {MAX_OPERATOR_TYPES}, got '{max_operator}'")
         self.max_operator = max_operator
-        
+                
         # Lane targets
         self.left_lane_y = left_lane_y
         self.right_lane_y = right_lane_y
@@ -316,6 +317,8 @@ class MPCBF(PCBF):
         
         # Visualization handles for multi-policy
         self.policy_traj_lines = {}
+
+        self.debug = debug
         
         # Multiple policies configuration
         self._setup_multi_policies()
@@ -577,7 +580,7 @@ class MPCBF(PCBF):
                 def body_fn(carry, i):
                     x = carry
                     u = get_u_at_t(i, None)
-                    x_next = self.dynamics_jax.step_full_state(x, u, self.current_friction)
+                    x_next = self.dynamics_jax.step_full_state(x, u, mu=self.current_friction)
                     
                     # Compute h
                     x_curr, y_curr = x_next[0], x_next[1]
@@ -689,7 +692,12 @@ class MPCBF(PCBF):
             Lg_V = grad_V @ G
             
             # Use per-policy alpha for SELECTION (smaller alpha for stop makes it less attractive)
-            policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
+            # Check self.alphas first (instance dict), then GLOBAL POLICY_ALPHA, then self.cbf_alpha
+            instance_alphas = getattr(self, 'alphas', {})
+            if name in instance_alphas:
+                 policy_alpha = instance_alphas[name]
+            else:
+                 policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
             
             # Constraint value at u_nom: c = Lf_V + Lg_V @ u_nom + alpha * V
             constraint_value = Lf_V + Lg_V @ u_nom + policy_alpha * V
@@ -698,7 +706,7 @@ class MPCBF(PCBF):
             # ALWAYS compute feasible area for feasibility check
             # CBF constraint: Lg_V @ u >= -(Lf_V + alpha * V)
             # Use GLOBAL alpha for area computation (execution phase perspective)
-            cbf_rhs = Lf_V + self.cbf_alpha * V
+            cbf_rhs = Lf_V + policy_alpha * V
             area = float(_compute_feasible_area_jit(
                 jnp.array(Lg_V),
                 cbf_rhs,
@@ -850,6 +858,14 @@ class MPCBF(PCBF):
         # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.
         # If constraint < 0 at u_nom, the QP will find minimal deviation to satisfy constraint.
+        
+        # UPDATE QP ALPHA to match selected policy
+        instance_alphas = getattr(self, 'alphas', {})
+        if best_policy in instance_alphas:
+             self.cbf_alpha = instance_alphas[best_policy]
+        elif best_policy in POLICY_ALPHA:
+             self.cbf_alpha = POLICY_ALPHA[best_policy]
+        # else keep existing self.cbf_alpha
         
         # Solve CBF-QP with best policy's constraint
         u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
