@@ -38,7 +38,7 @@ def main():
     # Scenario & Directory Logic
     scenario_name = "normal"
     if args.sidewind != 0.0:
-        scenario_name = "sidewind"
+        scenario_name = f"sidewind_{args.sidewind}"
     elif args.mu != 1.0:
         scenario_name = f"mu_{args.mu}"
         
@@ -52,7 +52,7 @@ def main():
     
     robot_spec = {
         'model': 'DoubleIntegrator2D',
-        'a_max': args.amax * args.mu, 
+        'a_max': args.amax, 
         'v_max': 5.0, 
         'radius': 0.5,
         'mu': args.mu,
@@ -77,12 +77,12 @@ def main():
     dt = 0.05
     #pcbf_alpha = 1.0 # using backup specified alpha below 
     
-    robot_spec = {
-        'model': 'DoubleIntegrator2D',
-        'a_max': args.amax * args.mu,
-        'v_max': 5.0,
-        'radius': robot_radius
-    }
+    # robot_spec = {
+    #     'model': 'DoubleIntegrator2D',
+    #     'a_max': args.amax * args.mu,
+    #     'v_max': 5.0,
+    #     'radius': robot_radius
+    # }
     
     robot = DoubleIntegratorSim(dt, robot_spec)
     
@@ -270,12 +270,13 @@ def main():
                     
                     if method == "BackupCBF":
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
-                    elif method == "PCBF" or method == "MPCBF":
-                         # PCBF/MPCBF generally don't use horizon_discount in this impl, 
-                         # MPS/GK use it for finer resolution check.
-                         # Pass it if the wrapper accepts it, but my PCBF wrapper above does NOT accept horizon_discount.
-                         # It accepts alpha.
-                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha) # Matches BackupCBF
+                    elif method == "MPCBF":
+                         # MPCBF MUST use the fixed heterogeneous alpha dict for Grid Generation too!
+                         # This resolves the discrepancy between Stop/Turn plots.
+                         mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                    elif method == "PCBF":
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
                     else:
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                     
@@ -410,7 +411,11 @@ def main():
                         wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'MPCBF': MPCBFWrapper}[method]
                         if method == "BackupCBF":
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
-                        elif method == "PCBF" or method == "MPCBF":
+                        elif method == "MPCBF":
+                             # MPCBF MUST use the fixed heterogeneous alpha dict regardless of the current plot policy
+                             mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                        elif method == "PCBF":
                              fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
                         else:
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)

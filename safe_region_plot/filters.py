@@ -149,7 +149,9 @@ class PCBF_DI(PCBF):
             a_max=robot_spec['a_max'],
             v_max=robot_spec['v_max'],
             radius=robot_spec['radius'],
-            dt=dt
+            dt=dt,
+            mu=robot_spec.get('mu', 1.0),
+            sidewind=robot_spec.get('sidewind', 0.0)
         )
         self.dynamics_jax = DoubleIntegratorDynamicsJAX(self.sys_params)
         
@@ -254,31 +256,41 @@ class PCBF_DI(PCBF):
 
 
 class MPCBF_DI(MPCBF):
-    def __init__(self, robot, robot_spec, dt, backup_horizon, cbf_alpha, backup_controller):
+    def __init__(self, robot, robot_spec, dt, backup_horizon, alpha, backup_controller):
         # Handle dict alpha for base class call (pass dummy or first value)
-        base_alpha = cbf_alpha['stop'] if isinstance(cbf_alpha, dict) else cbf_alpha
+        base_alpha = alpha['stop'] if isinstance(alpha, dict) else alpha
+        
+        # Store KV for use in setup
+        self.backup_controller_kv = backup_controller.k_v
+
+        # Call Super Init (sets self.robot_spec and calls _setup_multi_policies)
         super().__init__(robot, robot_spec, dt, backup_horizon, base_alpha, max_operator='c')
         
+        # Initialize Dynamics AFTER super().__init__ to overwrite base class defaults
         self.sys_params = DoubleIntegratorParams(
             a_max=robot_spec['a_max'],
             v_max=robot_spec['v_max'],
             radius=robot_spec['radius'],
-            dt=dt
+            dt=dt,
+            mu=robot_spec.get('mu', 1.0),
+            sidewind=robot_spec.get('sidewind', 0.0)
         )
         self.dynamics_jax = DoubleIntegratorDynamicsJAX(self.sys_params)
         self.u_min = np.array([-self.sys_params.a_max, -self.sys_params.a_max])
         self.u_max = np.array([self.sys_params.a_max, self.sys_params.a_max])
         
         # Alphas Setup
-        if isinstance(cbf_alpha, dict):
-             self.alphas = cbf_alpha
+        if isinstance(alpha, dict):
+             self.alphas = alpha
         else:
-             self.alphas = {'stop': cbf_alpha, 'turn_up': cbf_alpha, 'turn_down': cbf_alpha}
+             self.alphas = {'stop': alpha, 'turn_up': alpha, 'turn_down': alpha}
 
-        # Parameters (Force Turn Directions)
+    def _setup_multi_policies(self):
+        """Setup policies for Double Integrator (Stop, Turn Up, Turn Down)."""
+        # Create params locally (or store if needed elsewhere)
         # Turn Up (Force UP by setting decision_y low)
         self.params_turn_up = TurnPolicyParams(
-            a_max=robot_spec['a_max'], 
+            a_max=self.robot_spec['a_max'], 
             k_v=1.0, 
             decision_y=-100.0,
             target_y=2.0,
@@ -287,21 +299,38 @@ class MPCBF_DI(MPCBF):
         )
         # Turn Down (Force DOWN by setting decision_y high)
         self.params_turn_down = TurnPolicyParams(
-            a_max=robot_spec['a_max'], 
+            a_max=self.robot_spec['a_max'], 
             k_v=1.0, 
             decision_y=100.0,
             target_y=-2.0,
             target_y_up=-2.0,
             target_y_down=-2.0
         )
-        # Stop 
-        self.params_stop = StopPolicyParams(a_max=robot_spec['a_max'], k_v=backup_controller.k_v)
-        
-        self.di_policies = {
-             'stop': ('stop', self.params_stop),
-             'turn_up': ('turn', self.params_turn_up),
-             'turn_down': ('turn', self.params_turn_down)
+        # Stop
+        # Note: self.backup_controller_kv must be set before super().__init__ calls this
+        k_v = getattr(self, 'backup_controller_kv', 1.0) 
+        self.params_stop = StopPolicyParams(a_max=self.robot_spec['a_max'], k_v=k_v)
+
+        self.policy_configs = {
+             'stop': {
+                 'type': 'stop',
+                 'params': self.params_stop,
+                 'horizon': self.backup_horizon_steps
+             },
+             'turn_up': {
+                 'type': 'turn',
+                 'params': self.params_turn_up,
+                 'horizon': self.backup_horizon_steps
+             },
+             'turn_down': {
+                 'type': 'turn',
+                 'params': self.params_turn_down,
+                 'horizon': self.backup_horizon_steps
+             }
         }
+        
+        # Nominal "policy" is handled implicitly in compute_value (no params needed)
+
 
     def _compute_multi_value_and_grad(self, x0_jax):
         horizon_steps = self.backup_horizon_steps
@@ -314,24 +343,32 @@ class MPCBF_DI(MPCBF):
             
             obs_jax = jnp.array(obs_vals)
         else:
-             V_dict = {n: 100.0 for n in self.di_policies}
-             grad_V_dict = {n: np.zeros(4) for n in self.di_policies}
+             V_dict = {n: 100.0 for n in self.policy_configs}
+             grad_V_dict = {n: np.zeros(4) for n in self.policy_configs}
+             V_dict['nominal'] = 100.0
+             grad_V_dict['nominal'] = np.zeros(4)
              return V_dict, grad_V_dict, {}
 
         V_dict = {}
         grad_V_dict = {}
-        for name, (ptype, params) in self.di_policies.items():
+        
+        # 1. Backup Policies
+        for name, config in self.policy_configs.items():
+            ptype = config['type']
+            params = config['params']
+            
             if ptype == 'stop':
                 V, grad_V = compute_value_and_grad_stop(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
             else:
                 V, grad_V = compute_value_and_grad_turn(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
             
-            # Debug Print for specific point (-4, 0) approx
-            # Debug Print Removed
-            pass
-                 
             V_dict[name] = float(V)
             grad_V_dict[name] = np.array(grad_V)
+            
+        # 2. Nominal Policy
+        # Set to -inf to ensure we only rely on valid Backups for safety analysis unless explicit nominal trajectory is provided
+        V_dict['nominal'] = -np.inf 
+        grad_V_dict['nominal'] = np.zeros(4) # FIXME: you have to put nominal policy too
             
         return V_dict, grad_V_dict, {}
 

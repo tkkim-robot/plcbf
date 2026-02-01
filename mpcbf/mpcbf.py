@@ -692,7 +692,12 @@ class MPCBF(PCBF):
             Lg_V = grad_V @ G
             
             # Use per-policy alpha for SELECTION (smaller alpha for stop makes it less attractive)
-            policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
+            # Check self.alphas first (instance dict), then GLOBAL POLICY_ALPHA, then self.cbf_alpha
+            instance_alphas = getattr(self, 'alphas', {})
+            if name in instance_alphas:
+                 policy_alpha = instance_alphas[name]
+            else:
+                 policy_alpha = POLICY_ALPHA.get(name, self.cbf_alpha)
             
             # Constraint value at u_nom: c = Lf_V + Lg_V @ u_nom + alpha * V
             constraint_value = Lf_V + Lg_V @ u_nom + policy_alpha * V
@@ -701,7 +706,7 @@ class MPCBF(PCBF):
             # ALWAYS compute feasible area for feasibility check
             # CBF constraint: Lg_V @ u >= -(Lf_V + alpha * V)
             # Use GLOBAL alpha for area computation (execution phase perspective)
-            cbf_rhs = Lf_V + self.cbf_alpha * V
+            cbf_rhs = Lf_V + policy_alpha * V
             area = float(_compute_feasible_area_jit(
                 jnp.array(Lg_V),
                 cbf_rhs,
@@ -853,6 +858,14 @@ class MPCBF(PCBF):
         # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
         # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.
         # If constraint < 0 at u_nom, the QP will find minimal deviation to satisfy constraint.
+        
+        # UPDATE QP ALPHA to match selected policy
+        instance_alphas = getattr(self, 'alphas', {})
+        if best_policy in instance_alphas:
+             self.cbf_alpha = instance_alphas[best_policy]
+        elif best_policy in POLICY_ALPHA:
+             self.cbf_alpha = POLICY_ALPHA[best_policy]
+        # else keep existing self.cbf_alpha
         
         # Solve CBF-QP with best policy's constraint
         u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
