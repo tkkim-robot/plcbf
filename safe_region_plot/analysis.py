@@ -34,7 +34,7 @@ def compute_viability_kernel(grid_params, obstacle_pos, obstacle_radius, robot_r
     all_values = solve(solver_settings, dynamics, grid, times, initial_values)
     return grid, all_values[-1] # Return grid and final value function
 
-def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, obstacle_pos, obstacle_radius, robot_radius, robot, dt=0.05, t_sim=2.0):
+def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, obstacle_pos, obstacle_radius, robot_radius, robot, dt=0.05, t_sim=2.0, nominal_controller=None, check_trajectory_deviation=False):
     """
     Evaluate a single filter over a grid of X, Y positions with fixed VX, VY.
     """
@@ -48,8 +48,6 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
     # Perturb y exactly at 0 to avoid numerical singularities in gradients
     eval_y[np.abs(eval_y) < 1e-6] = 1e-5
 
-    # Nominal input is zero (maintain velocity)
-    u_nom = np.zeros((2, 1))
     # Results grids
     res_boundary = np.zeros(eval_x.shape)
     res_safe_set = np.zeros(eval_x.shape)
@@ -74,9 +72,17 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
 
             state = np.array([x, y, fixed_vx, fixed_vy]).reshape(-1, 1)
             
+            # Determine Nominal Control for Initial State
+            if nominal_controller is not None:
+                u_nom = nominal_controller(state)
+            else:
+                u_nom = np.zeros((2, 1))
+            
             # --- 1. Check Filter Boundary (Activation at Initial State) ---
             # Instantiate NEW filter instance for this point (Sanity)
             filter_wrapper = filter_factory()
+            
+            deviation_detected = False
             
             try:
                 # Solve control problem for first step
@@ -84,33 +90,29 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
                 try:
                     u_safe = filter_wrapper.get_safe_control(state, u_nom)
                     u = np.array(u_safe).flatten()
-                    problem_status = "Optimal"
                 except ValueError as e:
-                    # If infeasible, apply braking or dummy control and mark collision
-                    u = np.zeros(2) # Emergency stop attempt? Or just zero
-                    problem_status = "Infeasible"
-                    # We can continue with nominal/braking to see what happens, 
-                    # but usually for safe region plot trigger, we might stop.
-                    # Let's simple apply max braking as fallback? 
-                    # safe_region_plot usually counts "unsafe" if collision happens.
-                    # If we just brake, we might collide.
-                    # For visualization purpose, let's just use zero control.
-                    u_safe = None # Set u_safe to None to trigger is_active = True
+                    u = np.zeros(2)
+                    u_safe = None
           
                 # If infeasible or None returned, consider it Active (intervening/failed)
                 if u_safe is None:
-                     is_active = True
+                     is_active_initial = True
+                     deviation_detected = True
                 else:
                      # Check if output differs from nominal
-                     # Using 1e-4 tolerance
                      diff = np.linalg.norm(u_safe - u_nom)
-                     is_active = diff > 1e-4
+                     is_active_initial = diff > 1e-4
+                     if is_active_initial:
+                         deviation_detected = True
                      
             except Exception:
-                is_active = True
+                is_active_initial = True
+                deviation_detected = True
                 u_safe = None
 
-            res_boundary[i, j] = is_active
+            # If NOT checking full trajectory deviation, assume current boundary definition (first input)
+            if not check_trajectory_deviation:
+                res_boundary[i, j] = is_active_initial
             
             # --- 2. Check Safe Set (Simulation Loop) ---
             # Instantiate NEW filter again for fresh simulation
@@ -128,12 +130,27 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
                 # Get control
                 try:
                     state_col = curr_state.reshape(-1, 1)
-                    u_step = filter_wrapper.get_safe_control(state_col, u_nom)
+                    
+                    # Update Nominal Control for current state
+                    if nominal_controller is not None:
+                        u_nom_step = nominal_controller(state_col)
+                    else:
+                        u_nom_step = np.zeros((2, 1))
+                        
+                    u_step = filter_wrapper.get_safe_control(state_col, u_nom_step)
+                    
+                    # Check deviation if required
+                    if check_trajectory_deviation and not deviation_detected and u_step is not None:
+                         diff_step = np.linalg.norm(u_step - u_nom_step)
+                         if diff_step > 1e-4:
+                             deviation_detected = True
+                             
                 except Exception as e:
                     u_step = None
                     
                 if u_step is None:
                     is_safe = False
+                    deviation_detected = True # If failed, it deviated significantly (to failure)
                     break
                 
                 # Step dynamics
@@ -146,6 +163,12 @@ def evaluate_filter(name, filter_factory, grid_x, grid_y, fixed_vx, fixed_vy, ob
                     is_safe = False
             
             res_safe_set[i, j] = is_safe
+            
+            # Logic for "No Cost Region" (check_trajectory_deviation=True)
+            # If ANY deviation occurred -> Outside No Cost Region (Value 1)
+            # If NO deviation occurred -> Inside No Cost Region (Value 0)
+            if check_trajectory_deviation:
+                res_boundary[i, j] = deviation_detected
 
     print(f"DEBUG ANALYSIS: Total Safe Points: {np.sum(res_safe_set)} / {total_points}", flush=True)
     return {

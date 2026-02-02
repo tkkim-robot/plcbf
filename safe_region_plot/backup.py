@@ -49,3 +49,35 @@ class TurnBackupController:
         # Re-check total magnitude if robot spec is norm based
         # For simplicity, we use box constraints if not specified.
         return np.array([ax, ay]).reshape(-1, 1)
+
+class TargetHeightBackupController:
+    """
+    Backup Controller that maintains a target Y height and zero velocity.
+    ax = -kv * vx
+    ay = PD(y, vy) to target_y
+    """
+    def __init__(self, a_max=2.0, target_y=-2.0, k_p=1.0, k_d=2.0):
+        self.a_max = a_max
+        self.target_y = target_y
+        self.k_p = k_p
+        self.k_d = k_d
+        
+    def compute_control(self, state, target=None):
+        # state: [x, y, vx, vy]
+        state = state.flatten()
+        y = state[1]
+        vx = state[2]
+        vy = state[3]
+        
+        # X: Stop (Zero velocity)
+        ax = -self.k_d * vx 
+        
+        # Y: Go to target_y and stop
+        # Desired acceleration: -Kp(y - y_des) - Kd(vy)
+        ay = -self.k_p * (y - self.target_y) - self.k_d * vy
+        
+        # Saturation (Box)
+        ax = np.clip(ax, -self.a_max, self.a_max)
+        ay = np.clip(ay, -self.a_max, self.a_max)
+        
+        return np.array([ax, ay]).reshape(-1, 1)

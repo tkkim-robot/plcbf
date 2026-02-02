@@ -45,8 +45,8 @@ class MPSWrapper(SafetyFilterWrapper):
     def get_safe_control(self, state, u_nominal):
         self._u_nom = u_nominal.reshape(-1, 1)
         # solve_control_problem might return committed control, need to be careful with indexing
-        self.mps.committed_x_traj = None 
-        self.mps.committed_u_traj = None
+        # self.mps.committed_x_traj = None 
+        # self.mps.committed_u_traj = None
         u_safe = self.mps.solve_control_problem(state)
         return u_safe
 
@@ -68,8 +68,8 @@ class GatekeeperWrapper(SafetyFilterWrapper):
 
     def get_safe_control(self, state, u_nominal):
         self._u_nom = u_nominal.reshape(-1, 1)
-        self.gk.committed_x_traj = None
-        self.gk.committed_u_traj = None
+        # self.gk.committed_x_traj = None
+        # self.gk.committed_u_traj = None
         u_safe = self.gk.solve_control_problem(state)
         return u_safe
 
