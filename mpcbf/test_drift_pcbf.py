@@ -212,7 +212,7 @@ class TestConfig:
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
-    max_operator: str = 'c'  # MPCBF selection operator: 'c', 'v', or 'input_space'
+    max_operator: str = 'input_space'  # MPCBF selection operator: 'c', 'v', or 'input_space'
 
 
 # =============================================================================
