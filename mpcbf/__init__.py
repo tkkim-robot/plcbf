@@ -1,27 +1,8 @@
-# mpcbf package
-"""
-Multi-Policy CBF (mpcbf) - Safety-critical control for autonomous vehicles.
-
-This package provides:
-- Drifting environment with racing track simulation
-- Car dynamics based on kinematic bicycle model
-- Integration with safe_control library
-- Policy Control Barrier Function (PCBF) implementation in JAX
-"""
+"""MPCBF library for safe control using Control Barrier Functions."""
 
 __version__ = "0.1.0"
 
-from mpcbf.pcbf import (
-    PCBF, 
-    DriftingCarDynamicsJAX,
-    LaneChangeControllerJAX,
-    StoppingControllerJAX,
-)
+# Base classes only - scenario-specific implementations are in examples/
+from mpcbf.pcbf import PCBFBase
 
-__all__ = [
-    'PCBF', 
-    'DriftingCarDynamicsJAX',
-    'LaneChangeControllerJAX',
-    'StoppingControllerJAX',
-]
-
+__all__ = ['PCBFBase']
