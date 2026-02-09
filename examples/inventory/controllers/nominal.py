@@ -93,9 +93,20 @@ class GhostPredictor:
 
 
 class StopBackupController:
-    """Stop backup controller."""
+    """Stop backup controller (Brakes to zero velocity)."""
+    def __init__(self, Kp_braking=4.0):
+        self.Kp = Kp_braking
+
     def compute_control(self, state, target=None):
-        return np.zeros(2)
+        # state: [x, y, vx, vy]
+        if state.ndim == 2:
+            vel = state[2:4, 0]
+        else:
+            vel = state[2:4]
+        
+        # Desired velocity is zero
+        acc = -self.Kp * vel
+        return acc
 
 
 class MoveAwayBackupController:

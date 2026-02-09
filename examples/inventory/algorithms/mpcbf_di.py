@@ -32,11 +32,11 @@ class MPCBF_DI(PCBF_DI):
         num_angle_policies: int = 10,
         ax=None
     ):
+        self.num_angle_policies = num_angle_policies
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None) # Handle ax manually
         self.ax = ax
         
         # Policy Helpers
-        self.num_angle_policies = num_angle_policies
         self.policy_configs = {} # name -> (type, params)
         self._setup_policies()
         
@@ -72,6 +72,9 @@ class MPCBF_DI(PCBF_DI):
         # Nominal is handled specially
         
     def _setup_visualization(self):
+        if self.ax is None:
+            return
+            
         # Create lines for all policies
         colors = ['#FF0000'] # Stop is Red
         # Angles get rainbow
