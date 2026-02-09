@@ -343,8 +343,8 @@ def setup_controllers(
             dt=sim.dt,
             backup_horizon=sim.backup_horizon_time,
             cbf_alpha=sim.pcbf_alpha,
-            left_lane_y=max(left_lane_y, 6.5),
-            right_lane_y=min(right_lane_y, -6.5),
+            left_lane_y=left_lane_y,
+            right_lane_y=right_lane_y,
             safety_margin=1.0,
             max_operator=config.max_operator,
             ax=ax
@@ -352,7 +352,7 @@ def setup_controllers(
         actual_left = max(left_lane_y, 6.5)
         actual_right = min(right_lane_y, -6.5)
         print(f"  Using MPCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
-        print(f"    Policies: lane_change_left (y={actual_left:.1f}), lane_change_right (y={actual_right:.1f}), stop, nominal")
+        print(f"    Policies: lane_change_left (y={left_lane_y:.1f}), lane_change_right (y={right_lane_y:.1f}), stop, nominal")
     elif config.algo_type == 'pcbf':
         shielding = PCBF(
             robot=car,

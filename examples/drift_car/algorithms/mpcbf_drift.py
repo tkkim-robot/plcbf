@@ -22,7 +22,7 @@ Key Features:
 
 Selection Criterion:
 - For each policy i, compute constraint value: c_i = ∇V_i^T (f + G*u_nom) + α*V_i
-- Select policy with max c_i (most permissive constraint that's still safe)
+- Select policy with max feasible space (by default) (most permissive constraint that's still safe)
 - Use that constraint in the QP
 
 @required-scripts: mpcbf/pcbf.py
@@ -350,7 +350,7 @@ class MPCBF(PCBF):
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=6.0 if self.left_lane_y > 0 else self.left_lane_y, # Aim for y=6.0 (midpoint of safe corridor)
+                    target_y=self.left_lane_y,
                     Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
@@ -362,14 +362,14 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
+                    theta_des_max=float(np.deg2rad(15)),
                 ),
             },
             'lane_change_right': {
                 'type': 'lane_change',
                 'horizon': uniform_horizon,
                 'params': LaneChangePolicyParams(
-                    target_y=-6.0 if self.right_lane_y < 0 else self.right_lane_y, # Aim for y=-6.0
+                    target_y=self.right_lane_y,
                     Kp_y=0.15,  # Reduced gain for precise tracking in narrow corridor
                     Kp_theta=1.5,
                     Kd_theta=0.3,
@@ -381,7 +381,7 @@ class MPCBF(PCBF):
                     delta_dot_max=delta_dot_max,
                     tau_max=tau_max,
                     tau_dot_max=tau_dot_max,
-                    theta_des_max=float(np.deg2rad(30)),  # Increased to 30° for faster lateral move
+                    theta_des_max=float(np.deg2rad(15)),
                 ),
             },
             'stop': {
@@ -564,25 +564,18 @@ class MPCBF(PCBF):
                         dist = jnp.sqrt((x_curr - obs_x)**2 + (y_curr - obs_y)**2 + 1e-8)
                         return dist - combined_r
                     
-                    # Handle empty obstacles case inside JIT
-                    # If obs_arr is empty, map over empty array is fine, but reduction needs care
-                    # But we passed n_obs earlier to cond? No, here we assume obs_arr is valid
-                    # If obstacles_array is empty, we handle it outside this function or ensure shape is (0,3)
-                    
-                    h_vals = jax.vmap(h_single_obs)(obs_arr)
-                    # If no obstacles, h_vals is empty. 
-                    # We can use minimum with initial value but JAX min on empty is tricky
-                    # Better to check if obs_arr has substantial size
-                    
-                    h_obs = jnp.min(h_vals) if obs_arr.shape[0] > 0 else 100.0
+                    h_obs = jax.lax.select(
+                        obs_arr.shape[0] > 0,
+                        smooth_min(jax.vmap(h_single_obs)(obs_arr), temperature=5.0),
+                        100.0
+                    )
                     
                     # Boundary check
                     y_limit = t_width / 2.0 - r_rad
-                    h_bound = jnp.minimum(y_limit - y_curr, y_curr - (-y_limit))
-                    h_val_bounded = jnp.minimum(h_obs, h_bound)
-                    
-                    # Use select for JAX compatibility (t_width is a tracer)
-                    h_val = jax.lax.select(t_width < 900.0, h_val_bounded, h_obs)
+                    h_bound_upper = y_limit - y_curr
+                    h_bound_lower = y_curr - (-y_limit)
+                    h_bound = smooth_min(jnp.array([h_bound_upper, h_bound_lower]), temperature=5.0)
+                    h_val = smooth_min(jnp.array([h_obs, h_bound]), temperature=5.0)
                         
                     return x_next, (x_next, h_val)
                 
@@ -592,7 +585,7 @@ class MPCBF(PCBF):
                 
                 # Initial h
                 h0_vals = jax.vmap(lambda obs: jnp.sqrt((x0[0]-obs[0])**2 + (x0[1]-obs[1])**2 + 1e-8) - (obs[2]+r_rad))(obs_arr)
-                h0 = jnp.min(h0_vals) if obs_arr.shape[0] > 0 else 100.0
+                h0 = smooth_min(h0_vals, temperature=5.0) if obs_arr.shape[0] > 0 else 100.0
                 
                 h_all = jnp.concatenate([h0[None], h_values])
                 V = smooth_min(h_all, temperature=20.0)
@@ -718,12 +711,20 @@ class MPCBF(PCBF):
             elif self.max_operator == 'input_space':
                 # Feasible control area (control authority)
                 score_dict[name] = area
+            
+            if self.debug:
+                 print(f"Policy {name}: V={V:.4f}, c={constraint_value:.4f}, area={area:.4f}, rhs={cbf_rhs:.4f}")
         
         # Get all policies including nominal
         backup_policies = list(constraint_dict.keys())
         
         # Filter for safe policies (V > 0)
         safe_policies = [k for k in backup_policies if V_dict[k] > 0.0]
+        
+        if len(safe_policies) == 0:
+             print("WARNING: All policies unsafe (V <= 0)!")
+             for k in backup_policies:
+                 print(f"  {k}: V={V_dict[k]:.4f}")
         
         if len(safe_policies) > 0:
             candidates = safe_policies
