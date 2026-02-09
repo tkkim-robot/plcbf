@@ -761,7 +761,7 @@ def create_puddle_surprise_test() -> TestConfig:
         simulation=SimulationConfig(),
         obstacles=[
             ObstacleConfig(x=80.0, y=None),       # First obstacle in middle lane
-            ObstacleConfig(x=85.0, y=None),       # Second obstacle in left lane
+            ObstacleConfig(x=75.0, y=None),       # Second obstacle in left lane, a bit closer
         ],
         puddles=[
             # Large puddle right in front of obstacle
