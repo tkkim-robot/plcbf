@@ -883,27 +883,4 @@ class MPCBF(PCBF):
             self.multi_backup_trajs[name].clear()
         self.backup_trajs.clear()
         
-    def _update_multi_visualization(self, traj_dict: dict, best_policy: str):
-        """Update visualization for multiple policy trajectories."""
-        if self.ax is None:
-            return
-            
-        for name, traj in traj_dict.items():
-            line = self.policy_traj_lines.get(name)
-            if line is None:
-                continue
-                
-            if traj is not None and len(traj) > 0:
-                line.set_data(traj[:, 0], traj[:, 1])
-                
-                # Highlight best policy
-                if name == best_policy:
-                    line.set_alpha(1.0)
-                    line.set_linewidth(2.5)
-                    line.set_zorder(25)
-                else:
-                    line.set_alpha(0.3)
-                    line.set_linewidth(1.0)
-                    line.set_zorder(15)
-            else:
-                line.set_data([], [])
+
