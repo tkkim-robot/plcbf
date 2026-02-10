@@ -15,7 +15,10 @@ import jax.lax as lax
 import cvxpy as cp
 
 from examples.inventory.dynamics.dynamics_di_jax import DoubleIntegratorDynamicsJAX, DIDynamicsParams
-from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, StopPolicyJAX, AnglePolicyParams, StopPolicyParams
+from examples.inventory.controllers.policies_di_jax import (
+    AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
+    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
+)
 from examples.drift_car.algorithms.pcbf_drift import smooth_min
 from mpcbf.pcbf import PCBFBase
 
@@ -42,6 +45,7 @@ def _rollout_trajectory_di(
         x_pos, y_pos, vx, vy = x[0], x[1], x[2], x[3]
         ax, ay = u[0], u[1]
         
+        # Euler integration to match environment truth
         x_next = x_pos + vx * dt
         y_next = y_pos + vy * dt
         vx_next = vx + ax * dt
@@ -59,6 +63,8 @@ def _rollout_trajectory_di(
             return AnglePolicyJAX.compute(state, policy_params)
         elif policy_type == 'stop':
             return StopPolicyJAX.compute(state, policy_params)
+        elif policy_type == 'waypoint':
+            return WaypointPolicyJAX.compute(state, policy_params)
         else:
             return jnp.zeros(2) # Fallback
 
@@ -75,55 +81,55 @@ def _compute_value_pure_di(
     x0: jnp.ndarray,
     dynamics_params: DIDynamicsParams,
     policy_params: object, # NamedTuple
-    obstacles_array: jnp.ndarray, # (n, 5) [x, y, r, vx, vy]
+    dynamic_obstacles_array: jnp.ndarray, # (n, 5) [x, y, r, vx, vy]
+    static_obstacles_array: jnp.ndarray, # (m, 3) [x, y, r]
     policy_type: str,
     horizon: int,
     robot_radius: float,
-    dt: float,
-    track_width: float = 1000.0
+    robot_radius_base: float,
+    dt: float
 ) -> Tuple[float, jnp.ndarray]:
     """
     Compute Value function V(x) = min h(x(t)) for DI.
-    Handles moving obstacles.
+    Includes moving obstacles (with margin).
     """
     trajectory = _rollout_trajectory_di(dynamics_params, policy_params, policy_type, x0, horizon, dt)
     times = jnp.arange(horizon + 1) * dt
     
     def compute_h(state, t):
-        # Distance to obstacles
+        # Distance to dynamic obstacles
         x, y = state[0], state[1]
         
         def h_single(obs):
             # obs: [x, y, r, vx, vy]
-            # Predict obs pos
+            # Predict obs pos (with bouncing)
             obs_x = obs[0] + obs[3] * t
             obs_y = obs[1] + obs[4] * t
+            
+            obs_x = jnp.where(obs_x < 2.0, 4.0 - obs_x, obs_x)
+            obs_x = jnp.where(obs_x > 98.0, 196.0 - obs_x, obs_x)
+            obs_y = jnp.where(obs_y < 2.0, 4.0 - obs_y, obs_y)
+            obs_y = jnp.where(obs_y > 98.0, 196.0 - obs_y, obs_y)
             
             dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
             return dist - (obs[2] + robot_radius)
             
-        if obstacles_array.shape[0] > 0:
-            h_obs = smooth_min(jax.vmap(h_single)(obstacles_array), temperature=5.0)
+        if dynamic_obstacles_array.shape[0] > 0:
+            h_obs = smooth_min(jax.vmap(h_single)(dynamic_obstacles_array), temperature=100.0)
         else:
             h_obs = 100.0
             
-        # Boundary
-        y_max = track_width / 2.0 - robot_radius
-        h_bound = smooth_min(jnp.array([y_max - y, y - (-y_max)]), temperature=5.0)
-        
-        if track_width > 900:
-             return h_obs
-        return smooth_min(jnp.array([h_obs, h_bound]))
+        return h_obs
 
     h_all = jax.vmap(compute_h)(trajectory, times)
-    V = smooth_min(h_all, temperature=20.0)
+    V = smooth_min(h_all, temperature=40.0)
     
     return V, trajectory
 
 # JIT compiled version
 _compute_value_jit_di = jax.jit(
     _compute_value_pure_di,
-    static_argnums=(4, 5) # policy_type, horizon
+    static_argnums=(5, 6) # policy_type, horizon
 )
 
 
@@ -140,7 +146,7 @@ class PCBF_DI(PCBFBase):
     Overrides DI-specific:
     - 4-state dynamics (x, y, vx, vy)
     - Angle and stop policies
-    - HO-CBF for static obstacles
+    - HO-CBF for static obstacles (in QP) AND Value Function check
     """
     
     def _setup_dynamics(self):
@@ -155,12 +161,15 @@ class PCBF_DI(PCBFBase):
         
         # JIT cache
         self._jit_val_grad = None
+        self._jit_traj = None
         
     def set_policy(self, type_str: str, params):
         """Set backup policy for DI."""
         self.policy_type = type_str
         self.backup_policy_params = params
-        self._jit_val_grad = None  # Reset cache
+        # No need to reset cache for params change, only for static args (policy type)
+        # But if policy type changes, we need new JIT
+        self._jit_val_grad = None 
     
     def _get_control_dim(self) -> int:
         """DI control dimension: [ax, ay]."""
@@ -187,17 +196,29 @@ class PCBF_DI(PCBFBase):
     
     def _compute_value_and_grad(self, state):
         """Compute value function for DI via JAX rollout."""
+        # Prepare values
         robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
+        robot_radius_base = self.robot_spec.get('radius', 1.0)
         
-        # If no dynamic obstacles, return safe
-        if not self.dynamic_obstacles:
-            return 100.0, np.zeros(4), None
+        # Prepare Obstacle Arrays (Dynamic + Static)
         
-        # Get obstacles array
-        obs_array = jnp.array([
-            (o['x'], o['y'], o['radius'], o.get('vx', 0.0), o.get('vy', 0.0)) 
-            for o in self.dynamic_obstacles
-        ])
+        # Dynamic
+        if self.dynamic_obstacles:
+            dyn_obs_array = jnp.array([
+                (o['x'], o['y'], o['radius'], o.get('vx', 0.0), o.get('vy', 0.0)) 
+                for o in self.dynamic_obstacles
+            ])
+        else:
+            dyn_obs_array = jnp.zeros((0, 5))
+            
+        # Static
+        if self.static_obstacles:
+            stat_obs_array = jnp.array([
+                (o['x'], o['y'], o['radius']) 
+                for o in self.static_obstacles
+            ])
+        else:
+            stat_obs_array = jnp.zeros((0, 3))
         
         # Get or create JIT function
         val_grad_fn, traj_fn = self._get_jit_val_grad()
@@ -207,78 +228,77 @@ class PCBF_DI(PCBFBase):
             jnp.array(state),
             self.dynamics_params,
             self.backup_policy_params,
-            obs_array,
+            dyn_obs_array,
+            stat_obs_array,
             self.policy_type,
             self.backup_horizon_steps,
             robot_radius,
+            robot_radius_base,
             self.dt
         )
         
         # Get trajectory
         trajectory = traj_fn(
             jnp.array(state), self.dynamics_params, self.backup_policy_params,
-            obs_array, self.policy_type, self.backup_horizon_steps, robot_radius, self.dt
+            dyn_obs_array, stat_obs_array, self.policy_type, self.backup_horizon_steps, 
+            robot_radius, robot_radius_base, self.dt
         )
         
         return float(V_jax), np.array(grad_jax), np.array(trajectory)
     
-    def _add_cbf_constraints(self, u, constraints, state, V, grad_V):
+    def _add_cbf_constraints(self, u, constraints, state, V, grad_V, slack=0.0):
         """
         Add CBF constraints for DI.
         
         1. Dynamic obstacles: Standard CBF
         2. Static obstacles: HO-CBF (second-order)
         """
-        # Dynamic obstacle CBF
-        if self.dynamic_obstacles and V < 10.0:
+
+        if V < 10.0:
             f, g = self._get_system_matrices(state)
             L_f_V = np.dot(grad_V, f)
             L_g_V = grad_V[2:4]  # Only velocity components affect control
             
             constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V)
         
-        # Static obstacle HO-CBF (DI-specific)
+        # 2. Static obstacles: HO-CBF (second-order)
         gamma1, gamma2 = 2.0, 2.0
+        
+        # Static hurdles: additive safety margin
+        robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
         
         for obs in self.static_obstacles:
             ox, oy = obs['x'], obs['y']
-            robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
             r = obs['radius'] + robot_radius
             
             px, py, vx, vy = state
             dx, dy = px - ox, py - oy
             dist_sq = dx**2 + dy**2
             
-            # h = ||p - p_obs||^2 - R^2
             h = dist_sq - r**2
-            
-            # ḣ = 2(p - p_obs)^T v
             h_dot = 2 * (dx*vx + dy*vy)
-            
-            # ḧ = 2v^T v + 2(p - p_obs)^T a
             term_v = 2 * (vx**2 + vy**2)
             
-            # Constraint: 2(p - p_obs)^T u >= -(2v^T v + (γ₁+γ₂)ḣ + γ₁γ₂h)
             lhs = np.array([2*dx, 2*dy])
             rhs = -(term_v + (gamma1 + gamma2)*h_dot + gamma1*gamma2*h)
             
-            constraints.append(lhs @ u >= rhs)
+            constraints.append(lhs @ u >= rhs - slack)
     
     def _get_jit_val_grad(self):
         """Get or create JIT-compiled value_and_grad function."""
         if self._jit_val_grad is None:
-            def val_fn(x0, dyn_p, pol_p, obs_arr, p_type, hor, r_rad, dt_val):
-                V, _ = _compute_value_pure_di(x0, dyn_p, pol_p, obs_arr, p_type, hor, r_rad, dt_val)
+            def val_fn(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val):
+                V, _ = _compute_value_pure_di(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val)
                 return V
             
             self._jit_val_grad = jax.jit(
                 jax.value_and_grad(val_fn),
-                static_argnums=(4, 5)  # policy_type, horizon
+                static_argnums=(5, 6)  # policy_type, horizon
             )
             
             self._jit_traj = jax.jit(
-                lambda x0, dp, pp, oa, pt, h, rr, dt: _compute_value_pure_di(x0, dp, pp, oa, pt, h, rr, dt)[1],
-                static_argnums=(4, 5)
+                lambda x0, dp, pp, do, so, pt, h, rr, rb, dt: _compute_value_pure_di(x0, dp, pp, do, so, pt, h, rr, rb, dt)[1],
+                static_argnums=(5, 6)
             )
         
         return self._jit_val_grad, self._jit_traj

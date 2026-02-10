@@ -51,7 +51,7 @@ from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, backup_type='stop'):
+def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
     env = InventoryEnv(level=level)
     
     # Robot Spec
@@ -94,8 +94,8 @@ def setup_test(algo, level, backup_type='stop'):
         filter_algo = PCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=1.0,
-            safety_margin=1.0
+            cbf_alpha=5.0,
+            safety_margin=safety_margin
         )
         if backup_type == 'move_away':
             # PCBF JAX policy for move away? We only implemented Angle and Stop.
@@ -107,20 +107,23 @@ def setup_test(algo, level, backup_type='stop'):
         else:
             filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
             
+        filter_algo.set_environment(env)
+            
     elif algo == 'mpcbf':
         filter_algo = MPCBF_DI(
             robot_spec, dt=env.dt,
-            backup_horizon=backup_horizon,
-            cbf_alpha=1.0,
-            safety_margin=1.0,
-            num_angle_policies=10
+            backup_horizon=backup_horizon, # Use 3.0
+            cbf_alpha=5.0, # Use 5.0
+            safety_margin=safety_margin,
+            num_angle_policies=16
         )
+        filter_algo.set_environment(env)
         
     elif algo == 'backup_cbf':
         backup_horizon_cbf = 4.0 
         filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon_cbf)
         filter_algo.env = env # Enable boundary checks
-        filter_algo.safety_margin = 0.5 # Align with Gatekeeper/MPS
+        filter_algo.safety_margin = safety_margin 
         filter_algo.alpha = 5.0 # High alpha for earlier intervention
         filter_algo.alpha_terminal = 5.0
         filter_algo.visualize_backup = True # Enable visualization for debugging
@@ -131,7 +134,7 @@ def setup_test(algo, level, backup_type='stop'):
         filter_algo.set_moving_obstacles(ghost_pred)
         
     elif algo == 'gatekeeper':
-        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, safety_margin=safety_margin)
         filter_algo.set_nominal_controller(nominal_controller_fn) # Gatekeeper needs trajectory but handles function?
         # Gatekeeper usually expects set_nominal_trajectory to be called per step or iterates internal model.
         # We will manually set nominal trajectory in loop.
@@ -140,7 +143,7 @@ def setup_test(algo, level, backup_type='stop'):
         filter_algo.set_moving_obstacles(ghost_pred)  # CRITICAL: Enable ghost prediction
         
     elif algo == 'mps':
-        filter_algo = MPS(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        filter_algo = MPS(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, safety_margin=safety_margin)
         filter_algo.set_backup_controller(py_backup)
         filter_algo.set_environment(env)
         filter_algo.set_moving_obstacles(ghost_pred)  # CRITICAL: Enable ghost prediction
@@ -152,7 +155,7 @@ def setup_test(algo, level, backup_type='stop'):
 # =============================================================================
 
 def run_simulation(args):
-    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup)
+    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup, args.safety_margin)
     
     # Plot Setup
     if not args.no_render:
@@ -201,15 +204,9 @@ def run_simulation(args):
             
             # Predict nominal trajectory for MPCBF visualization (optional)
             if args.algo == 'mpcbf':
-                 # NOTE: Disabled to prevent side-effects on stateful NominalController
-                 # pred_traj = [current_state]
-                 # temp_x = current_state.copy()
-                 # for _ in range(20):
-                 #     u = nom_ctrl.get_control(temp_x)
-                 #     temp_x = robot.step(temp_x.reshape(-1,1), u.reshape(-1,1)).flatten()
-                 #     pred_traj.append(temp_x)
-                 # shielding.set_nominal_traj(np.array(pred_traj))
-                 pass
+                 # Pass waypoint info for Nominal rollout
+                control_ref['waypoints'] = nom_ctrl.waypoints
+                control_ref['wp_idx'] = nom_ctrl.wp_idx
             
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
@@ -342,6 +339,7 @@ def run_sweep(args):
             args_sim.save = False
             
             try:
+                args_sim.safety_margin = args.safety_margin 
                 res = run_simulation(args_sim)
                 res['algo'] = alg
                 res['level'] = level
@@ -405,12 +403,13 @@ def plot_results(data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
-    parser.add_argument('--level', type=int, default=1)
+    parser.add_argument('--level', type=str, default='1')
     parser.add_argument('--backup', type=str, default='stop', choices=['stop', 'move_away'])
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
+    parser.add_argument('--safety_margin', type=float, default=0.5, help="Additive safety margin (e.g. 0.5)")
     
     args = parser.parse_args()
     

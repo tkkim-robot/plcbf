@@ -13,7 +13,10 @@ import jax.numpy as jnp
 import cvxpy as cp
 
 from .pcbf_di import PCBF_DI, _compute_value_pure_di
-from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, StopPolicyJAX, AnglePolicyParams, StopPolicyParams
+from examples.inventory.controllers.policies_di_jax import (
+    AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
+    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
+)
 from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 
 class MPCBF_DI(PCBF_DI):
@@ -69,7 +72,11 @@ class MPCBF_DI(PCBF_DI):
                 target_angle=angle, target_speed=v_ref, Kp_v=4.0, a_max=self.dynamics_params.a_max
             ))
             
-        # Nominal is handled specially
+        # 3. Nominal Policy (Default Params, will be updated per step)
+        self.policy_configs['nominal'] = ('waypoint', WaypointPolicyParams(
+            waypoints=jnp.zeros((1, 2)), v_max=v_ref, Kp=4.0, dist_threshold=1.0, 
+            a_max=self.dynamics_params.a_max, current_wp_idx=0
+        ))
         
     def _setup_visualization(self):
         if self.ax is None:
@@ -111,7 +118,13 @@ class MPCBF_DI(PCBF_DI):
         else:
             obs_array = jnp.zeros((0, 5))
             
+        if self.static_obstacles:
+            stat_obs_array = jnp.array([(o['x'], o['y'], o['radius']) for o in self.static_obstacles])
+        else:
+            stat_obs_array = jnp.zeros((0, 3))
+            
         robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
+        robot_radius_base = self.robot_spec.get('radius', 1.0)
         
         # JIT function getter
         val_grad_fn, traj_fn = self._get_jit_val_grad()
@@ -120,33 +133,28 @@ class MPCBF_DI(PCBF_DI):
         
         # Evaluate Defined Policies
         for name, (ptype, params) in self.policy_configs.items():
+            # Update Nominal Params dynamically
+            if name == 'nominal' and control_ref is not None and 'waypoints' in control_ref:
+                params = WaypointPolicyParams(
+                    waypoints=jnp.array(control_ref['waypoints']),
+                    v_max=float(self.robot_spec.get('v_max', 8.0)),
+                    Kp=4.0,
+                    dist_threshold=1.0,
+                    a_max=self.dynamics_params.a_max,
+                    current_wp_idx=control_ref.get('wp_idx', 0)
+                )
+            
             V_jax, grad_jax = val_grad_fn(
-                state_jax, self.dynamics_params, params, obs_array, ptype,
-                self.backup_horizon_steps, robot_radius, self.dt
+                state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
+                self.backup_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             traj = traj_fn(
-                state_jax, self.dynamics_params, params, obs_array, ptype,
-                self.backup_horizon_steps, robot_radius, self.dt
+                state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
+                self.backup_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             results[name] = (float(V_jax), np.array(grad_jax), np.array(traj))
             
-        # Evaluate Nominal (Approximate as rollout of u_nom? or use provided traj?)
-        # If we have nominal_trajectory (predicted states), we can evaluate V on it.
-        # But for CBF we need V(x) implies a backup strategy. 
-        # Nominal Strategy: "Continue nominal control".
-        # We can approximate nominal strategy as "Angle Policy" towards current heading?
-        # Or better: Just ignore Nominal for *generation* but include it if we had a "NominalFollower" policy.
-        # The user said "include the nominal".
-        # Let's use the cached `nominal_trajectory` to compute V, but we can't easily compute gradient without a policy definition.
-        # Actually, best way is to treat "Nominal" as "Zero Hold of u_nom" or "Angle Policy matching u_nom".
-        # Let's skip formal Nominal policy for now to simplify, or treat it as checking if u_nom is safe.
-        # Wait, if u_nom is safe, we should prefer it!
-        # Let's add a "fake" result for Nominal using the provided trajectory if available
-        if self.nominal_trajectory is not None:
-             # Calculate V for nominal trajectory
-             # Cannot get gradient properly without AD through the nominal generator.
-             # We will just visualize it.
-             pass
+        # Nominal policy is now evaluated inside the loop above as 'nominal'
              
         # 3. Select Best Policy
         # Metric: Score = V_dot + alpha * V (Constraint Value)
@@ -251,12 +259,12 @@ class MPCBF_DI(PCBF_DI):
                         self.policy_lines[name].set_alpha(0.3)
                         
         # 5. Solve QP with Selected Constraint
-        # Same as PCBF but using best_name's V and grad_V
         V_best, grad_best, _ = results[best_name]
         
         # QP Formulation
         u = cp.Variable(2)
-        cost = cp.sum_squares(u - u_nom)
+        slack = cp.Variable(1, nonneg=True)
+        cost = cp.sum_squares(u - u_nom) + 1e5 * cp.square(slack)
         constraints = []
         
         # Input Limits
@@ -267,25 +275,8 @@ class MPCBF_DI(PCBF_DI):
             u[1] >= -self.dynamics_params.ay_max
         ]
         
-        # Dynamic CBF
-        if self.dynamic_obstacles and V_best < 50.0:
-             L_f_V = np.dot(grad_best, f)
-             L_g_V = grad_best[2:4]
-             constraints.append(L_g_V @ u >= -self.cbf_alpha * V_best - L_f_V)
-             
-        # Static CBF (Same as PCBF_DI)
-        gamma1, gamma2 = 2.0, 2.0
-        for obs in self.static_obstacles:
-            ox, oy = obs['x'], obs['y']
-            r = obs['radius'] + robot_radius
-            px, py, vx, vy = state
-            dx, dy = px - ox, py - oy
-            h = (dx**2 + dy**2) - r**2
-            h_dot = 2 * (dx*vx + dy*vy)
-            term_v = 2 * (vx**2 + vy**2)
-            lhs = np.array([2*dx, 2*dy])
-            rhs = - (term_v + (gamma1 + gamma2)*h_dot + gamma1*gamma2*h)
-            constraints.append(lhs @ u >= rhs)
+        # Safety Constraints (standardized via PCBF_DI)
+        self._add_cbf_constraints(u, constraints, state, V_best, grad_best, slack=slack[0])
             
         prob = cp.Problem(cp.Minimize(cost), constraints)
         
@@ -299,24 +290,24 @@ class MPCBF_DI(PCBF_DI):
                 res = u.value
             else:
                 use_fallback = True
-                print(f"QP Status: {prob.status}")
-        except Exception as e:
-             use_fallback = True
-             print(f"QP Exception: {e}")
+        except Exception:
+            use_fallback = True
              
         if use_fallback:
             # Fallback to Best Policy Control
-            ptype, pparams = self.policy_configs[best_name]
-            if ptype == 'angle':
-                res = np.array(AnglePolicyJAX.compute(jnp.array(state), pparams))
-            elif ptype == 'stop':
-                res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
+            if best_name in self.policy_configs:
+                ptype, pparams = self.policy_configs[best_name]
+                if ptype == 'angle':
+                    res = np.array(AnglePolicyJAX.compute(jnp.array(state), pparams))
+                elif ptype == 'stop':
+                    res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
+                elif ptype == 'waypoint':
+                    res = np.array(WaypointPolicyJAX.compute(jnp.array(state), pparams))
+                else:
+                    res = u_nom
             else:
-                res = u_nom # Nominal fallback
+                res = u_nom
                 
-        # DEBUG Immobility
-        if np.linalg.norm(res) < 0.1 and np.linalg.norm(u_nom) > 1.0:
-            print(f"MPCBF Stuck! u_safe={res}, u_nom={u_nom}, V={V_best:.1f}, Policy={best_name}")
-            
-        return res
+        u_safe = res
 
+        return u_safe

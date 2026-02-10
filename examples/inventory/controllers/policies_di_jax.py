@@ -70,6 +70,15 @@ class AnglePolicyJAX:
         
         return jnp.array([ax, ay])
 
+class WaypointPolicyParams(NamedTuple):
+    """Parameters for WaypointPolicy."""
+    waypoints: jnp.ndarray  # Array of [x, y] waypoints
+    v_max: float           # Maximum speed
+    Kp: float              # Velocity error gain
+    dist_threshold: float  # Distance to switch waypoints
+    a_max: float           # Max acceleration
+    current_wp_idx: int    # Starting waypoint index
+
 class StopPolicyJAX:
     """
     Brakes to zero velocity.
@@ -101,3 +110,38 @@ class StopPolicyJAX:
         scale = jnp.where(a_norm > params.a_max, params.a_max / a_norm, 1.0)
         
         return jnp.array([ax * scale, ay * scale])
+
+class WaypointPolicyJAX:
+    """
+    Follows a series of waypoints. 
+    """
+    
+    @staticmethod
+    def compute(state: jnp.ndarray, params: WaypointPolicyParams) -> jnp.ndarray:
+        pos = state[0:2]
+        vel = state[2:4]
+        
+        # Simplified: Just target the current waypoint index.
+        # Rolling out waypoint switching in JAX usually requires putting wp_idx into the state,
+        # which would require changing DIDynamicsParams.
+        # For a short backup rollout, targeting the "nominal" target waypoint is often sufficient.
+        target = params.waypoints[params.current_wp_idx]
+        
+        dist = jnp.sqrt(jnp.sum((target - pos)**2) + 1e-8)
+        
+        # Direction
+        v_des_dir = (target - pos) / (dist + 1e-6)
+        
+        # Braking distance logic (similar to nominal.py)
+        # Using a fixed a_max of 4.0 for the braking profile as in nominal.py
+        braking_speed = jnp.sqrt(2 * 4.0 * dist)
+        speed = jnp.minimum(params.v_max, braking_speed)
+        v_des = v_des_dir * speed
+        
+        acc = params.Kp * (v_des - vel)
+        
+        # Clip
+        a_norm = jnp.sqrt(jnp.sum(acc**2) + 1e-8)
+        scale = jnp.where(a_norm > params.a_max, params.a_max / a_norm, 1.0)
+        
+        return acc * scale

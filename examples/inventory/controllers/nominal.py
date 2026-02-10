@@ -73,8 +73,17 @@ class GhostPredictor:
         
         # Predict all ghosts
         for g in ghosts_now:
+            # Linear prediction with bouncing
             px = g['x'] + g['vx'] * rel_t
             py = g['y'] + g['vy'] * rel_t
+            
+            # Bounce at 2.0 and 98.0
+            # Simple bounce logic for a single bounce (sufficient for 2s rollout)
+            if px < 2.0: px = 4.0 - px
+            elif px > 98.0: px = 196.0 - px
+            if py < 2.0: py = 4.0 - py
+            elif py > 98.0: py = 196.0 - py
+            
             predicted_ghosts.append({
                 'x': px, 'y': py, 
                 'radius': g['radius'], 
