@@ -80,7 +80,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     elif algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
          # Use Retrace Strategy as per User Request
          # It needs access to nominal_ctrl_obj to know past waypoints
-         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=8.0, a_max=5.0)
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=robot_spec['v_max'], a_max=robot_spec['a_max'])
     else:
         py_backup = StopBackupController()
         
@@ -97,7 +97,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         # Dummy init
         init_params = WaypointPolicyParams(
              waypoints=jnp.array([[10., 10.]]), 
-             v_max=8.0, Kp=15.0, dist_threshold=1.0, a_max=5.0, current_wp_idx=0
+             v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'], current_wp_idx=0
         )
         filter_algo = PCBF_DI(
             robot_spec, dt=env.dt,
@@ -238,7 +238,7 @@ def run_simulation(args):
                           
                           new_params = WaypointPolicyParams(
                                waypoints=wps_jax,
-                               v_max=8.0, Kp=15.0, dist_threshold=1.0, a_max=5.0,
+                               v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'],
                                current_wp_idx=0
                           )
                           shielding.set_policy('waypoint', new_params)
