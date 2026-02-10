@@ -26,7 +26,8 @@ from examples.inventory.dynamics.double_integrator import DoubleIntegrator2D
 # Import controllers  
 from examples.inventory.controllers.nominal import (
     WaypointFollower, GhostPredictor, 
-    StopBackupController, MoveAwayBackupController
+    StopBackupController, MoveAwayBackupController,
+    MovingBackBackupController, RetraceBackupController
 )
 
 # Environment
@@ -75,6 +76,10 @@ def setup_test(algo, level, backup_type='stop'):
     # Python Backup Controller (for Baselines)
     if backup_type == 'move_away':
         py_backup = MoveAwayBackupController(env)
+    elif algo in ['backup_cbf', 'gatekeeper', 'mps']:
+         # Use Retrace Strategy as per User Request
+         # It needs access to nominal_ctrl_obj to know past waypoints
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=8.0, target_speed=6.0, a_max=robot_spec['a_max'])
     else:
         py_backup = StopBackupController()
         
@@ -112,7 +117,14 @@ def setup_test(algo, level, backup_type='stop'):
         )
         
     elif algo == 'backup_cbf':
-        filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        backup_horizon_cbf = 4.0 
+        filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon_cbf)
+        filter_algo.env = env # Enable boundary checks
+        filter_algo.safety_margin = 0.5 # Align with Gatekeeper/MPS
+        filter_algo.alpha = 5.0 # High alpha for earlier intervention
+        filter_algo.alpha_terminal = 5.0
+        filter_algo.visualize_backup = True # Enable visualization for debugging
+        
         filter_algo.set_nominal_controller(nominal_controller_fn)
         filter_algo.set_backup_controller(py_backup)
         filter_algo.set_environment(env)
@@ -280,6 +292,10 @@ def run_simulation(args):
             
         # Visualize
         if not args.no_render:
+             # Update Shielding visualization (BackupCBF/Gatekeeper backup trajs)
+             if hasattr(shielding, 'update_visualization'):
+                 shielding.update_visualization()
+             
              env.update_plot()
              # Draw Robot
              if not hasattr(env, 'robot_patch'):
