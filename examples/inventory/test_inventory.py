@@ -51,7 +51,7 @@ from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
+def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     env = InventoryEnv(level=level)
     
     # Robot Spec
@@ -79,7 +79,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
     elif algo in ['backup_cbf', 'gatekeeper', 'mps']:
          # Use Retrace Strategy as per User Request
          # It needs access to nominal_ctrl_obj to know past waypoints
-         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=8.0, target_speed=6.0, a_max=robot_spec['a_max'])
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=10.0, a_max=20.0)
     else:
         py_backup = StopBackupController()
         
@@ -87,7 +87,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
     ghost_pred = GhostPredictor(env)
     
     filter_algo = None
-    backup_horizon = 3.0
+    backup_horizon = 2.0
     
     if algo == 'pcbf':
         # Single policy PCBF
@@ -120,13 +120,12 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
         filter_algo.set_environment(env)
         
     elif algo == 'backup_cbf':
-        backup_horizon_cbf = 4.0 
+        backup_horizon_cbf = 2.0 
         filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon_cbf)
         filter_algo.env = env # Enable boundary checks
         filter_algo.safety_margin = safety_margin 
-        filter_algo.alpha = 5.0 # High alpha for earlier intervention
-        filter_algo.alpha_terminal = 5.0
-        filter_algo.visualize_backup = True # Enable visualization for debugging
+        filter_algo.alpha = 2.0 # Standard alpha
+        filter_algo.alpha_terminal = 2.0
         
         filter_algo.set_nominal_controller(nominal_controller_fn)
         filter_algo.set_backup_controller(py_backup)
@@ -134,7 +133,11 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.0):
         filter_algo.set_moving_obstacles(ghost_pred)
         
     elif algo == 'gatekeeper':
-        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, safety_margin=safety_margin)
+        # Default event_offset=0.5 is too slow for dynamic retrace sync. 
+        # Set to env.dt to force replanning every step (like MPS).
+        # Set horizon_discount=env.dt to ensure we find "1-step" valid plans (matching MPS capability)
+        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, 
+                                 event_offset=env.dt, horizon_discount=env.dt, safety_margin=safety_margin)
         filter_algo.set_nominal_controller(nominal_controller_fn) # Gatekeeper needs trajectory but handles function?
         # Gatekeeper usually expects set_nominal_trajectory to be called per step or iterates internal model.
         # We will manually set nominal trajectory in loop.
@@ -226,6 +229,14 @@ def run_simulation(args):
             # (nominal_controller_fn uses update_state=False for gatekeeper's internal rollouts)
             u_nom = nom_ctrl.get_control(current_state, update_state=True)
             
+            # --- SYNCHRONIZATION FIX ---
+            # Explicitly call prepare_rollout HERE to ensure nominal waypoint 
+            # is regressed (synced with retrace) BEFORE generating the prediction trajectory.
+            # This ensures Gatekeeper predicts based on the CORRECT (regressed) target.
+            if hasattr(shielding, 'backup_controller') and shielding.backup_controller is not None:
+                if hasattr(shielding.backup_controller, 'prepare_rollout'):
+                     shielding.backup_controller.prepare_rollout(current_state)
+
             if args.algo in ['gatekeeper', 'mps']:
                 # Generate simple nominal trajectory
                 # CRITICAL: Use update_state=False to prevent waypoint switching during prediction
@@ -271,6 +282,7 @@ def run_simulation(args):
              if np.linalg.norm(current_state[:2] - np.array([g['x'], g['y']])) < (g['radius'] + robot_spec['radius']):
                 collision = True
                 print("Collision with Ghost!")
+                break
                 
         # 5. Check Goal
         if np.linalg.norm(current_state[:2] - env.goal_pos) < env.goal_radius:

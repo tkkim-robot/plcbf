@@ -140,13 +140,6 @@ class MovingBackBackupController:
         self.fixed_target_v = None
         
     def prepare_rollout(self, state):
-        """Prepare for a new rollout by fixing the target velocity."""
-        if state.ndim == 2:
-            vel = state[2:4, 0]
-            pos = state[:2, 0]
-        else:
-            vel = state[2:4]
-    def prepare_rollout(self, state):
         """Prepare for backup trajectory rollout by choosing escape direction."""
         if state.ndim == 2:
             pos = state[:2, 0]
@@ -266,7 +259,6 @@ class MovingBackBackupController:
         return K
 
 
-
 class MoveAwayBackupController:
     """Move away from ghosts backup controller."""
     def __init__(self, env):
@@ -291,11 +283,69 @@ class RetraceBackupController:
     Backup controller that retraces the nominal path backwards.
     Maintains a reference to the nominal WaypointFollower to know the current target index.
     """
-    def __init__(self, nominal_controller, Kp=8.0, target_speed=6.0, a_max=10.0):
+    def __init__(self, nominal_controller, Kp=15.0, target_speed=10.0, a_max=20.0):
         self.nom = nominal_controller
         self.Kp = Kp
         self.target_speed = target_speed
         self.a_max = a_max
+        
+        # Persistence across physical steps
+        self.active_retrace_idx = 0
+        self.last_nominal_idx = -1
+        self._last_dist_to_nom = None
+        
+        # Local for rollout simulation
+        self.retrace_idx = 0
+        
+    def prepare_rollout(self, state):
+        """Pick a retrace point that is persistent across physical steps."""
+        pos = state.flatten()[:2]
+        
+        # Detect if nominal progress has advanced
+        if self.nom.wp_idx > self.last_nominal_idx:
+            self.last_nominal_idx = self.nom.wp_idx
+            # Latest waypoint passed is the target retrace WP
+            self.active_retrace_idx = max(0, self.nom.wp_idx - 1)
+            self._last_dist_to_nom = None # Reset retreat detection
+            
+        # Retreat Detection: only advance retrace mission if moving away from nominal target
+        nom_target = self.nom.waypoints[min(len(self.nom.waypoints)-1, self.nom.wp_idx)]
+        dist_to_nom = np.linalg.norm(nom_target - pos)
+        
+        is_retreating = False
+        if self._last_dist_to_nom is not None:
+             if dist_to_nom > self._last_dist_to_nom + 0.005: 
+                  is_retreating = True
+        
+        self._last_dist_to_nom = dist_to_nom
+
+        # Proximity update: only allowed to go FURTHER back if we are actually retreating
+        target_pos = self.nom.waypoints[self.active_retrace_idx]
+        dist = np.linalg.norm(target_pos - pos)
+        
+        # Robust Skip Detection: Scan backward history
+        if self.active_retrace_idx > 0:
+            for k in range(self.active_retrace_idx - 1, -1, -1):
+                 target_k = self.nom.waypoints[k]
+                 dist_k = np.linalg.norm(target_k - pos)
+                 
+                 # If we are found at an earlier waypoint (with loose tolerance)
+                 if is_retreating and dist_k < 2.0 and dist_k < dist:
+                      self.active_retrace_idx = k
+                      self.nom.wp_idx = self.active_retrace_idx + 1
+                      dist = dist_k
+                      break
+        
+        if is_retreating and dist < 1.0 and self.active_retrace_idx > 0:
+             self.active_retrace_idx -= 1
+             # Sync nominal controller: Resume from here once safe!
+             self.nom.wp_idx = self.active_retrace_idx + 1
+             self.last_nominal_idx = self.nom.wp_idx
+             # Reset distance tracker for the new target
+             self._last_dist_to_nom = None 
+             
+        # Initialize local rollout index from the persistent state
+        self.retrace_idx = self.active_retrace_idx
         
     def compute_control(self, state, target=None):
         if state.ndim == 2:
@@ -305,30 +355,23 @@ class RetraceBackupController:
             pos = state[:2]
             vel = state[2:4]
             
-        # Determine target waypoint index based on current nominal progress
-        # We want to go to wp_idx - 1 (start of current segment)
-        # If we are close to it, go to wp_idx - 2
+        # Target position from retrace index
+        target_pos = self.nom.waypoints[self.retrace_idx]
         
-        current_nominal_idx = self.nom.wp_idx
-        target_idx = max(0, current_nominal_idx - 1)
-        
-        target_pos = self.nom.waypoints[target_idx]
-        
-        # Check if we reached this backup target during rollout
+        # Rollout Transition: always allow sequential visitation in simulations
         dist = np.linalg.norm(target_pos - pos)
-        if dist < 2.0 and target_idx > 0:
-             target_idx = max(0, target_idx - 1)
-             target_pos = self.nom.waypoints[target_idx]
+        if dist < 1.0 and self.retrace_idx > 0:
+             # Progress backwards
+             self.retrace_idx = max(0, self.retrace_idx - 1)
+             target_pos = self.nom.waypoints[self.retrace_idx]
              dist = np.linalg.norm(target_pos - pos)
              
         # P-Control to target
         err_pos = target_pos - pos
         
-        # Smooth velocity profile to avoid singularity at dist=0 (infinite stiffness)
-        if dist < 0.1:
-             # Scale speed linearly with distance
-             # Max usage of stiffness: speed / dist = target_speed / 0.1
-             current_speed_target = (self.target_speed / 0.1) * dist
+        # Only ramp down if we are at the very first waypoint (the ultimate start)
+        if self.retrace_idx == 0 and dist < 1.0:
+             current_speed_target = (self.target_speed / 1.0) * dist
         else:
              current_speed_target = self.target_speed
              
@@ -344,57 +387,31 @@ class RetraceBackupController:
         return acc
 
     def get_sensitivity(self, state):
+        # state is current simulation state
         pos = state[:2]
-        # Recalculate target to get correct linearization point
-        current_nominal_idx = self.nom.wp_idx
-        target_idx = max(0, current_nominal_idx - 1)
-        target_pos = self.nom.waypoints[target_idx]
         
-        # Check if we reached this backup target during rollout check
-        # (Sensitivity is local, so we check distance at current state)
+        # Current retrace target
+        target_pos = self.nom.waypoints[self.retrace_idx]
         dist = np.linalg.norm(target_pos - pos)
-        if dist < 2.0 and target_idx > 0:
-             target_idx = max(0, target_idx - 1)
-             target_pos = self.nom.waypoints[target_idx]
+        
+        if dist < 1.0 and self.retrace_idx > 0:
+             t_idx = max(0, self.retrace_idx - 1)
+             target_pos = self.nom.waypoints[t_idx]
              dist = np.linalg.norm(target_pos - pos)
 
         K = np.zeros((2, 4))
-        
-        # du/dv = -Kp
         K[0, 2] = -self.Kp
         K[1, 3] = -self.Kp
-        
-        # du/dx = Kp * d(v_des)/dx
-        # v_des = speed * (target - pos) / dist
-        # let d = target - pos. v_des = speed * d / ||d||
-        # d(v_des)/dx = d(v_des)/dd * dd/dx
-        # dd/dx = -I
-        # d(v_des)/dd = speed * (I/||d|| - d*d.T/||d||^3)
-        #             = (speed / dist) * (I - d_hat * d_hat.T)
         
         if dist > 0.1:
             d = target_pos - pos
             d_hat = d / dist
-            
-            # Jacobian of normalized vector scaling
-            # J_dir = (I - d_hat*d_hat.T) / dist
-            # dv_des/dx = speed * J_dir * (-I)
-            # dv_dx = -self.target_speed * (I - np.outer(d_hat, d_hat)) / dist
-            
             I = np.eye(2)
             J_dir = (I - np.outer(d_hat, d_hat)) / dist
             dv_dx = -self.target_speed * J_dir
-            
         else:
-             # Linear ramp region: v_des = (v_max/0.1) * (target - pos)
-             # dv_des/dx = -(v_max/0.1) * I
-             ramp_slope = self.target_speed / 0.1
+             ramp_slope = self.target_speed / 1.0
              dv_dx = -ramp_slope * np.eye(2)
             
-        # du/dx = Kp * dv_dx
         K[:, :2] = self.Kp * dv_dx
-            
         return K
-    
-    def prepare_rollout(self, state):
-        pass
