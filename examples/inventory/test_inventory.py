@@ -11,6 +11,7 @@ import sys
 import os
 import argparse
 import numpy as np
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Optional, List, Any
@@ -76,10 +77,10 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     # Python Backup Controller (for Baselines)
     if backup_type == 'move_away':
         py_backup = MoveAwayBackupController(env)
-    elif algo in ['backup_cbf', 'gatekeeper', 'mps']:
+    elif algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
          # Use Retrace Strategy as per User Request
          # It needs access to nominal_ctrl_obj to know past waypoints
-         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=10.0, a_max=20.0)
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=8.0, a_max=5.0)
     else:
         py_backup = StopBackupController()
         
@@ -91,36 +92,46 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     
     if algo == 'pcbf':
         # Single policy PCBF
+        # Use Waypoint policy (will be updated dynamically)
+        from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+        # Dummy init
+        init_params = WaypointPolicyParams(
+             waypoints=jnp.array([[10., 10.]]), 
+             v_max=8.0, Kp=15.0, dist_threshold=1.0, a_max=5.0, current_wp_idx=0
+        )
         filter_algo = PCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
             cbf_alpha=5.0,
             safety_margin=safety_margin
         )
+        filter_algo.set_policy('waypoint', init_params)
+        
+        # Attach backup controller for retrace target querying
+        filter_algo.backup_controller = py_backup
         if backup_type == 'move_away':
             # PCBF JAX policy for move away? We only implemented Angle and Stop.
             # Using AnglePolicyJAX requires fixed angle.
             # Dynamic repulsion is hard in JAX without passing obstacle state to policy.
             # Fallback to StopPolicyJAX for PCBF unless we implement RepulsivePolicyJAX
-            print("Warning: PCBF JAX currently supports 'stop' policy well. Using StopPolicyJAX.")
-            filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
-        else:
-            filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
+            # User request: Default to retrace (waypoint) policy for PCBF
+            # filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
+            filter_algo.set_policy('waypoint', init_params)
             
         filter_algo.set_environment(env)
             
     elif algo == 'mpcbf':
         filter_algo = MPCBF_DI(
             robot_spec, dt=env.dt,
-            backup_horizon=backup_horizon, # Use 3.0
-            cbf_alpha=5.0, # Use 5.0
+            backup_horizon=backup_horizon,
+            cbf_alpha=5.0,
             safety_margin=safety_margin,
             num_angle_policies=16
         )
         filter_algo.set_environment(env)
         
     elif algo == 'backup_cbf':
-        backup_horizon_cbf = 2.0 
+        backup_horizon_cbf = backup_horizon
         filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon_cbf)
         filter_algo.env = env # Enable boundary checks
         filter_algo.safety_margin = safety_margin 
@@ -207,10 +218,31 @@ def run_simulation(args):
             
             # Predict nominal trajectory for MPCBF visualization (optional)
             if args.algo == 'mpcbf':
-                 # Pass waypoint info for Nominal rollout
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             
+            elif args.algo == 'pcbf':
+                # Update JAX Policy Target from RetraceBackupController
+                if hasattr(shielding, 'backup_controller') and shielding.backup_controller is not None:
+                     # CRITICAL: Must call prepare_rollout to update active_retrace_idx based on current state
+                     if hasattr(shielding.backup_controller, 'prepare_rollout'):
+                          shielding.backup_controller.prepare_rollout(current_state)
+                          
+                     if hasattr(shielding.backup_controller, 'get_current_target'):
+                          target_pos = shielding.backup_controller.get_current_target()
+                          # Update WaypointPolicy params structure with new target
+                          from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+                          
+                          # Create a dummy waypoint path with just the target
+                          wps_jax = jnp.array([target_pos[:2]]) 
+                          
+                          new_params = WaypointPolicyParams(
+                               waypoints=wps_jax,
+                               v_max=8.0, Kp=15.0, dist_threshold=1.0, a_max=5.0,
+                               current_wp_idx=0
+                          )
+                          shielding.set_policy('waypoint', new_params)
+
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
             
@@ -299,12 +331,11 @@ def run_simulation(args):
         if collision:
             break
             
-        # Visualize
         if not args.no_render:
              # Update Shielding visualization (BackupCBF/Gatekeeper backup trajs)
              if hasattr(shielding, 'update_visualization'):
                  shielding.update_visualization()
-             
+
              env.update_plot()
              # Draw Robot
              if not hasattr(env, 'robot_patch'):

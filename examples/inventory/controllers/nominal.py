@@ -347,6 +347,14 @@ class RetraceBackupController:
         # Initialize local rollout index from the persistent state
         self.retrace_idx = self.active_retrace_idx
         
+    def get_current_target(self):
+        """Get the current retrace target (for external visualization/JAX policy update)."""
+        # Ensure we return the ACTIVE retrace target
+        if self.nom.waypoints is None:
+             return np.zeros(2)
+        idx = min(len(self.nom.waypoints)-1, self.active_retrace_idx)
+        return self.nom.waypoints[idx]
+
     def compute_control(self, state, target=None):
         if state.ndim == 2:
             pos = state[:2, 0]

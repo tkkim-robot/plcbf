@@ -165,11 +165,12 @@ class PCBF_DI(PCBFBase):
         
     def set_policy(self, type_str: str, params):
         """Set backup policy for DI."""
-        self.policy_type = type_str
+        if type_str != getattr(self, 'policy_type', None):
+             # Only reset cache if policy type changes (static argument)
+             self._jit_val_grad = None 
+             self.policy_type = type_str
+             
         self.backup_policy_params = params
-        # No need to reset cache for params change, only for static args (policy type)
-        # But if policy type changes, we need new JIT
-        self._jit_val_grad = None 
     
     def _get_control_dim(self) -> int:
         """DI control dimension: [ax, ay]."""
@@ -244,14 +245,18 @@ class PCBF_DI(PCBFBase):
             robot_radius, robot_radius_base, self.dt
         )
         
+        # Store for visualization
+        self.latest_trajectory = np.array(trajectory)
+        
         return float(V_jax), np.array(grad_jax), np.array(trajectory)
+    
+    def get_backup_trajectory(self) -> Optional[np.ndarray]:
+        """Return the latest backup trajectory (e.g. for visualization)."""
+        return self.latest_trajectory
     
     def _add_cbf_constraints(self, u, constraints, state, V, grad_V, slack=0.0):
         """
         Add CBF constraints for DI.
-        
-        1. Dynamic obstacles: Standard CBF
-        2. Static obstacles: HO-CBF (second-order)
         """
 
         if V < 10.0:
@@ -259,9 +264,11 @@ class PCBF_DI(PCBFBase):
             L_f_V = np.dot(grad_V, f)
             L_g_V = grad_V[2:4]  # Only velocity components affect control
             
-            constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V)
+            # Use slack variable (if passed as Variable or float)
+            constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V - slack)
         
         # 2. Static obstacles: HO-CBF (second-order)
+        # (Slack also applied here?)
         gamma1, gamma2 = 2.0, 2.0
         
         # Static hurdles: additive safety margin

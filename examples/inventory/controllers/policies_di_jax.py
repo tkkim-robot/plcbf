@@ -133,8 +133,8 @@ class WaypointPolicyJAX:
         v_des_dir = (target - pos) / (dist + 1e-6)
         
         # Braking distance logic (similar to nominal.py)
-        # Using a fixed a_max of 4.0 for the braking profile as in nominal.py
-        braking_speed = jnp.sqrt(2 * 4.0 * dist)
+        # Use params.a_max for braking capability
+        braking_speed = jnp.sqrt(2 * params.a_max * dist)
         speed = jnp.minimum(params.v_max, braking_speed)
         v_des = v_des_dir * speed
         
