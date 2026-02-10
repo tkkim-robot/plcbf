@@ -363,20 +363,27 @@ class RetraceBackupController:
         # d(v_des)/dd = speed * (I/||d|| - d*d.T/||d||^3)
         #             = (speed / dist) * (I - d_hat * d_hat.T)
         
-        if dist > 1e-4:
+        if dist > 0.1:
             d = target_pos - pos
             d_hat = d / dist
             
             # Jacobian of normalized vector scaling
             # J_dir = (I - d_hat*d_hat.T) / dist
+            # dv_des/dx = speed * J_dir * (-I)
+            # dv_dx = -self.target_speed * (I - np.outer(d_hat, d_hat)) / dist
+            
             I = np.eye(2)
             J_dir = (I - np.outer(d_hat, d_hat)) / dist
-            
-            # dv_des/dx = speed * J_dir * (-I)
             dv_dx = -self.target_speed * J_dir
             
-            # du/dx = Kp * dv_dx
-            K[:, :2] = self.Kp * dv_dx
+        else:
+             # Linear ramp region: v_des = (v_max/0.1) * (target - pos)
+             # dv_des/dx = -(v_max/0.1) * I
+             ramp_slope = self.target_speed / 0.1
+             dv_dx = -ramp_slope * np.eye(2)
+            
+        # du/dx = Kp * dv_dx
+        K[:, :2] = self.Kp * dv_dx
             
         return K
     
