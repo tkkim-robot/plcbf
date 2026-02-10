@@ -138,6 +138,8 @@ class MPCBF_DI(PCBF_DI):
             
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None) # Handle ax manually
         self.ax = ax
+        # Use fixed 2.0s horizon for MPCBF evaluation of dynamic obstacles
+        self.eval_horizon_steps = int(2.0 / self.dt)
         
         # Policy Helpers
         self.policy_configs = {} # name -> (type, params)
@@ -155,6 +157,9 @@ class MPCBF_DI(PCBF_DI):
         # We can reuse the single evaluation function in a loop or vmap if parameters allow.
         # Since params differ, loop is safer/easier.
         self._jit_val_grad_fn = None
+        self._jit_val_grad_obs = None
+        self.curr_step = 0
+        self.debug = False
             
     def _setup_policies(self):
         # 1. Angle Policies
@@ -166,6 +171,11 @@ class MPCBF_DI(PCBF_DI):
             self.policy_configs[name] = ('angle', AnglePolicyParams(
                 target_angle=angle, target_speed=v_ref, Kp_v=15.0, a_max=self.dynamics_params.a_max
             ))
+        
+        # 2. Stop Policy (standard backup)
+        self.policy_configs['stop'] = ('stop', StopPolicyParams(
+            Kp_v=4.0, a_max=self.dynamics_params.a_max, stop_threshold=0.05
+        ))
             
         # 3. Nominal Policy (Default Params, will be updated per step)
         self.policy_configs['nominal'] = ('waypoint', WaypointPolicyParams(
@@ -202,24 +212,30 @@ class MPCBF_DI(PCBF_DI):
         
         # Dynamic obstacles array
         if self.dynamic_obstacles:
-            obs_array = jnp.array([(o['x'], o['y'], o['radius'], o.get('vx', 0.0), o.get('vy', 0.0)) for o in self.dynamic_obstacles])
+            obs_array = jnp.array([
+                (o['x'], o['y'], o['radius'], o.get('vx', 0.0), o.get('vy', 0.0))
+                for o in self.dynamic_obstacles
+            ])
         else:
             obs_array = jnp.zeros((0, 5))
+
             
-        if self.static_obstacles:
-            stat_obs_array = jnp.array([(o['x'], o['y'], o['radius']) for o in self.static_obstacles])
-        else:
-            stat_obs_array = jnp.zeros((0, 3))
+        # For MPCBF, focus V on dynamic obstacles (static handled by HO-CBF)
+        stat_obs_array_eval = jnp.zeros((0, 3))
+        
             
         robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
         robot_radius_base = self.robot_spec.get('radius', 1.0)
         
         # JIT function getter
         val_grad_fn, traj_fn = self._get_jit_val_grad()
+        grad_obs_fn = self._get_jit_val_grad_obs()
         
         state_jax = jnp.array(state)
         
         # Evaluate Defined Policies
+        policy_params_used = {}
+        time_derivatives = {}
         for name, (ptype, params) in self.policy_configs.items():
             # Update Nominal Params dynamically
             if name == 'nominal' and control_ref is not None and 'waypoints' in control_ref:
@@ -231,16 +247,29 @@ class MPCBF_DI(PCBF_DI):
                     a_max=self.dynamics_params.a_max,
                     current_wp_idx=control_ref.get('wp_idx', 0)
                 )
+            policy_params_used[name] = (ptype, params)
             
             V_jax, grad_jax = val_grad_fn(
-                state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
-                self.backup_horizon_steps, robot_radius, robot_radius_base, self.dt
+                state_jax, self.dynamics_params, params, obs_array, stat_obs_array_eval, ptype,
+                self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             traj = traj_fn(
-                state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
-                self.backup_horizon_steps, robot_radius, robot_radius_base, self.dt
+                state_jax, self.dynamics_params, params, obs_array, stat_obs_array_eval, ptype,
+                self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             results[name] = (float(V_jax), np.array(grad_jax), np.array(traj))
+            
+            # Time-derivative of V from obstacle motion: dV/dt = dV/dobs · v_obs
+            if obs_array.shape[0] > 0:
+                grad_obs = grad_obs_fn(
+                    state_jax, self.dynamics_params, params, obs_array, stat_obs_array_eval, ptype,
+                    self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
+                )
+                vxs = obs_array[:, 3]
+                vys = obs_array[:, 4]
+                time_derivatives[name] = float(jnp.sum(grad_obs[:, 0] * vxs + grad_obs[:, 1] * vys))
+            else:
+                time_derivatives[name] = 0.0
              
         # 3. Select Best Policy
         best_name = None
@@ -255,7 +284,16 @@ class MPCBF_DI(PCBF_DI):
         f = np.array([state[2], state[3], 0, 0])
         # G_flat = np.array([0, 0, 1, 0, 0, 0, 0, 1]).reshape(4, 2) # Double Integrator G
         
+        max_grad_norm = 50.0
+        min_lg_norm = 1e-3
+        
         for name, (V, grad_V, traj) in results.items():
+             # Normalize gradient to avoid extreme constraints/selection
+             grad_norm = np.linalg.norm(grad_V)
+             if grad_norm > max_grad_norm:
+                 grad_V = grad_V * (max_grad_norm / grad_norm)
+                 results[name] = (V, grad_V, traj)
+             
              # Lie Derivatives
              Lf_V = np.dot(grad_V, f)
              Lg_V = grad_V[2:4] # grad_V @ G
@@ -265,10 +303,14 @@ class MPCBF_DI(PCBF_DI):
                  score = V
              elif self.max_operator == 'input_space':
                  # Compute area of feasible control set
-                 cbf_rhs = Lf_V + self.cbf_alpha * V
-                 score = float(_compute_feasible_area_jit(
-                     jnp.array(Lg_V), cbf_rhs, u_min, u_max
-                 ))
+                 # If control influence is near-zero, treat as non-informative
+                 if np.linalg.norm(Lg_V) < min_lg_norm:
+                     score = -np.inf
+                 else:
+                     cbf_rhs = Lf_V + time_derivatives.get(name, 0.0) + self.cbf_alpha * V
+                     score = float(_compute_feasible_area_jit(
+                         jnp.array(Lg_V), cbf_rhs, u_min, u_max
+                     ))
              
              # Alignment for tie-breaking
              alignment = -1.0
@@ -318,37 +360,57 @@ class MPCBF_DI(PCBF_DI):
                         self.policy_lines[name].set_linewidth(1)
                         self.policy_lines[name].set_alpha(0.3)
 
-        # 5. Solve QP with Selected Constraint
+        # 5. QP objective stays centered at nominal control
+        u_qp_nom = u_nom
+        
+        # 6. Solve QP with Selected Constraint
         V_best, grad_best, _ = results[best_name]
+        self._last_time_derivative = time_derivatives.get(best_name, 0.0)
+        if self.debug and self.curr_step % 50 == 0:
+            lg_norm = float(np.linalg.norm(grad_best[2:4]))
+            g_norm = float(np.linalg.norm(grad_best))
+            print(f"[MPCBF_DI] step={self.curr_step} best={best_name} V={V_best:.3f} time_dV={self._last_time_derivative:.3f} |g|={g_norm:.3f} |Lg|={lg_norm:.3f}")
+
+        # (Optional) Nominal CBF satisfaction can be computed here for analysis if needed
+        f = np.array([state[2], state[3], 0, 0])
+        Lf_V = np.dot(grad_best, f)
+        Lg_V = grad_best[2:4]
+        time_term = self._last_time_derivative
         
         # QP Formulation
-        u = cp.Variable(2)
-        slack = cp.Variable(1, nonneg=True)
-        # Heavy penalty on slack to enforce safety
-        cost = cp.sum_squares(u - u_nom) + 1e6 * cp.square(slack)
-        constraints = []
-        
-        # Input Limits
-        constraints += [
-            u[0] <= self.dynamics_params.ax_max,
-            u[0] >= -self.dynamics_params.ax_max,
-            u[1] <= self.dynamics_params.ay_max,
-            u[1] >= -self.dynamics_params.ay_max
+        # Scaled QP for numerical stability
+        u_scale = np.array([self.dynamics_params.ax_max, self.dynamics_params.ay_max])
+        u_nom_scaled = u_qp_nom / u_scale
+        u_scaled = cp.Variable(2)
+        u = cp.multiply(u_scaled, u_scale)
+        cost = cp.sum_squares(u_scaled - u_nom_scaled)
+        constraints = [
+            u_scaled[0] <= 1.0,
+            u_scaled[0] >= -1.0,
+            u_scaled[1] <= 1.0,
+            u_scaled[1] >= -1.0
         ]
         
-        # Safety Constraints (standardized via PCBF_DI)
-        self._add_cbf_constraints(u, constraints, state, V_best, grad_best, slack=slack[0])
+        # Safety Constraints (standardized via MPCBF_DI override)
+        self._add_cbf_constraints(u, constraints, state, V_best, grad_best)
             
         prob = cp.Problem(cp.Minimize(cost), constraints)
         
         # Fallback Logic
         use_fallback = False
-        res = u_nom
+        res = u_qp_nom
         
         try:
-            prob.solve(verbose=False)
+            prob.solve(solver=cp.OSQP, verbose=False, eps_abs=1e-5, eps_rel=1e-5, max_iter=20000)
             if prob.status in ['optimal', 'optimal_inaccurate']:
-                res = u.value
+                res = u_scaled.value * u_scale
+                # Enforce CBF constraint numerically; fallback if violated
+                if res is None:
+                    use_fallback = True
+                else:
+                    cbf_val = Lg_V @ res + Lf_V + time_term + self.cbf_alpha * V_best
+                    if cbf_val < -1e-4:
+                        use_fallback = True
             else:
                 use_fallback = True
         except Exception:
@@ -356,19 +418,69 @@ class MPCBF_DI(PCBF_DI):
              
         if use_fallback:
             # Fallback to Best Policy Control
-            if best_name in self.policy_configs:
-                ptype, pparams = self.policy_configs[best_name]
+            if best_name in policy_params_used:
+                ptype, pparams = policy_params_used[best_name]
                 if ptype == 'angle':
                     res = np.array(AnglePolicyJAX.compute(jnp.array(state), pparams))
-                # elif ptype == 'stop':
-                #     res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
+                elif ptype == 'stop':
+                    res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
                 elif ptype == 'waypoint':
                     res = np.array(WaypointPolicyJAX.compute(jnp.array(state), pparams))
                 else:
-                    res = u_nom
+                    res = u_qp_nom
             else:
-                res = u_nom
+                res = u_qp_nom
                 
         u_safe = res
 
+        self.curr_step += 1
         return u_safe
+
+    def _add_cbf_constraints(self, u, constraints, state, V, grad_V, slack=0.0):
+        """
+        Add CBF constraints for MPCBF_DI.
+        
+        Add HOCBF constarint for static obstacles (assumeing the robot knows the static obs)
+        Add MPCBF constraint for dynamic obstacles (robot doesn't know the dynamic obs in advanced)
+        """
+        f, _ = self._get_system_matrices(state)
+        L_f_V = np.dot(grad_V, f)
+        L_g_V = grad_V[2:4]  # Only velocity components affect control
+        
+        # Value-function CBF (dynamic obstacles + rollout)
+        time_term = getattr(self, "_last_time_derivative", 0.0)
+        constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V - time_term - slack)
+        
+        # Static obstacles: HO-CBF (second-order)
+        gamma1, gamma2 = 2.0, 2.0
+        robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
+        for obs in self.static_obstacles:
+            ox, oy = obs['x'], obs['y']
+            r = obs['radius'] + robot_radius
+            
+            px, py, vx, vy = state
+            dx, dy = px - ox, py - oy
+            dist_sq = dx**2 + dy**2
+            
+            h = dist_sq - r**2
+            h_dot = 2 * (dx*vx + dy*vy)
+            term_v = 2 * (vx**2 + vy**2)
+            
+            lhs = np.array([2*dx, 2*dy])
+            rhs = -(term_v + (gamma1 + gamma2)*h_dot + gamma1*gamma2*h)
+            
+            constraints.append(lhs @ u >= rhs - slack)
+
+    def _get_jit_val_grad_obs(self):
+        """Get or create JIT-compiled gradient function w.r.t. dynamic obstacles."""
+        if self._jit_val_grad_obs is None:
+            def val_fn(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val):
+                V, _ = _compute_value_pure_di(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val)
+                return V
+            
+            self._jit_val_grad_obs = jax.jit(
+                jax.grad(val_fn, argnums=3),
+                static_argnums=(5, 6)  # policy_type, horizon
+            )
+        
+        return self._jit_val_grad_obs

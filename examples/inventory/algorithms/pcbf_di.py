@@ -106,20 +106,19 @@ def _compute_value_pure_di(
             obs_x = obs[0] + obs[3] * t
             obs_y = obs[1] + obs[4] * t
             
-            # obs_x = jnp.where(obs_x < 2.0, 4.0 - obs_x, obs_x)
-            # obs_x = jnp.where(obs_x > 98.0, 196.0 - obs_x, obs_x)
-            # obs_y = jnp.where(obs_y < 2.0, 4.0 - obs_y, obs_y)
-            # obs_y = jnp.where(obs_y > 98.0, 196.0 - obs_y, obs_y)
+            # Bounce at 2.0 and 98.0 (match env/GhostPredictor)
+            obs_x = jnp.where(obs_x < 2.0, 4.0 - obs_x, obs_x)
+            obs_x = jnp.where(obs_x > 98.0, 196.0 - obs_x, obs_x)
+            obs_y = jnp.where(obs_y < 2.0, 4.0 - obs_y, obs_y)
+            obs_y = jnp.where(obs_y > 98.0, 196.0 - obs_y, obs_y)
             
-            #dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
-            dist = (x - obs_x)**2 + (y - obs_y)**2 
-            return dist - (obs[2] + robot_radius)**2
+            dist = jnp.sqrt((x - obs_x)**2 + (y - obs_y)**2 + 1e-8)
+            return dist - (obs[2] + robot_radius)
 
         def h_single_stat(obs):
             # obs: [x, y, r]
-            #dist = jnp.sqrt((x - obs[0])**2 + (y - obs[1])**2 + 1e-8)
-            dist = (x - obs[0])**2 + (y - obs[1])**2 
-            return dist - (obs[2] + robot_radius_base)**2
+            dist = jnp.sqrt((x - obs[0])**2 + (y - obs[1])**2 + 1e-8)
+            return dist - (obs[2] + robot_radius_base)
             
         h_dyn = 100.0
         if dynamic_obstacles_array.shape[0] > 0:
@@ -129,10 +128,11 @@ def _compute_value_pure_di(
         if static_obstacles_array.shape[0] > 0:
             h_stat = smooth_min(jax.vmap(h_single_stat)(static_obstacles_array), temperature=100.0)
             
-        return jnp.minimum(h_dyn, h_stat)
+        # Smoothly combine dynamic and static safety margins
+        return smooth_min(jnp.array([h_dyn, h_stat]), temperature=40.0)
 
     h_all = jax.vmap(compute_h)(trajectory, times)
-    V = smooth_min(h_all, temperature=40.0)
+    V = smooth_min(h_all, temperature=80.0)
     
     return V, trajectory
 
@@ -319,5 +319,3 @@ class PCBF_DI(PCBFBase):
             )
         
         return self._jit_val_grad, self._jit_traj
-
-

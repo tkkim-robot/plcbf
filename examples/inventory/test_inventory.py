@@ -43,7 +43,7 @@ from safe_control.utils.animation import AnimationSaver
 # Core algorithms (PCBF/MPCBF)
 from examples.inventory.algorithms.pcbf_di import PCBF_DI
 from examples.inventory.algorithms.mpcbf_di import MPCBF_DI
-from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, StopPolicyJAX, AnglePolicyParams, StopPolicyParams
+from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
 from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 
 # Note: Controllers are imported from controllers.nominal module
@@ -300,7 +300,9 @@ def run_simulation(args):
         # Update Env Robot Pos for visualization
         env.robot_pos = current_state[:2]
         
-        # 4. Check Collision
+        if step % 200 == 0:
+            dist_goal = np.linalg.norm(current_state[:2] - env.goal_pos)
+            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[2:4]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")        # 4. Check Collision
         # Static
         for obs in statics:
             dist = np.linalg.norm(current_state[:2] - np.array([obs['x'], obs['y']]))
@@ -453,7 +455,7 @@ if __name__ == "__main__":
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
     parser.add_argument('--safety_margin', type=float, default=0.5, help="Additive safety margin (e.g. 0.5)")
-    parser.add_argument('--alpha', type=float, default=2.0)
+    parser.add_argument('--alpha', type=float, default=5.0)
     args = parser.parse_args()
     
     if args.sweep:
