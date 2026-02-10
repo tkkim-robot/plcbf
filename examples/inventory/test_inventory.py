@@ -124,7 +124,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         filter_algo = MPCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=5.0,
+            cbf_alpha=args.alpha, 
             safety_margin=safety_margin,
             num_angle_policies=16
         )
@@ -453,7 +453,7 @@ if __name__ == "__main__":
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
     parser.add_argument('--safety_margin', type=float, default=0.5, help="Additive safety margin (e.g. 0.5)")
-    
+    parser.add_argument('--alpha', type=float, default=2.0)
     args = parser.parse_args()
     
     if args.sweep:

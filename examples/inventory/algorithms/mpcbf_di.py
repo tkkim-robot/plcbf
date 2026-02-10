@@ -19,6 +19,101 @@ from examples.inventory.controllers.policies_di_jax import (
 )
 from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 
+# =============================================================================
+# JIT-compiled Feasible Control Area Computation (for input_space operator)
+# =============================================================================
+
+@jax.jit
+def _compute_feasible_area_jit(
+    grad_V_G: jnp.ndarray,      # (2,) - gradient @ G
+    cbf_rhs: float,             # scalar - ∇V·f + α·V
+    u_min: jnp.ndarray,         # (2,) - control lower bounds
+    u_max: jnp.ndarray,         # (2,) - control upper bounds
+) -> float:
+    """
+    Compute area of feasible control polygon (box ∩ half-space).
+    """
+    # Box vertices (counter-clockwise)
+    box_vertices = jnp.array([
+        [u_min[0], u_min[1]],
+        [u_max[0], u_min[1]],
+        [u_max[0], u_max[1]],
+        [u_min[0], u_max[1]],
+    ])  # (4, 2)
+    
+    a = grad_V_G  # (2,)
+    b = -cbf_rhs  # scalar
+    
+    grad_norm = jnp.linalg.norm(a)
+    
+    def full_box_area():
+        return (u_max[0] - u_min[0]) * (u_max[1] - u_min[1])
+    
+    def clip_polygon():
+        inside = jax.vmap(lambda v: jnp.dot(a, v) >= b)(box_vertices)  # (4,)
+        all_inside = jnp.all(inside)
+        all_outside = jnp.all(~inside)
+        
+        n_verts = 4
+        def edge_intersect(i):
+            p1 = box_vertices[i]
+            p2 = box_vertices[(i + 1) % n_verts]
+            d = p2 - p1
+            denom = jnp.dot(a, d)
+            t = jnp.where(
+                jnp.abs(denom) > 1e-10,
+                (b - jnp.dot(a, p1)) / denom,
+                0.5
+            )
+            t = jnp.clip(t, 0.0, 1.0)
+            return p1 + t * d
+        
+        intersections = jax.vmap(edge_intersect)(jnp.arange(n_verts))  # (4, 2)
+        
+        def process_edge(i):
+            p1_in = inside[i]
+            p2_in = inside[(i + 1) % n_verts]
+            p2 = box_vertices[(i + 1) % n_verts]
+            inter = intersections[i]
+            
+            v1 = jnp.where(p1_in & ~p2_in, inter, p2)
+            v2 = jnp.where(~p1_in & p2_in, p2, jnp.zeros(2))
+            
+            count = jnp.where(
+                p1_in & p2_in, 1,
+                jnp.where(
+                    p1_in & ~p2_in, 1,
+                    jnp.where(~p1_in & p2_in, 2, 0)
+                )
+            )
+            return v1, v2, count
+        
+        v1s, v2s, counts = jax.vmap(process_edge)(jnp.arange(n_verts))
+        
+        all_verts = jnp.concatenate([v1s, v2s], axis=0)  # (8, 2)
+        valid_mask = jnp.concatenate([counts >= 1, counts >= 2])  # (8,)
+        
+        centroid = jnp.sum(all_verts * valid_mask[:, None], axis=0) / jnp.maximum(jnp.sum(valid_mask), 1.0)
+        angles = jnp.arctan2(all_verts[:, 1] - centroid[1], all_verts[:, 0] - centroid[0])
+        angles = jnp.where(valid_mask, angles, 100.0)
+        sorted_indices = jnp.argsort(angles)
+        sorted_verts = all_verts[sorted_indices]
+        sorted_valid = valid_mask[sorted_indices]
+        
+        def shoelace_term(i):
+            j = (i + 1) % 8
+            term = sorted_verts[i, 0] * sorted_verts[j, 1] - sorted_verts[j, 0] * sorted_verts[i, 1]
+            return jnp.where(sorted_valid[i] & sorted_valid[j], term, 0.0)
+        
+        area = 0.5 * jnp.abs(jnp.sum(jax.vmap(shoelace_term)(jnp.arange(8))))
+        area = jnp.where(all_inside, full_box_area(), area)
+        area = jnp.where(all_outside, 0.0, area)
+        return area
+    
+    return jax.lax.cond(grad_norm < 1e-8, full_box_area, clip_polygon)
+
+MAX_OPERATOR_TYPES = ['v', 'input_space']
+
 class MPCBF_DI(PCBF_DI):
     """
     MPCBF for Double Integrator.
@@ -33,9 +128,14 @@ class MPCBF_DI(PCBF_DI):
         cbf_alpha: float = 5.0,
         safety_margin: float = 0.0,
         num_angle_policies: int = 10,
+        max_operator: str = 'input_space',
         ax=None
     ):
         self.num_angle_policies = num_angle_policies
+        self.max_operator = max_operator
+        if self.max_operator not in MAX_OPERATOR_TYPES:
+            raise ValueError(f"max_operator must be one of {MAX_OPERATOR_TYPES}")
+            
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None) # Handle ax manually
         self.ax = ax
         
@@ -57,24 +157,19 @@ class MPCBF_DI(PCBF_DI):
         self._jit_val_grad_fn = None
             
     def _setup_policies(self):
-        # 1. Stop Policy
-        self.policy_configs['stop'] = ('stop', StopPolicyParams(
-            Kp_v=4.0, a_max=self.dynamics_params.a_max, stop_threshold=0.05
-        ))
-        
-        # 2. Angle Policies
+        # 1. Angle Policies
         for i in range(self.num_angle_policies):
             angle = i * (2 * np.pi / self.num_angle_policies)
             name = f'angle_{i}'
             # Use v_max as target speed? Or v_ref?
             v_ref = float(self.robot_spec.get('v_ref', 5.0))
             self.policy_configs[name] = ('angle', AnglePolicyParams(
-                target_angle=angle, target_speed=v_ref, Kp_v=4.0, a_max=self.dynamics_params.a_max
+                target_angle=angle, target_speed=v_ref, Kp_v=15.0, a_max=self.dynamics_params.a_max
             ))
             
         # 3. Nominal Policy (Default Params, will be updated per step)
         self.policy_configs['nominal'] = ('waypoint', WaypointPolicyParams(
-            waypoints=jnp.zeros((1, 2)), v_max=v_ref, Kp=4.0, dist_threshold=1.0, 
+            waypoints=jnp.zeros((1, 2)), v_max=v_ref, Kp=15.0, dist_threshold=1.0, 
             a_max=self.dynamics_params.a_max, current_wp_idx=0
         ))
         
@@ -83,15 +178,8 @@ class MPCBF_DI(PCBF_DI):
             return
             
         # Create lines for all policies
-        colors = ['#FF0000'] # Stop is Red
-        # Angles get rainbow
         import matplotlib.cm as cm
         cmap = cm.get_cmap('hsv', self.num_angle_policies + 1)
-        for i in range(self.num_angle_policies):
-            colors.append(cmap(i))
-        colors.append('#000000') # Nominal is Black
-        
-        self.policy_lines['stop'], = self.ax.plot([], [], color='red', alpha=0.3, linewidth=1)
         
         for i in range(self.num_angle_policies):
             name = f'angle_{i}'
@@ -138,7 +226,7 @@ class MPCBF_DI(PCBF_DI):
                 params = WaypointPolicyParams(
                     waypoints=jnp.array(control_ref['waypoints']),
                     v_max=float(self.robot_spec.get('v_max', 8.0)),
-                    Kp=4.0,
+                    Kp=15.0, # Sync with user tuning
                     dist_threshold=1.0,
                     a_max=self.dynamics_params.a_max,
                     current_wp_idx=control_ref.get('wp_idx', 0)
@@ -153,41 +241,36 @@ class MPCBF_DI(PCBF_DI):
                 self.backup_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             results[name] = (float(V_jax), np.array(grad_jax), np.array(traj))
-            
-        # Nominal policy is now evaluated inside the loop above as 'nominal'
              
         # 3. Select Best Policy
-        # Metric: Score = V_dot + alpha * V (Constraint Value)
-        # We want the policy that gives us the most flexible constraint.
-        # Constraint: grad_V @ (f + g u) + alpha V >= 0
-        # Check value at u_nom: score = grad_V @ (f + g u_nom) + alpha V
-        
         best_name = None
         best_score = -np.inf
         best_V = -np.inf
         best_alignment = -1.0
         
-        scores = {}
+        # Control bounds for area calculation
+        u_min = jnp.array([-self.dynamics_params.ax_max, -self.dynamics_params.ay_max])
+        u_max = jnp.array([self.dynamics_params.ax_max, self.dynamics_params.ay_max])
         
         f = np.array([state[2], state[3], 0, 0])
+        # G_flat = np.array([0, 0, 1, 0, 0, 0, 0, 1]).reshape(4, 2) # Double Integrator G
         
         for name, (V, grad_V, traj) in results.items():
-             # Basic score: V (Safety Margin)
-             # Sophisticated: Feasibility at u_nom
+             # Lie Derivatives
+             Lf_V = np.dot(grad_V, f)
+             Lg_V = grad_V[2:4] # grad_V @ G
              
-             # Calculate Lie Derivatives
-             # f_dyn = [vx, vy, 0, 0]
-             # g_dyn u = [0, 0, ax, ay]
+             # score based on operator
+             if self.max_operator == 'v':
+                 score = V
+             elif self.max_operator == 'input_space':
+                 # Compute area of feasible control set
+                 cbf_rhs = Lf_V + self.cbf_alpha * V
+                 score = float(_compute_feasible_area_jit(
+                     jnp.array(Lg_V), cbf_rhs, u_min, u_max
+                 ))
              
-             L_f_V = np.dot(grad_V, f)
-             # L_g_V = [grad_vx, grad_vy]
-             L_g_V = grad_V[2:4]
-             
-             # Constraint value at u_nom
-             # c(u) = L_g_V @ u + L_f_V + alpha * V
-             val_at_unom = np.dot(L_g_V, u_nom) + L_f_V + self.cbf_alpha * V
-             
-             # calculate alignment for tie-breaking
+             # Alignment for tie-breaking
              alignment = -1.0
              if "angle" in name and np.linalg.norm(u_nom) > 0.1:
                  try:
@@ -198,46 +281,23 @@ class MPCBF_DI(PCBF_DI):
                  except:
                      pass
              
-             # Selection Logic
-             # 1. Initialization
              if best_name is None:
-                 best_name = name
-                 best_score = val_at_unom
-                 best_V = V
-                 best_alignment = alignment
+                 best_name, best_score, best_V, best_alignment = name, score, V, alignment
                  continue
                  
-             # 2. Comparison
-             # Case A: Both Unsafe (V < 0) -> Maximize V (Safety)
-             if V < 0 and best_V < 0:
-                 if V > best_V:
-                     best_name = name
-                     best_score = val_at_unom
-                     best_V = V
-                     best_alignment = alignment
-             
-             # Case B: Current Safe, Best Unsafe -> Pick Current
-             elif V > 0 and best_V < 0:
-                 best_name = name
-                 best_score = val_at_unom
-                 best_V = V
-                 best_alignment = alignment
-                 
-             # Case C: Both Safe -> Maximize Slack, Tie-break with Alignment
-             elif V > 0 and best_V > 0:
-                 # Significant improvement in slack?
-                 if val_at_unom > best_score + 1e-3:
-                     best_name = name
-                     best_score = val_at_unom
-                     best_V = V
-                     best_alignment = alignment
-                 # Tie (slack is similar) -> Use Alignment
-                 elif abs(val_at_unom - best_score) < 1e-3:
-                     if alignment > best_alignment:
-                         best_name = name
-                         best_score = val_at_unom
-                         best_V = V
-                         best_alignment = alignment
+             # Prioritize safety: Among safe policies (V > 0), pick max score.
+             # If both safe or both unsafe, pick max score.
+             # Actually, if any are safe, we ONLY look at safe ones.
+             if V > 0 and best_V > 0:
+                 if score > best_score + 1e-3:
+                     best_name, best_score, best_V, best_alignment = name, score, V, alignment
+                 elif abs(score - best_score) <= 1e-3 and alignment > best_alignment:
+                     best_name, best_score, best_V, best_alignment = name, score, V, alignment
+             elif V > 0 and best_V <= 0:
+                  best_name, best_score, best_V, best_alignment = name, score, V, alignment
+             elif V <= 0 and best_V <= 0:
+                 if score > best_score + 1e-3:
+                     best_name, best_score, best_V, best_alignment = name, score, V, alignment
              
         # Tie-breaking for Safe Scenario (V > 50)
         # If best_V is high (safe), we might have picked arbitrary policy due to 0 gradients.
@@ -257,14 +317,15 @@ class MPCBF_DI(PCBF_DI):
                     else:
                         self.policy_lines[name].set_linewidth(1)
                         self.policy_lines[name].set_alpha(0.3)
-                        
+
         # 5. Solve QP with Selected Constraint
         V_best, grad_best, _ = results[best_name]
         
         # QP Formulation
         u = cp.Variable(2)
         slack = cp.Variable(1, nonneg=True)
-        cost = cp.sum_squares(u - u_nom) + 1e5 * cp.square(slack)
+        # Heavy penalty on slack to enforce safety
+        cost = cp.sum_squares(u - u_nom) + 1e6 * cp.square(slack)
         constraints = []
         
         # Input Limits
@@ -299,8 +360,8 @@ class MPCBF_DI(PCBF_DI):
                 ptype, pparams = self.policy_configs[best_name]
                 if ptype == 'angle':
                     res = np.array(AnglePolicyJAX.compute(jnp.array(state), pparams))
-                elif ptype == 'stop':
-                    res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
+                # elif ptype == 'stop':
+                #     res = np.array(StopPolicyJAX.compute(jnp.array(state), pparams))
                 elif ptype == 'waypoint':
                     res = np.array(WaypointPolicyJAX.compute(jnp.array(state), pparams))
                 else:
