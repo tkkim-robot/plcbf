@@ -71,11 +71,11 @@ def _rollout_trajectory_quad3d(
         x_next = step_fn(x, u)
         return x_next, x_next
 
-    if policy_type != 'retrace':
+    if policy_type != 'retrace_waypoint':
         _, trajectory = lax.scan(body_fn, x0, None, length=horizon)
         return jnp.vstack([x0[None, :], trajectory])
 
-    # Retrace policy: update waypoint index during rollout (match Python retrace behavior)
+    # Retrace-waypoint policy: update waypoint index during rollout (match Python retrace behavior)
     params: RetracePolicyParams = policy_params
     ctrl = params.ctrl
 

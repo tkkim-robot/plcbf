@@ -54,7 +54,7 @@ from examples.inventory.dynamics.dynamics_quad3d_jax import _build_quad3d_matric
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
+def setup_test(algo, level, safety_margin=0.5):
     env = InventoryEnv(level=level)
     
     # Robot Spec (Quad3D)
@@ -109,9 +109,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         return nominal_ctrl_obj.get_control(x.flatten(), update_state=False)
         
     # Python Backup Controller (for Baselines)
-    if backup_type == 'move_away':
-        py_backup = MoveAwayBackupControllerQuad3D(robot_spec, env)
-    elif algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
+    if algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
         py_backup = RetraceBackupControllerQuad3D(
             nominal_ctrl_obj, robot_spec,
             Kp=robot_spec['backup_Kp'],
@@ -150,7 +148,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     
     if algo == 'pcbf':
         # Single policy PCBF
-        # Use Waypoint policy (will be updated dynamically)
+        # Use retrace-waypoint policy (will be updated dynamically)
         # Dummy init
         init_params = RetracePolicyParams(
             waypoints=jnp.array([[10., 10.]]),
@@ -166,18 +164,10 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
             cbf_alpha=5.0,
             safety_margin=safety_margin
         )
-        filter_algo.set_policy('retrace', init_params)
+        filter_algo.set_policy('retrace_waypoint', init_params)
         
         # Attach backup controller for retrace target querying
         filter_algo.backup_controller = py_backup
-        if backup_type == 'move_away':
-            # PCBF JAX policy for move away? We only implemented Angle and Stop.
-            # Using AnglePolicyJAX requires fixed angle.
-            # Dynamic repulsion is hard in JAX without passing obstacle state to policy.
-            # Fallback to StopPolicyJAX for PCBF unless we implement RepulsivePolicyJAX
-            # User request: Default to retrace (waypoint) policy for PCBF
-            # filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
-            filter_algo.set_policy('retrace', init_params)
             
         filter_algo.set_environment(env)
             
@@ -231,7 +221,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
 
 def run_simulation(args):
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = setup_test(
-        args.algo, args.level, args.backup, args.safety_margin
+        args.algo, args.level, args.safety_margin
     )
     
     # Plot Setup
@@ -341,7 +331,7 @@ def run_simulation(args):
                                current_wp_idx=active_idx,
                                ctrl=ctrl_params
                           )
-                          shielding.set_policy('retrace', new_params)
+                          shielding.set_policy('retrace_waypoint', new_params)
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
@@ -485,7 +475,6 @@ def run_sweep(args):
             args_sim = argparse.Namespace()
             args_sim.algo = alg
             args_sim.level = level
-            args_sim.backup = 'stop'
             args_sim.no_render = True
             args_sim.save = False
             
@@ -555,7 +544,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
     parser.add_argument('--level', type=str, default='1')
-    parser.add_argument('--backup', type=str, default='stop', choices=['stop', 'move_away'])
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
