@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(project_root, 'safe_control'))
 from examples.inventory.dynamics.double_integrator import DoubleIntegrator2D
 
 # Import controllers  
-from examples.inventory.controllers.nominal import (
+from examples.inventory.controllers.nominal_di import (
     WaypointFollower, GhostPredictor, 
     StopBackupController, MoveAwayBackupController,
     MovingBackBackupController, RetraceBackupController
@@ -46,7 +46,7 @@ from examples.inventory.algorithms.mpcbf_di import MPCBF_DI
 from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
 from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 
-# Note: Controllers are imported from controllers.nominal module
+# Note: Controllers are imported from controllers.nominal_di module
 
 # =============================================================================
 # Setup Functions
@@ -172,6 +172,7 @@ def run_simulation(args):
     env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup, args.safety_margin)
     
     # Plot Setup
+    update_waypoint_markers = None
     if not args.no_render:
         plt.ion()
         fig, ax1 = env.setup_plot()
@@ -180,12 +181,47 @@ def run_simulation(args):
              # Trigger visual setup
              if hasattr(shielding, '_setup_visualization'): shielding._setup_visualization()
              if hasattr(shielding, '_setup_multi_visualization'): shielding._setup_multi_visualization()
+
+        # Waypoint markers (yellow = unvisited, orange = current target)
+        wps = np.array(nom_ctrl.waypoints) if getattr(nom_ctrl, 'waypoints', None) is not None else None
+        if wps is not None and len(wps) > 0:
+            wp_colors = np.tile(np.array([1.0, 1.0, 0.0, 1.0]), (len(wps), 1))  # yellow
+            wp_scatter = ax1.scatter(
+                wps[:, 0], wps[:, 1],
+                marker='*', s=120,
+                c=wp_colors, edgecolors='k', linewidths=0.5,
+                zorder=5
+            )
+            wp_state = {'last_idx': None, 'last_visited': None}
+
+            def _update_waypoints(force=False):
+                visited = int(np.clip(nom_ctrl.wp_idx, 0, len(wps)))
+                current_idx = min(visited, len(wps) - 1)
+                if not force and wp_state['last_idx'] == current_idx and wp_state['last_visited'] == visited:
+                    return
+                wp_colors[:] = [1.0, 1.0, 0.0, 1.0]  # reset to yellow
+                if visited > 0:
+                    wp_colors[:visited, 3] = 0.0  # hide visited
+                if visited < len(wps):
+                    wp_colors[current_idx] = [1.0, 0.6, 0.0, 1.0]  # orange
+                wp_scatter.set_facecolors(wp_colors)
+                wp_scatter.set_edgecolors(wp_colors)
+                wp_state['last_idx'] = current_idx
+                wp_state['last_visited'] = visited
+
+            update_waypoint_markers = _update_waypoints
+            update_waypoint_markers(force=True)
     else:
         fig, ax1 = None, None
         
     saver = None
     if args.save and fig:
-        saver = AnimationSaver(f"output/animations/inventory_{args.algo}_lvl{args.level}", save_per_frame=1)
+        saver = AnimationSaver(
+            f"output/animations/inventory_{args.algo}_lvl{args.level}",
+            save_per_frame=1,
+            dpi=250,
+            video_height=1080
+        )
         
     # metrics
     infeasible = False
@@ -337,6 +373,9 @@ def run_simulation(args):
              # Update Shielding visualization (BackupCBF/Gatekeeper backup trajs)
              if hasattr(shielding, 'update_visualization'):
                  shielding.update_visualization()
+
+             if update_waypoint_markers is not None:
+                 update_waypoint_markers()
 
              env.update_plot()
              # Draw Robot
