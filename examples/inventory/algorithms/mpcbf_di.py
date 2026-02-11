@@ -168,7 +168,7 @@ class MPCBF_DI(PCBF_DI):
             name = f'angle_{i}'
             # Use v_max as target speed? Or v_ref?
             v_ref = float(self.robot_spec.get('v_ref', 5.0))
-            v_ref = min(v_ref, 4.0)
+            v_ref = min(v_ref, 3.8)
             self.policy_configs[name] = ('angle', AnglePolicyParams(
                 target_angle=angle, target_speed=v_ref, Kp_v=15.0, a_max=self.dynamics_params.a_max
             ))
