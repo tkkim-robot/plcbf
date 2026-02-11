@@ -11,6 +11,7 @@ import sys
 import os
 import argparse
 import numpy as np
+import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Optional, List, Any
@@ -26,7 +27,8 @@ from examples.inventory.dynamics.double_integrator import DoubleIntegrator2D
 # Import controllers  
 from examples.inventory.controllers.nominal import (
     WaypointFollower, GhostPredictor, 
-    StopBackupController, MoveAwayBackupController
+    StopBackupController, MoveAwayBackupController,
+    MovingBackBackupController, RetraceBackupController
 )
 
 # Environment
@@ -41,7 +43,7 @@ from safe_control.utils.animation import AnimationSaver
 # Core algorithms (PCBF/MPCBF)
 from examples.inventory.algorithms.pcbf_di import PCBF_DI
 from examples.inventory.algorithms.mpcbf_di import MPCBF_DI
-from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, StopPolicyJAX, AnglePolicyParams, StopPolicyParams
+from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
 from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 
 # Note: Controllers are imported from controllers.nominal module
@@ -50,7 +52,7 @@ from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, backup_type='stop'):
+def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     env = InventoryEnv(level=level)
     
     # Robot Spec
@@ -75,6 +77,10 @@ def setup_test(algo, level, backup_type='stop'):
     # Python Backup Controller (for Baselines)
     if backup_type == 'move_away':
         py_backup = MoveAwayBackupController(env)
+    elif algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
+         # Use Retrace Strategy as per User Request
+         # It needs access to nominal_ctrl_obj to know past waypoints
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=robot_spec['v_max'], a_max=robot_spec['a_max'])
     else:
         py_backup = StopBackupController()
         
@@ -82,44 +88,67 @@ def setup_test(algo, level, backup_type='stop'):
     ghost_pred = GhostPredictor(env)
     
     filter_algo = None
-    backup_horizon = 3.0
+    backup_horizon = 2.0
     
     if algo == 'pcbf':
         # Single policy PCBF
+        # Use Waypoint policy (will be updated dynamically)
+        from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+        # Dummy init
+        init_params = WaypointPolicyParams(
+             waypoints=jnp.array([[10., 10.]]), 
+             v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'], current_wp_idx=0
+        )
         filter_algo = PCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=1.0,
-            safety_margin=1.0
+            cbf_alpha=5.0,
+            safety_margin=safety_margin
         )
+        filter_algo.set_policy('waypoint', init_params)
+        
+        # Attach backup controller for retrace target querying
+        filter_algo.backup_controller = py_backup
         if backup_type == 'move_away':
             # PCBF JAX policy for move away? We only implemented Angle and Stop.
             # Using AnglePolicyJAX requires fixed angle.
             # Dynamic repulsion is hard in JAX without passing obstacle state to policy.
             # Fallback to StopPolicyJAX for PCBF unless we implement RepulsivePolicyJAX
-            print("Warning: PCBF JAX currently supports 'stop' policy well. Using StopPolicyJAX.")
-            filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
-        else:
-            filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
+            # User request: Default to retrace (waypoint) policy for PCBF
+            # filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
+            filter_algo.set_policy('waypoint', init_params)
+            
+        filter_algo.set_environment(env)
             
     elif algo == 'mpcbf':
         filter_algo = MPCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=1.0,
-            safety_margin=1.0,
-            num_angle_policies=10
+            cbf_alpha=args.alpha, 
+            safety_margin=safety_margin,
+            num_angle_policies=64
         )
+        filter_algo.set_environment(env)
         
     elif algo == 'backup_cbf':
-        filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        backup_horizon_cbf = backup_horizon
+        filter_algo = BackupCBF(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon_cbf)
+        filter_algo.env = env # Enable boundary checks
+        filter_algo.safety_margin = safety_margin 
+        filter_algo.alpha = 2.0 # Standard alpha
+        filter_algo.alpha_terminal = 2.0
+        
         filter_algo.set_nominal_controller(nominal_controller_fn)
         filter_algo.set_backup_controller(py_backup)
         filter_algo.set_environment(env)
         filter_algo.set_moving_obstacles(ghost_pred)
         
     elif algo == 'gatekeeper':
-        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        # Default event_offset=0.5 is too slow for dynamic retrace sync. 
+        # Set to env.dt to force replanning every step (like MPS).
+        # Set horizon_discount=env.dt to ensure we find "1-step" valid plans (matching MPS capability)
+        filter_algo = Gatekeeper(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, 
+                                 event_offset=env.dt, horizon_discount=env.dt, safety_margin=safety_margin)
         filter_algo.set_nominal_controller(nominal_controller_fn) # Gatekeeper needs trajectory but handles function?
         # Gatekeeper usually expects set_nominal_trajectory to be called per step or iterates internal model.
         # We will manually set nominal trajectory in loop.
@@ -128,7 +157,7 @@ def setup_test(algo, level, backup_type='stop'):
         filter_algo.set_moving_obstacles(ghost_pred)  # CRITICAL: Enable ghost prediction
         
     elif algo == 'mps':
-        filter_algo = MPS(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon)
+        filter_algo = MPS(robot, robot_spec, dt=env.dt, backup_horizon=backup_horizon, safety_margin=safety_margin)
         filter_algo.set_backup_controller(py_backup)
         filter_algo.set_environment(env)
         filter_algo.set_moving_obstacles(ghost_pred)  # CRITICAL: Enable ghost prediction
@@ -140,7 +169,7 @@ def setup_test(algo, level, backup_type='stop'):
 # =============================================================================
 
 def run_simulation(args):
-    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup)
+    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup, args.safety_margin)
     
     # Plot Setup
     if not args.no_render:
@@ -189,16 +218,31 @@ def run_simulation(args):
             
             # Predict nominal trajectory for MPCBF visualization (optional)
             if args.algo == 'mpcbf':
-                 # NOTE: Disabled to prevent side-effects on stateful NominalController
-                 # pred_traj = [current_state]
-                 # temp_x = current_state.copy()
-                 # for _ in range(20):
-                 #     u = nom_ctrl.get_control(temp_x)
-                 #     temp_x = robot.step(temp_x.reshape(-1,1), u.reshape(-1,1)).flatten()
-                 #     pred_traj.append(temp_x)
-                 # shielding.set_nominal_traj(np.array(pred_traj))
-                 pass
+                control_ref['waypoints'] = nom_ctrl.waypoints
+                control_ref['wp_idx'] = nom_ctrl.wp_idx
             
+            elif args.algo == 'pcbf':
+                # Update JAX Policy Target from RetraceBackupController
+                if hasattr(shielding, 'backup_controller') and shielding.backup_controller is not None:
+                     # CRITICAL: Must call prepare_rollout to update active_retrace_idx based on current state
+                     if hasattr(shielding.backup_controller, 'prepare_rollout'):
+                          shielding.backup_controller.prepare_rollout(current_state)
+                          
+                     if hasattr(shielding.backup_controller, 'get_current_target'):
+                          target_pos = shielding.backup_controller.get_current_target()
+                          # Update WaypointPolicy params structure with new target
+                          from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+                          
+                          # Create a dummy waypoint path with just the target
+                          wps_jax = jnp.array([target_pos[:2]]) 
+                          
+                          new_params = WaypointPolicyParams(
+                               waypoints=wps_jax,
+                               v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'],
+                               current_wp_idx=0
+                          )
+                          shielding.set_policy('waypoint', new_params)
+
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
             
@@ -217,6 +261,14 @@ def run_simulation(args):
             # (nominal_controller_fn uses update_state=False for gatekeeper's internal rollouts)
             u_nom = nom_ctrl.get_control(current_state, update_state=True)
             
+            # --- SYNCHRONIZATION FIX ---
+            # Explicitly call prepare_rollout HERE to ensure nominal waypoint 
+            # is regressed (synced with retrace) BEFORE generating the prediction trajectory.
+            # This ensures Gatekeeper predicts based on the CORRECT (regressed) target.
+            if hasattr(shielding, 'backup_controller') and shielding.backup_controller is not None:
+                if hasattr(shielding.backup_controller, 'prepare_rollout'):
+                     shielding.backup_controller.prepare_rollout(current_state)
+
             if args.algo in ['gatekeeper', 'mps']:
                 # Generate simple nominal trajectory
                 # CRITICAL: Use update_state=False to prevent waypoint switching during prediction
@@ -248,7 +300,9 @@ def run_simulation(args):
         # Update Env Robot Pos for visualization
         env.robot_pos = current_state[:2]
         
-        # 4. Check Collision
+        if step % 200 == 0:
+            dist_goal = np.linalg.norm(current_state[:2] - env.goal_pos)
+            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[2:4]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")        # 4. Check Collision
         # Static
         for obs in statics:
             dist = np.linalg.norm(current_state[:2] - np.array([obs['x'], obs['y']]))
@@ -262,6 +316,7 @@ def run_simulation(args):
              if np.linalg.norm(current_state[:2] - np.array([g['x'], g['y']])) < (g['radius'] + robot_spec['radius']):
                 collision = True
                 print("Collision with Ghost!")
+                break
                 
         # 5. Check Goal
         if np.linalg.norm(current_state[:2] - env.goal_pos) < env.goal_radius:
@@ -278,8 +333,11 @@ def run_simulation(args):
         if collision:
             break
             
-        # Visualize
         if not args.no_render:
+             # Update Shielding visualization (BackupCBF/Gatekeeper backup trajs)
+             if hasattr(shielding, 'update_visualization'):
+                 shielding.update_visualization()
+
              env.update_plot()
              # Draw Robot
              if not hasattr(env, 'robot_patch'):
@@ -326,6 +384,7 @@ def run_sweep(args):
             args_sim.save = False
             
             try:
+                args_sim.safety_margin = args.safety_margin 
                 res = run_simulation(args_sim)
                 res['algo'] = alg
                 res['level'] = level
@@ -389,13 +448,14 @@ def plot_results(data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
-    parser.add_argument('--level', type=int, default=1)
+    parser.add_argument('--level', type=str, default='1')
     parser.add_argument('--backup', type=str, default='stop', choices=['stop', 'move_away'])
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
-    
+    parser.add_argument('--safety_margin', type=float, default=1.4, help="Additive safety margin (e.g. 0.5)")
+    parser.add_argument('--alpha', type=float, default=6.0)
     args = parser.parse_args()
     
     if args.sweep:
