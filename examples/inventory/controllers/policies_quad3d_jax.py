@@ -50,6 +50,15 @@ class WaypointPolicyParams(NamedTuple):
     ctrl: Quad3DControlParams
 
 
+class RetracePolicyParams(NamedTuple):
+    waypoints: jnp.ndarray
+    v_max: float
+    Kp: float
+    dist_threshold: float
+    current_wp_idx: int
+    ctrl: Quad3DControlParams
+
+
 def _clip_xy_accel(ax, ay, a_max_xy):
     norm = jnp.sqrt(ax * ax + ay * ay + 1e-8)
     scale = jnp.where(norm > a_max_xy, a_max_xy / norm, 1.0)

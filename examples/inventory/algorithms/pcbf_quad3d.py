@@ -16,7 +16,8 @@ import cvxpy as cp
 from examples.inventory.dynamics.dynamics_quad3d_jax import Quad3DDynamicsJAX, Quad3DDynamicsParams, _build_quad3d_matrices
 from examples.inventory.controllers.policies_quad3d_jax import (
     AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
-    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams, Quad3DControlParams
+    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams,
+    _clip_xy_accel, _accel_to_u
 )
 from examples.drift_car.algorithms.pcbf_drift import smooth_min
 from mpcbf.pcbf import PCBFBase
@@ -70,7 +71,48 @@ def _rollout_trajectory_quad3d(
         x_next = step_fn(x, u)
         return x_next, x_next
 
-    _, trajectory = lax.scan(body_fn, x0, None, length=horizon)
+    if policy_type != 'retrace':
+        _, trajectory = lax.scan(body_fn, x0, None, length=horizon)
+        return jnp.vstack([x0[None, :], trajectory])
+
+    # Retrace policy: update waypoint index during rollout (match Python retrace behavior)
+    params: RetracePolicyParams = policy_params
+    ctrl = params.ctrl
+
+    def retrace_step(carry, _):
+        x, idx = carry
+        pos = x[0:2]
+        vel = x[6:8]
+
+        idx = jnp.clip(idx, 0, params.waypoints.shape[0] - 1)
+        target = params.waypoints[idx]
+        dist = jnp.sqrt(jnp.sum((target - pos) ** 2) + 1e-8)
+
+        # Decrement retrace index when close to target
+        idx_next = jax.lax.cond(
+            jnp.logical_and(dist < params.dist_threshold, idx > 0),
+            lambda i: i - 1,
+            lambda i: i,
+            idx
+        )
+
+        v_des_dir = (target - pos) / (dist + 1e-6)
+        braking_speed = jnp.sqrt(2.0 * ctrl.a_max_xy * jnp.maximum(dist, 0.0))
+        v_des_speed = jnp.minimum(params.v_max, braking_speed)
+        v_des = v_des_dir * v_des_speed
+
+        ax = params.Kp * (v_des[0] - vel[0])
+        ay = params.Kp * (v_des[1] - vel[1])
+        ax, ay = _clip_xy_accel(ax, ay, ctrl.a_max_xy)
+
+        az = ctrl.Kp_z * (ctrl.z_ref - x[2]) - ctrl.Kd_z * x[8]
+        u = _accel_to_u(x, ax, ay, az, ctrl)
+
+        x_next = step_fn(x, u)
+        return (x_next, idx_next), x_next
+
+    carry0 = (x0, jnp.array(params.current_wp_idx))
+    _, trajectory = lax.scan(retrace_step, carry0, None, length=horizon)
     return jnp.vstack([x0[None, :], trajectory])
 
 

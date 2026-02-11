@@ -185,7 +185,7 @@ def run_simulation(args):
         # Waypoint markers (yellow = unvisited, orange = current target)
         wps = np.array(nom_ctrl.waypoints) if getattr(nom_ctrl, 'waypoints', None) is not None else None
         if wps is not None and len(wps) > 0:
-            wp_colors = np.tile(np.array([1.0, 1.0, 0.0, 1.0]), (len(wps), 1))  # yellow
+            wp_colors = np.tile(np.array([1.0, 0.78, 0.0, 1.0]), (len(wps), 1))  # vivid yellow
             wp_scatter = ax1.scatter(
                 wps[:, 0], wps[:, 1],
                 marker='*', s=120,
@@ -199,11 +199,11 @@ def run_simulation(args):
                 current_idx = min(visited, len(wps) - 1)
                 if not force and wp_state['last_idx'] == current_idx and wp_state['last_visited'] == visited:
                     return
-                wp_colors[:] = [1.0, 1.0, 0.0, 1.0]  # reset to yellow
+                wp_colors[:] = [1.0, 0.78, 0.0, 1.0]  # reset to yellow
                 if visited > 0:
                     wp_colors[:visited, 3] = 0.0  # hide visited
                 if visited < len(wps):
-                    wp_colors[current_idx] = [1.0, 0.6, 0.0, 1.0]  # orange
+                    wp_colors[current_idx] = [1.0, 0.45, 0.0, 1.0]  # vivid orange
                 wp_scatter.set_facecolors(wp_colors)
                 wp_scatter.set_edgecolors(wp_colors)
                 wp_state['last_idx'] = current_idx
@@ -264,20 +264,20 @@ def run_simulation(args):
                      if hasattr(shielding.backup_controller, 'prepare_rollout'):
                           shielding.backup_controller.prepare_rollout(current_state)
                           
-                     if hasattr(shielding.backup_controller, 'get_current_target'):
-                          target_pos = shielding.backup_controller.get_current_target()
-                          # Update WaypointPolicy params structure with new target
-                          from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
-                          
-                          # Create a dummy waypoint path with just the target
-                          wps_jax = jnp.array([target_pos[:2]]) 
-                          
-                          new_params = WaypointPolicyParams(
-                               waypoints=wps_jax,
-                               v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'],
-                               current_wp_idx=0
-                          )
-                          shielding.set_policy('waypoint', new_params)
+                     # Match Gatekeeper/MPS retrace parameters for fairness
+                     from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+                     active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
+                     wps_jax = jnp.array(nom_ctrl.waypoints)
+                     
+                     new_params = WaypointPolicyParams(
+                          waypoints=wps_jax,
+                          v_max=robot_spec['v_max'],
+                          Kp=15.0,
+                          dist_threshold=1.0,
+                          a_max=robot_spec['a_max'],
+                          current_wp_idx=active_idx
+                     )
+                     shielding.set_policy('waypoint', new_params)
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()

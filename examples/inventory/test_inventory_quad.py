@@ -44,7 +44,7 @@ from safe_control.utils.animation import AnimationSaver
 from examples.inventory.algorithms.pcbf_quad3d import PCBF_Quad3D
 from examples.inventory.algorithms.mpcbf_quad3d import MPCBF_Quad3D
 from examples.inventory.controllers.policies_quad3d_jax import (
-    AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, Quad3DControlParams
+    AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams
 )
 from examples.inventory.dynamics.dynamics_quad3d_jax import _build_quad3d_matrices
 
@@ -152,12 +152,10 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         # Single policy PCBF
         # Use Waypoint policy (will be updated dynamically)
         # Dummy init
-        init_params = WaypointPolicyParams(
+        init_params = RetracePolicyParams(
             waypoints=jnp.array([[10., 10.]]),
-            v_max=robot_spec['v_max'],
-            Kp=robot_spec['nominal_Kp_v'],
-            K_lat=robot_spec['nominal_K_lat'],
-            v_lat_max=robot_spec['nominal_v_lat_max'],
+            v_max=robot_spec['backup_speed'],
+            Kp=robot_spec['backup_Kp'],
             dist_threshold=robot_spec['nominal_dist_threshold'],
             current_wp_idx=0,
             ctrl=ctrl_params
@@ -168,7 +166,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
             cbf_alpha=5.0,
             safety_margin=safety_margin
         )
-        filter_algo.set_policy('waypoint', init_params)
+        filter_algo.set_policy('retrace', init_params)
         
         # Attach backup controller for retrace target querying
         filter_algo.backup_controller = py_backup
@@ -179,7 +177,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
             # Fallback to StopPolicyJAX for PCBF unless we implement RepulsivePolicyJAX
             # User request: Default to retrace (waypoint) policy for PCBF
             # filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
-            filter_algo.set_policy('waypoint', init_params)
+            filter_algo.set_policy('retrace', init_params)
             
         filter_algo.set_environment(env)
             
@@ -250,7 +248,7 @@ def run_simulation(args):
         # Waypoint markers (yellow = unvisited, orange = current target)
         wps = np.array(nom_ctrl.waypoints) if getattr(nom_ctrl, 'waypoints', None) is not None else None
         if wps is not None and len(wps) > 0:
-            wp_colors = np.tile(np.array([1.0, 1.0, 0.0, 1.0]), (len(wps), 1))  # yellow
+            wp_colors = np.tile(np.array([1.0, 0.78, 0.0, 1.0]), (len(wps), 1))  # vivid yellow
             wp_scatter = ax1.scatter(
                 wps[:, 0], wps[:, 1],
                 marker='*', s=120,
@@ -264,11 +262,11 @@ def run_simulation(args):
                 current_idx = min(visited, len(wps) - 1)
                 if not force and wp_state['last_idx'] == current_idx and wp_state['last_visited'] == visited:
                     return
-                wp_colors[:] = [1.0, 1.0, 0.0, 1.0]  # reset to yellow
+                wp_colors[:] = [1.0, 0.78, 0.0, 1.0]  # reset to yellow
                 if visited > 0:
                     wp_colors[:visited, 3] = 0.0  # hide visited
                 if visited < len(wps):
-                    wp_colors[current_idx] = [1.0, 0.6, 0.0, 1.0]  # orange
+                    wp_colors[current_idx] = [1.0, 0.45, 0.0, 1.0]  # vivid orange
                 wp_scatter.set_facecolors(wp_colors)
                 wp_scatter.set_edgecolors(wp_colors)
                 wp_state['last_idx'] = current_idx
@@ -332,22 +330,18 @@ def run_simulation(args):
                      if hasattr(shielding.backup_controller, 'prepare_rollout'):
                           shielding.backup_controller.prepare_rollout(current_state)
                           
-                     if hasattr(shielding.backup_controller, 'get_current_target'):
-                          target_pos = shielding.backup_controller.get_current_target()
-                          # Create a dummy waypoint path with just the target
-                          wps_jax = jnp.array([target_pos[:2]])
-                          
-                          new_params = WaypointPolicyParams(
+                          # Match Gatekeeper/MPS retrace parameters for fairness
+                          active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
+                          wps_jax = jnp.array(nom_ctrl.waypoints)
+                          new_params = RetracePolicyParams(
                                waypoints=wps_jax,
-                               v_max=robot_spec['v_max'],
-                               Kp=robot_spec['nominal_Kp_v'],
-                               K_lat=robot_spec['nominal_K_lat'],
-                               v_lat_max=robot_spec['nominal_v_lat_max'],
+                               v_max=robot_spec['backup_speed'],
+                               Kp=robot_spec['backup_Kp'],
                                dist_threshold=robot_spec['nominal_dist_threshold'],
-                               current_wp_idx=0,
+                               current_wp_idx=active_idx,
                                ctrl=ctrl_params
                           )
-                          shielding.set_policy('waypoint', new_params)
+                          shielding.set_policy('retrace', new_params)
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()

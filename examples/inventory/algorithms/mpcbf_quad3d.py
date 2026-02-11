@@ -113,6 +113,8 @@ class MPCBF_Quad3D(PCBF_Quad3D):
         self.eval_horizon_steps = int(self.backup_horizon / self.dt)
 
         self.policy_configs = {}
+        self.angle_names = []
+        self.angle_params_batch = None
         self._setup_policies()
 
         self.nominal_trajectory = None
@@ -121,6 +123,8 @@ class MPCBF_Quad3D(PCBF_Quad3D):
         self._last_best_name = None
         self._jit_val_grad_fn = None
         self._jit_val_grad_obs = None
+        self._jit_angle_val_grad = None
+        self._jit_angle_grad_obs = None
         self.curr_step = 0
         self.debug = False
         if self.ax is not None:
@@ -170,13 +174,22 @@ class MPCBF_Quad3D(PCBF_Quad3D):
         Kp_v_angle = float(self.robot_spec.get('angle_Kp_v', Kp_v_nom))
         Kp_v_stop = float(self.robot_spec.get('stop_Kp_v', 3.0))
 
+        angle_params = []
         for i in range(self.num_angle_policies):
             angle = i * (2 * np.pi / self.num_angle_policies)
             name = f'angle_{i}'
             v_ref = float(self.robot_spec.get('v_ref', 4.0))
-            self.policy_configs[name] = ('angle', AnglePolicyParams(
+            params = AnglePolicyParams(
                 target_angle=angle, target_speed=v_ref, Kp_v=Kp_v_angle, ctrl=ctrl
-            ))
+            )
+            self.policy_configs[name] = ('angle', params)
+            self.angle_names.append(name)
+            angle_params.append(params)
+
+        if angle_params:
+            self.angle_params_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *angle_params
+            )
 
         self.policy_configs['stop'] = ('stop', StopPolicyParams(
             Kp_v=Kp_v_stop, ctrl=ctrl
@@ -214,19 +227,14 @@ class MPCBF_Quad3D(PCBF_Quad3D):
     def _get_jit_val_grad(self):
         if self._jit_val_grad_fn is None:
             def val_fn(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val):
-                V, _ = _compute_value_pure_quad3d(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val)
-                return V
+                V, traj = _compute_value_pure_quad3d(x0, dyn_p, pol_p, dyn_obs, stat_obs, p_type, hor, r_rad, rr_base, dt_val)
+                return V, traj
 
             self._jit_val_grad_fn = jax.jit(
-                jax.value_and_grad(val_fn),
+                jax.value_and_grad(val_fn, has_aux=True),
                 static_argnums=(5, 6)
             )
-
-            self._jit_traj = jax.jit(
-                lambda x0, dp, pp, do, so, pt, h, rr, rb, dt: _compute_value_pure_quad3d(x0, dp, pp, do, so, pt, h, rr, rb, dt)[1],
-                static_argnums=(5, 6)
-            )
-        return self._jit_val_grad_fn, self._jit_traj
+        return self._jit_val_grad_fn
 
     def _get_jit_val_grad_obs(self):
         if self._jit_val_grad_obs is None:
@@ -239,6 +247,34 @@ class MPCBF_Quad3D(PCBF_Quad3D):
                 static_argnums=(5, 6)
             )
         return self._jit_val_grad_obs
+
+    def _get_jit_angle_batch(self):
+        if self._jit_angle_val_grad is None:
+            h = self.eval_horizon_steps
+            dt_val = self.dt
+
+            def val_fn(x0, dyn_p, pol_p, dyn_obs, stat_obs, r_rad, rr_base):
+                V, traj = _compute_value_pure_quad3d(
+                    x0, dyn_p, pol_p, dyn_obs, stat_obs, 'angle', h, r_rad, rr_base, dt_val
+                )
+                return V, traj
+
+            val_grad = jax.value_and_grad(val_fn, has_aux=True)
+            self._jit_angle_val_grad = jax.jit(
+                jax.vmap(val_grad, in_axes=(None, None, 0, None, None, None, None))
+            )
+
+            def val_only(x0, dyn_p, pol_p, dyn_obs, stat_obs, r_rad, rr_base):
+                V, _ = _compute_value_pure_quad3d(
+                    x0, dyn_p, pol_p, dyn_obs, stat_obs, 'angle', h, r_rad, rr_base, dt_val
+                )
+                return V
+
+            grad_obs = jax.grad(val_only, argnums=3)
+            self._jit_angle_grad_obs = jax.jit(
+                jax.vmap(grad_obs, in_axes=(None, None, 0, None, None, None, None))
+            )
+        return self._jit_angle_val_grad, self._jit_angle_grad_obs
 
     def _setup_visualization(self):
         if self.ax is None:
@@ -289,14 +325,48 @@ class MPCBF_Quad3D(PCBF_Quad3D):
         else:
             stat_obs_array = jnp.zeros((0, 3))
 
-        val_grad_fn, traj_fn = self._get_jit_val_grad()
+        val_grad_fn = self._get_jit_val_grad()
         grad_obs_fn = self._get_jit_val_grad_obs()
 
         state_jax = jnp.array(state)
         policy_params_used = {}
         time_derivatives = {}
 
-        for name, (ptype, params) in self.policy_configs.items():
+        robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
+        robot_radius_base = self.robot_spec.get('radius', 1.0)
+
+        # Batch evaluate angle policies (most expensive)
+        if self.angle_params_batch is not None and len(self.angle_names) > 0:
+            batch_val_grad_fn, batch_grad_obs_fn = self._get_jit_angle_batch()
+            (V_batch, traj_batch), grad_batch = batch_val_grad_fn(
+                state_jax, self.dynamics_params, self.angle_params_batch,
+                obs_array, stat_obs_array, robot_radius, robot_radius_base
+            )
+            if obs_array.shape[0] > 0:
+                grad_obs_batch = batch_grad_obs_fn(
+                    state_jax, self.dynamics_params, self.angle_params_batch,
+                    obs_array, stat_obs_array, robot_radius, robot_radius_base
+                )
+                obs_vel = obs_array[:, 3:5]
+                time_deriv_batch = jnp.sum(grad_obs_batch[:, :, 0:2] * obs_vel[None, :, :], axis=(1, 2))
+            else:
+                time_deriv_batch = jnp.zeros((len(self.angle_names),))
+
+            for i, name in enumerate(self.angle_names):
+                params = self.policy_configs[name][1]
+                policy_params_used[name] = ('angle', params)
+                results[name] = (
+                    float(V_batch[i]),
+                    np.array(grad_batch[i]),
+                    np.array(traj_batch[i])
+                )
+                time_derivatives[name] = float(time_deriv_batch[i])
+
+        # Evaluate stop and nominal policies (single)
+        for name in ['stop', 'nominal']:
+            if name not in self.policy_configs:
+                continue
+            ptype, params = self.policy_configs[name]
             if name == 'nominal' and control_ref is not None and 'waypoints' in control_ref:
                 Kp_v_nom = float(self.robot_spec.get('nominal_Kp_v', 6.0))
                 K_lat_nom = float(self.robot_spec.get('nominal_K_lat', 1.0))
@@ -314,23 +384,16 @@ class MPCBF_Quad3D(PCBF_Quad3D):
                 )
             policy_params_used[name] = (ptype, params)
 
-            V_jax, grad_jax = val_grad_fn(
+            (V_jax, traj), grad_jax = val_grad_fn(
                 state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
-                self.eval_horizon_steps, self.robot_spec.get('radius', 1.0) + self.safety_margin,
-                self.robot_spec.get('radius', 1.0), self.dt
-            )
-            traj = traj_fn(
-                state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
-                self.eval_horizon_steps, self.robot_spec.get('radius', 1.0) + self.safety_margin,
-                self.robot_spec.get('radius', 1.0), self.dt
+                self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
             )
             results[name] = (float(V_jax), np.array(grad_jax), np.array(traj))
 
             if obs_array.shape[0] > 0:
                 grad_obs = grad_obs_fn(
                     state_jax, self.dynamics_params, params, obs_array, stat_obs_array, ptype,
-                    self.eval_horizon_steps, self.robot_spec.get('radius', 1.0) + self.safety_margin,
-                    self.robot_spec.get('radius', 1.0), self.dt
+                    self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
                 )
                 obs_vel = obs_array[:, 3:5]
                 time_derivatives[name] = float(jnp.sum(grad_obs[:, 0:2] * obs_vel))
