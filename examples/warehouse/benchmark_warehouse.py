@@ -1,5 +1,5 @@
 """
-Benchmark script for Inventory scenario algorithms.
+Benchmark script for Warehouse scenario algorithms.
 Measures per-step algorithm time (solve_control_problem only),
 skipping warmup steps to avoid JIT compile overhead.
 """
@@ -25,8 +25,8 @@ def _format_bool(val):
 
 
 def run_one_quad(algo, level, safety_margin, alpha, max_steps, warmup_steps):
-    import examples.inventory.test_inventory_quad as tiq
-    from examples.inventory.controllers.policies_quad3d_jax import RetracePolicyParams
+    import examples.warehouse.test_warehouse_quad as tiq
+    from examples.warehouse.controllers.policies_quad3d_jax import RetracePolicyParams
 
     # Provide alpha expected by setup_test
     tiq.args = argparse.Namespace(alpha=alpha)
@@ -172,8 +172,8 @@ def run_one_quad(algo, level, safety_margin, alpha, max_steps, warmup_steps):
 
 
 def run_one_di(algo, level, safety_margin, alpha, max_steps, warmup_steps):
-    import examples.inventory.test_inventory_di as tid
-    from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+    import examples.warehouse.test_warehouse_di as tid
+    from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
 
     # Provide alpha expected by setup_test
     tid.args = argparse.Namespace(alpha=alpha)

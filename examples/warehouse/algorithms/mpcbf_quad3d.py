@@ -13,8 +13,8 @@ import jax.numpy as jnp
 import cvxpy as cp
 
 from .pcbf_quad3d import _compute_value_pure_quad3d
-from examples.inventory.dynamics.dynamics_quad3d_jax import Quad3DDynamicsJAX, Quad3DDynamicsParams, _build_quad3d_matrices
-from examples.inventory.controllers.policies_quad3d_jax import (
+from examples.warehouse.dynamics.dynamics_quad3d_jax import Quad3DDynamicsJAX, Quad3DDynamicsParams, _build_quad3d_matrices
+from examples.warehouse.controllers.policies_quad3d_jax import (
     AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
     AnglePolicyParams, StopPolicyParams, WaypointPolicyParams, Quad3DControlParams
 )

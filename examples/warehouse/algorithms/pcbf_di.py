@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import jax.lax as lax
 import cvxpy as cp
 
-from examples.inventory.dynamics.dynamics_di_jax import DoubleIntegratorDynamicsJAX, DIDynamicsParams
-from examples.inventory.controllers.policies_di_jax import (
+from examples.warehouse.dynamics.dynamics_di_jax import DoubleIntegratorDynamicsJAX, DIDynamicsParams
+from examples.warehouse.controllers.policies_di_jax import (
     AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
     AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
 )

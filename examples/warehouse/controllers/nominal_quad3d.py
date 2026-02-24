@@ -1,8 +1,8 @@
-"""Controllers for the Inventory scenario with Quad3D dynamics."""
+"""Controllers for the Warehouse scenario with Quad3D dynamics."""
 
 import numpy as np
 
-from examples.inventory.controllers.nominal_di import GhostPredictor
+from examples.warehouse.controllers.nominal_di import GhostPredictor
 
 
 def _build_b2_inv(robot_spec):

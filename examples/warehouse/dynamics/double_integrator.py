@@ -1,4 +1,4 @@
-"""Double Integrator dynamics wrapper for Inventory scenario."""
+"""Double Integrator dynamics wrapper for Warehouse scenario."""
 
 from safe_control.robots.double_integrator2D import DoubleIntegrator2D
 

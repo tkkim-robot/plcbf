@@ -1,9 +1,9 @@
 """
-Created on February 11th, 2026
+Created on February 4th, 2026
 @author: Taekyung Kim
 
 @description:
-Test script for Inventory Scenario with Quad3D dynamics.
+Test script for Warehouse Scenario with Double Integrator.
 Tests PCBF, MPCBF, Gatekeeper, MPS, and BackupCBF.
 """
 
@@ -22,17 +22,17 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'safe_control'))
 
 # Import dynamics (modular)
-from examples.inventory.dynamics.quad3d import Quad3D
+from examples.warehouse.dynamics.double_integrator import DoubleIntegrator2D
 
-# Import controllers
-from examples.inventory.controllers.nominal_quad3d import (
-    WaypointFollowerQuad3D, GhostPredictor,
-    StopBackupControllerQuad3D, MoveAwayBackupControllerQuad3D,
-    MovingBackBackupControllerQuad3D, RetraceBackupControllerQuad3D
+# Import controllers  
+from examples.warehouse.controllers.nominal_di import (
+    WaypointFollower, GhostPredictor, 
+    StopBackupController, MoveAwayBackupController,
+    MovingBackBackupController, RetraceBackupController
 )
 
 # Environment
-from safe_control.envs.inventory_env import InventoryEnv
+from safe_control.envs.warehouse_env import WarehouseEnv
 
 # Shielding algorithms
 from safe_control.position_control.backup_cbf_qp import BackupCBF
@@ -41,68 +41,34 @@ from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
 # Core algorithms (PCBF/MPCBF)
-from examples.inventory.algorithms.pcbf_quad3d import PCBF_Quad3D
-from examples.inventory.algorithms.mpcbf_quad3d import MPCBF_Quad3D
-from examples.inventory.controllers.policies_quad3d_jax import (
-    AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams
-)
-from examples.inventory.dynamics.dynamics_quad3d_jax import _build_quad3d_matrices
+from examples.warehouse.algorithms.pcbf_di import PCBF_DI
+from examples.warehouse.algorithms.mpcbf_di import MPCBF_DI
+from examples.warehouse.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
+from examples.warehouse.dynamics.dynamics_di_jax import DIDynamicsParams
 
-# Note: Controllers are imported from controllers.nominal_quad3d module
+# Note: Controllers are imported from controllers.nominal_di module
 
 # =============================================================================
 # Setup Functions
 # =============================================================================
 
 def setup_test(algo, level, safety_margin=0.5):
-    env = InventoryEnv(level=level)
+    env = WarehouseEnv(level=level)
     
-    # Robot Spec (Quad3D)
+    # Robot Spec
     robot_spec = {
-        'model': 'Quad3D',
+        'model': 'DoubleIntegrator2D',
+        'a_max': 5.0,
+        'v_max': 8.0,
         'radius': 1.0,
-        'mass': 3.0,
-        'Ix': 0.5,
-        'Iy': 0.5,
-        'Iz': 0.5,
-        'L': 0.3,
-        'nu': 0.1,
-        'g': 9.8,
-        'u_max': 10.0,
-        'u_min': -10.0,
-        'v_max': 3.5,
-        'v_ref': 3.0,
-        'a_max_xy': 8.0,
-        'z_ref': 0.0,
-        'Kp_z': 4.0,
-        'Kd_z': 3.0,
-        'K_ang': 10.0,
-        'Kd_ang': 4.0,
-        # Nominal/Backup tuning (Quad3D)
-        'nominal_Kp_v': 7.0,
-        'nominal_K_lat': 1.2,
-        'nominal_v_lat_max': 2.5,
-        'nominal_dist_threshold': 1.0,
-        'angle_Kp_v': 7.0,
-        'stop_Kp_v': 3.0,
-        'backup_Kp': 6.0,
-        'backup_speed': 2.8
+        'v_ref': 8.0
     }
     
     # Dynamics (Python)
-    robot = Quad3D(env.dt, robot_spec)
+    robot = DoubleIntegrator2D(env.dt, robot_spec)
     
     # Nominal Controller
-    nominal_ctrl_obj = WaypointFollowerQuad3D(
-        env.get_nominal_waypoints(),
-        robot_spec=robot_spec,
-        v_max=robot_spec['v_max'],
-        Kp_v=robot_spec['nominal_Kp_v'],
-        K_lat=robot_spec['nominal_K_lat'],
-        v_lat_max=robot_spec['nominal_v_lat_max'],
-        debug=False
-    )
-    nominal_ctrl_obj.dist_threshold = robot_spec['nominal_dist_threshold']
+    nominal_ctrl_obj = WaypointFollower(env.get_nominal_waypoints(), v_max=robot_spec['v_max'], debug=False)
     def nominal_controller_fn(x):
         # CRITICAL: Use update_state=False for gatekeeper/mps rollouts
         # The actual waypoint state should only update based on real robot position
@@ -110,61 +76,34 @@ def setup_test(algo, level, safety_margin=0.5):
         
     # Python Backup Controller (for Baselines)
     if algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
-        py_backup = RetraceBackupControllerQuad3D(
-            nominal_ctrl_obj, robot_spec,
-            Kp=robot_spec['backup_Kp'],
-            target_speed=robot_spec['backup_speed']
-        )
+         # Use Retrace Strategy as per User Request
+         # It needs access to nominal_ctrl_obj to know past waypoints
+         py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=robot_spec['v_max'], a_max=robot_spec['a_max'])
     else:
-        py_backup = StopBackupControllerQuad3D(robot_spec)
+        py_backup = StopBackupController()
         
     # Ghost Predictor
     ghost_pred = GhostPredictor(env)
-
-    # Shared control params for JAX policies
-    A, B, B2, B2_inv = _build_quad3d_matrices(
-        robot_spec['mass'], robot_spec['Ix'], robot_spec['Iy'], robot_spec['Iz'],
-        robot_spec['L'], robot_spec['nu'], robot_spec['g']
-    )
-    ctrl_params = Quad3DControlParams(
-        m=robot_spec['mass'],
-        Ix=robot_spec['Ix'],
-        Iy=robot_spec['Iy'],
-        Iz=robot_spec['Iz'],
-        g=robot_spec['g'],
-        B2_inv=B2_inv,
-        u_min=robot_spec['u_min'],
-        u_max=robot_spec['u_max'],
-        K_ang=robot_spec['K_ang'],
-        Kd_ang=robot_spec['Kd_ang'],
-        z_ref=robot_spec['z_ref'],
-        Kp_z=robot_spec['Kp_z'],
-        Kd_z=robot_spec['Kd_z'],
-        a_max_xy=robot_spec['a_max_xy']
-    )
     
     filter_algo = None
-    backup_horizon = 4.0
+    backup_horizon = 2.0
     
     if algo == 'pcbf':
         # Single policy PCBF
-        # Use retrace-waypoint policy (will be updated dynamically)
+        # Use Waypoint policy (will be updated dynamically)
+        from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
         # Dummy init
-        init_params = RetracePolicyParams(
-            waypoints=jnp.array([[10., 10.]]),
-            v_max=robot_spec['backup_speed'],
-            Kp=robot_spec['backup_Kp'],
-            dist_threshold=robot_spec['nominal_dist_threshold'],
-            current_wp_idx=0,
-            ctrl=ctrl_params
+        init_params = WaypointPolicyParams(
+             waypoints=jnp.array([[10., 10.]]), 
+             v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'], current_wp_idx=0
         )
-        filter_algo = PCBF_Quad3D(
+        filter_algo = PCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
             cbf_alpha=5.0,
             safety_margin=safety_margin
         )
-        filter_algo.set_policy('retrace_waypoint', init_params)
+        filter_algo.set_policy('waypoint', init_params)
         
         # Attach backup controller for retrace target querying
         filter_algo.backup_controller = py_backup
@@ -172,12 +111,12 @@ def setup_test(algo, level, safety_margin=0.5):
         filter_algo.set_environment(env)
             
     elif algo == 'mpcbf':
-        filter_algo = MPCBF_Quad3D(
+        filter_algo = MPCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=args.alpha,
+            cbf_alpha=args.alpha, 
             safety_margin=safety_margin,
-            num_angle_policies=32
+            num_angle_policies=64
         )
         filter_algo.set_environment(env)
         
@@ -213,16 +152,14 @@ def setup_test(algo, level, safety_margin=0.5):
         filter_algo.set_environment(env)
         filter_algo.set_moving_obstacles(ghost_pred)  # CRITICAL: Enable ghost prediction
         
-    return env, robot, nominal_ctrl_obj, filter_algo, robot_spec, ctrl_params
+    return env, robot, nominal_ctrl_obj, filter_algo, robot_spec
 
 # =============================================================================
 # Main Loop
 # =============================================================================
 
 def run_simulation(args):
-    env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = setup_test(
-        args.algo, args.level, args.safety_margin
-    )
+    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.safety_margin)
     
     # Plot Setup
     update_waypoint_markers = None
@@ -270,7 +207,7 @@ def run_simulation(args):
     saver = None
     if args.save and fig:
         saver = AnimationSaver(
-            f"output/animations/inventory_{args.algo}_lvl{args.level}",
+            f"output/animations/warehouse_{args.algo}_lvl{args.level}",
             save_per_frame=1,
             dpi=250,
             video_height=1080
@@ -287,14 +224,11 @@ def run_simulation(args):
     print(f"Starting {args.algo} Level {args.level}...")
     
     for step in range(max_steps):
-        # env doesn't simulate mechanics; use `current_state` for robot dynamics.
+        state = np.hstack([env.robot_pos, [0,0]]) # Current robot state (pos only in env, need vel)
+        # Wait, env doesn't simulate mechanics, robot does.
+        # Let's keep robot state in `current_state` variable.
         if step == 0:
-            current_state = np.array([
-                env.start_pos[0], env.start_pos[1], robot_spec['z_ref'],
-                0.0, 0.0, 0.0,   # theta, phi, psi
-                0.0, 0.0, 0.0,   # vx, vy, vz
-                0.0, 0.0, 0.0    # q, p, r
-            ])
+            current_state = np.array([env.start_pos[0], env.start_pos[1], 0.0, 0.0])
             
         # 1. Prediction (Ghosts)
         env.step() # Move ghosts
@@ -320,24 +254,26 @@ def run_simulation(args):
                      if hasattr(shielding.backup_controller, 'prepare_rollout'):
                           shielding.backup_controller.prepare_rollout(current_state)
                           
-                          # Match Gatekeeper/MPS retrace parameters for fairness
-                          active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
-                          wps_jax = jnp.array(nom_ctrl.waypoints)
-                          new_params = RetracePolicyParams(
-                               waypoints=wps_jax,
-                               v_max=robot_spec['backup_speed'],
-                               Kp=robot_spec['backup_Kp'],
-                               dist_threshold=robot_spec['nominal_dist_threshold'],
-                               current_wp_idx=active_idx,
-                               ctrl=ctrl_params
-                          )
-                          shielding.set_policy('retrace_waypoint', new_params)
+                     # Match Gatekeeper/MPS retrace parameters for fairness
+                     from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
+                     active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
+                     wps_jax = jnp.array(nom_ctrl.waypoints)
+                     
+                     new_params = WaypointPolicyParams(
+                          waypoints=wps_jax,
+                          v_max=robot_spec['v_max'],
+                          Kp=15.0,
+                          dist_threshold=1.0,
+                          a_max=robot_spec['a_max'],
+                          current_wp_idx=active_idx
+                     )
+                     shielding.set_policy('waypoint', new_params)
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
             
             # Check feasibility (if result is exactly u_nom when unsafe? Logic inside handles it)
-            # PCBF_Quad3D returns u_nom if failed.
+            # PCBF_DI returns u_nom if failed.
             
         elif args.algo in ['backup_cbf', 'gatekeeper', 'mps']:
             # Set moving obstacles current state for BackupCBF
@@ -379,7 +315,7 @@ def run_simulation(args):
             except ValueError as e:
                 print(f"Infeasible: {e}")
                 infeasible = True
-                u_safe = np.zeros(4) # Stop
+                u_safe = np.zeros(2) # Stop
                 if not args.no_render:
                     ax1.text(current_state[0], current_state[1], "X", color='red', fontsize=20)
         
@@ -392,7 +328,7 @@ def run_simulation(args):
         
         if step % 200 == 0:
             dist_goal = np.linalg.norm(current_state[:2] - env.goal_pos)
-            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[6:8]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")        # 4. Check Collision
+            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[2:4]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")        # 4. Check Collision
         # Static
         for obs in statics:
             dist = np.linalg.norm(current_state[:2] - np.array([obs['x'], obs['y']]))
@@ -403,12 +339,9 @@ def run_simulation(args):
                 print(f"  Dist: {dist:.2f} < {obs['radius'] + robot_spec['radius']}")
         # Dynamic
         for g in ghosts:
-             dist_g = np.linalg.norm(current_state[:2] - np.array([g['x'], g['y']]))
-             if dist_g < (g['radius'] + robot_spec['radius']):
+             if np.linalg.norm(current_state[:2] - np.array([g['x'], g['y']])) < (g['radius'] + robot_spec['radius']):
                 collision = True
-                print(f"Collision with Ghost at ({g['x']:.2f}, {g['y']:.2f})!")
-                print(f"  Robot Pos: {current_state[:2]}")
-                print(f"  Dist: {dist_g:.2f} < {g['radius'] + robot_spec['radius']}")
+                print("Collision with Ghost!")
                 break
                 
         # 5. Check Goal
@@ -537,8 +470,8 @@ def plot_results(data):
     ax.set_title("Goal Completion")
     
     plt.tight_layout()
-    plt.savefig("inventory_results.png")
-    print("Saved inventory_results.png")
+    plt.savefig("warehouse_results.png")
+    print("Saved warehouse_results.png")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

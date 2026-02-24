@@ -3,7 +3,7 @@ Created on February 11th, 2026
 @author: Taekyung Kim
 
 @description:
-JAX-compatible Quad3D dynamics for Inventory scenario.
+JAX-compatible Quad3D dynamics for Warehouse scenario.
 
 State: [x, y, z, theta, phi, psi, vx, vy, vz, q, p, r] (12 states)
 Control: [u1, u2, u3, u4] (4 motor forces)

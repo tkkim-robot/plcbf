@@ -1,4 +1,4 @@
-"""Quad3D dynamics wrapper for Inventory scenario."""
+"""Quad3D dynamics wrapper for Warehouse scenario."""
 
 from safe_control.robots.quad3D import Quad3D
 
