@@ -3,7 +3,7 @@ Created on February 4th, 2026
 @author: Taekyung Kim
 
 @description:
-Test script for Inventory Scenario with Double Integrator.
+Test script for Warehouse Scenario with Double Integrator.
 Tests PCBF, MPCBF, Gatekeeper, MPS, and BackupCBF.
 """
 
@@ -22,17 +22,17 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'safe_control'))
 
 # Import dynamics (modular)
-from examples.inventory.dynamics.double_integrator import DoubleIntegrator2D
+from examples.warehouse.dynamics.double_integrator import DoubleIntegrator2D
 
 # Import controllers  
-from examples.inventory.controllers.nominal import (
+from examples.warehouse.controllers.nominal_di import (
     WaypointFollower, GhostPredictor, 
     StopBackupController, MoveAwayBackupController,
     MovingBackBackupController, RetraceBackupController
 )
 
 # Environment
-from safe_control.envs.inventory_env import InventoryEnv
+from safe_control.envs.warehouse_env import WarehouseEnv
 
 # Shielding algorithms
 from safe_control.position_control.backup_cbf_qp import BackupCBF
@@ -41,19 +41,19 @@ from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
 # Core algorithms (PCBF/MPCBF)
-from examples.inventory.algorithms.pcbf_di import PCBF_DI
-from examples.inventory.algorithms.mpcbf_di import MPCBF_DI
-from examples.inventory.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
-from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
+from examples.warehouse.algorithms.pcbf_di import PCBF_DI
+from examples.warehouse.algorithms.mpcbf_di import MPCBF_DI
+from examples.warehouse.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
+from examples.warehouse.dynamics.dynamics_di_jax import DIDynamicsParams
 
-# Note: Controllers are imported from controllers.nominal module
+# Note: Controllers are imported from controllers.nominal_di module
 
 # =============================================================================
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
-    env = InventoryEnv(level=level)
+def setup_test(algo, level, safety_margin=0.5):
+    env = WarehouseEnv(level=level)
     
     # Robot Spec
     robot_spec = {
@@ -75,9 +75,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         return nominal_ctrl_obj.get_control(x.flatten(), update_state=False)
         
     # Python Backup Controller (for Baselines)
-    if backup_type == 'move_away':
-        py_backup = MoveAwayBackupController(env)
-    elif algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
+    if algo in ['backup_cbf', 'gatekeeper', 'mps', 'pcbf']:
          # Use Retrace Strategy as per User Request
          # It needs access to nominal_ctrl_obj to know past waypoints
          py_backup = RetraceBackupController(nominal_ctrl_obj, Kp=15.0, target_speed=robot_spec['v_max'], a_max=robot_spec['a_max'])
@@ -93,7 +91,7 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
     if algo == 'pcbf':
         # Single policy PCBF
         # Use Waypoint policy (will be updated dynamically)
-        from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
+        from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
         # Dummy init
         init_params = WaypointPolicyParams(
              waypoints=jnp.array([[10., 10.]]), 
@@ -109,14 +107,6 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
         
         # Attach backup controller for retrace target querying
         filter_algo.backup_controller = py_backup
-        if backup_type == 'move_away':
-            # PCBF JAX policy for move away? We only implemented Angle and Stop.
-            # Using AnglePolicyJAX requires fixed angle.
-            # Dynamic repulsion is hard in JAX without passing obstacle state to policy.
-            # Fallback to StopPolicyJAX for PCBF unless we implement RepulsivePolicyJAX
-            # User request: Default to retrace (waypoint) policy for PCBF
-            # filter_algo.set_policy('stop', StopPolicyParams(Kp_v=4.0, a_max=5.0, stop_threshold=0.05))
-            filter_algo.set_policy('waypoint', init_params)
             
         filter_algo.set_environment(env)
             
@@ -169,9 +159,10 @@ def setup_test(algo, level, backup_type='stop', safety_margin=0.5):
 # =============================================================================
 
 def run_simulation(args):
-    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.backup, args.safety_margin)
+    env, robot, nom_ctrl, shielding, robot_spec = setup_test(args.algo, args.level, args.safety_margin)
     
     # Plot Setup
+    update_waypoint_markers = None
     if not args.no_render:
         plt.ion()
         fig, ax1 = env.setup_plot()
@@ -180,12 +171,47 @@ def run_simulation(args):
              # Trigger visual setup
              if hasattr(shielding, '_setup_visualization'): shielding._setup_visualization()
              if hasattr(shielding, '_setup_multi_visualization'): shielding._setup_multi_visualization()
+
+        # Waypoint markers (yellow = unvisited, orange = current target)
+        wps = np.array(nom_ctrl.waypoints) if getattr(nom_ctrl, 'waypoints', None) is not None else None
+        if wps is not None and len(wps) > 0:
+            wp_colors = np.tile(np.array([1.0, 0.78, 0.0, 1.0]), (len(wps), 1))  # vivid yellow
+            wp_scatter = ax1.scatter(
+                wps[:, 0], wps[:, 1],
+                marker='*', s=120,
+                c=wp_colors, edgecolors='k', linewidths=0.5,
+                zorder=5
+            )
+            wp_state = {'last_idx': None, 'last_visited': None}
+
+            def _update_waypoints(force=False):
+                visited = int(np.clip(nom_ctrl.wp_idx, 0, len(wps)))
+                current_idx = min(visited, len(wps) - 1)
+                if not force and wp_state['last_idx'] == current_idx and wp_state['last_visited'] == visited:
+                    return
+                wp_colors[:] = [1.0, 0.78, 0.0, 1.0]  # reset to yellow
+                if visited > 0:
+                    wp_colors[:visited, 3] = 0.0  # hide visited
+                if visited < len(wps):
+                    wp_colors[current_idx] = [1.0, 0.45, 0.0, 1.0]  # vivid orange
+                wp_scatter.set_facecolors(wp_colors)
+                wp_scatter.set_edgecolors(wp_colors)
+                wp_state['last_idx'] = current_idx
+                wp_state['last_visited'] = visited
+
+            update_waypoint_markers = _update_waypoints
+            update_waypoint_markers(force=True)
     else:
         fig, ax1 = None, None
         
     saver = None
     if args.save and fig:
-        saver = AnimationSaver(f"output/animations/inventory_{args.algo}_lvl{args.level}", save_per_frame=1)
+        saver = AnimationSaver(
+            f"output/animations/warehouse_{args.algo}_lvl{args.level}",
+            save_per_frame=1,
+            dpi=250,
+            video_height=1080
+        )
         
     # metrics
     infeasible = False
@@ -228,20 +254,20 @@ def run_simulation(args):
                      if hasattr(shielding.backup_controller, 'prepare_rollout'):
                           shielding.backup_controller.prepare_rollout(current_state)
                           
-                     if hasattr(shielding.backup_controller, 'get_current_target'):
-                          target_pos = shielding.backup_controller.get_current_target()
-                          # Update WaypointPolicy params structure with new target
-                          from examples.inventory.controllers.policies_di_jax import WaypointPolicyParams
-                          
-                          # Create a dummy waypoint path with just the target
-                          wps_jax = jnp.array([target_pos[:2]]) 
-                          
-                          new_params = WaypointPolicyParams(
-                               waypoints=wps_jax,
-                               v_max=robot_spec['v_max'], Kp=15.0, dist_threshold=1.0, a_max=robot_spec['a_max'],
-                               current_wp_idx=0
-                          )
-                          shielding.set_policy('waypoint', new_params)
+                     # Match Gatekeeper/MPS retrace parameters for fairness
+                     from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
+                     active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
+                     wps_jax = jnp.array(nom_ctrl.waypoints)
+                     
+                     new_params = WaypointPolicyParams(
+                          waypoints=wps_jax,
+                          v_max=robot_spec['v_max'],
+                          Kp=15.0,
+                          dist_threshold=1.0,
+                          a_max=robot_spec['a_max'],
+                          current_wp_idx=active_idx
+                     )
+                     shielding.set_policy('waypoint', new_params)
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
@@ -338,6 +364,9 @@ def run_simulation(args):
              if hasattr(shielding, 'update_visualization'):
                  shielding.update_visualization()
 
+             if update_waypoint_markers is not None:
+                 update_waypoint_markers()
+
              env.update_plot()
              # Draw Robot
              if not hasattr(env, 'robot_patch'):
@@ -379,7 +408,6 @@ def run_sweep(args):
             args_sim = argparse.Namespace()
             args_sim.algo = alg
             args_sim.level = level
-            args_sim.backup = 'stop'
             args_sim.no_render = True
             args_sim.save = False
             
@@ -442,14 +470,13 @@ def plot_results(data):
     ax.set_title("Goal Completion")
     
     plt.tight_layout()
-    plt.savefig("inventory_results.png")
-    print("Saved inventory_results.png")
+    plt.savefig("warehouse_results.png")
+    print("Saved warehouse_results.png")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
     parser.add_argument('--level', type=str, default='1')
-    parser.add_argument('--backup', type=str, default='stop', choices=['stop', 'move_away'])
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")

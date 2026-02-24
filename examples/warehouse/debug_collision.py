@@ -8,8 +8,8 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'safe_control'))
 
-from examples.inventory.dynamics.double_integrator import DoubleIntegrator2D
-from examples.inventory.controllers.nominal import MovingBackBackupController
+from examples.warehouse.dynamics.double_integrator import DoubleIntegrator2D
+from examples.warehouse.controllers.nominal_di import MovingBackBackupController
 from safe_control.position_control.backup_cbf_qp import BackupCBF
 
 def debug_collision():

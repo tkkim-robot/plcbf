@@ -1,4 +1,4 @@
-"""Controllers for the Inventory scenario."""
+"""Controllers for the Warehouse scenario."""
 
 import numpy as np
 

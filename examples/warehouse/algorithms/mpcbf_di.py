@@ -13,11 +13,11 @@ import jax.numpy as jnp
 import cvxpy as cp
 
 from .pcbf_di import PCBF_DI, _compute_value_pure_di
-from examples.inventory.controllers.policies_di_jax import (
+from examples.warehouse.controllers.policies_di_jax import (
     AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
     AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
 )
-from examples.inventory.dynamics.dynamics_di_jax import DIDynamicsParams
+from examples.warehouse.dynamics.dynamics_di_jax import DIDynamicsParams
 
 # =============================================================================
 # JIT-compiled Feasible Control Area Computation (for input_space operator)
