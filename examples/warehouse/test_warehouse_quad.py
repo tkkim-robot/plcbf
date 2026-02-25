@@ -4,7 +4,7 @@ Created on February 11th, 2026
 
 @description:
 Test script for Warehouse Scenario with Quad3D dynamics.
-Tests PCBF, MPCBF, Gatekeeper, MPS, and BackupCBF.
+Tests PCBF, MPCBF, MIP-MPC, Gatekeeper, MPS, and BackupCBF.
 """
 
 import sys
@@ -43,6 +43,7 @@ from safe_control.utils.animation import AnimationSaver
 # Core algorithms (PCBF/MPCBF)
 from examples.warehouse.algorithms.pcbf_quad3d import PCBF_Quad3D
 from examples.warehouse.algorithms.mpcbf_quad3d import MPCBF_Quad3D
+from examples.warehouse.algorithms.mip_mpc_quad3d import MIPMPC_Quad3D
 from examples.warehouse.controllers.policies_quad3d_jax import (
     AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams
 )
@@ -180,6 +181,30 @@ def setup_test(algo, level, safety_margin=0.5):
             num_angle_policies=32
         )
         filter_algo.set_environment(env)
+
+    elif algo == 'mip_mpc':
+        # Fixed configuration for the MIP baseline (kept local on purpose).
+        mip_backup_horizon = backup_horizon
+        mip_horizon_steps = max(1, int(round(mip_backup_horizon / env.dt)))
+        filter_algo = MIPMPC_Quad3D(
+            robot_spec,
+            dt=env.dt,
+            mpc_horizon_steps=mip_horizon_steps,
+            backup_horizon=mip_backup_horizon,
+            num_angle_policies=32,
+            safety_margin=safety_margin,
+            safety_threshold=0.0,
+            xy_tube=3.0,
+            control_tube=6.0,
+            control_tube_steps=2,
+            goal_weight=8.0,
+            terminal_goal_weight=16.0,
+            velocity_weight=0.15,
+            control_weight=0.02,
+            nominal_weight=0.5,
+            mip_solver='ECOS_BB'
+        )
+        filter_algo.set_environment(env)
         
     elif algo == 'backup_cbf':
         backup_horizon_cbf = backup_horizon
@@ -283,6 +308,9 @@ def run_simulation(args):
     nominal_track_steps = 0
     total_steps = 0
     max_steps = 3000
+    solve_times = []
+    policy_eval_times = []
+    mip_solve_times = []
     
     print(f"Starting {args.algo} Level {args.level}...")
     
@@ -302,14 +330,14 @@ def run_simulation(args):
         statics = env.get_static_obstacles()
         
         # 2. Update Shielding Info
-        if args.algo in ['pcbf', 'mpcbf']:
+        if args.algo in ['pcbf', 'mpcbf', 'mip_mpc']:
             shielding.update_obstacles(ghosts, statics)
             # PCBF/MPCBF need nominal reference u
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
             
             # Predict nominal trajectory for MPCBF visualization (optional)
-            if args.algo == 'mpcbf':
+            if args.algo in ['mpcbf', 'mip_mpc']:
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             
@@ -335,6 +363,12 @@ def run_simulation(args):
 
             u_safe = shielding.solve_control_problem(current_state, control_ref)
             u_safe = np.array(u_safe).flatten()
+            if hasattr(shielding, 'last_total_time_sec'):
+                solve_times.append(float(shielding.last_total_time_sec))
+            if hasattr(shielding, 'last_policy_eval_time_sec'):
+                policy_eval_times.append(float(shielding.last_policy_eval_time_sec))
+            if hasattr(shielding, 'last_mip_solve_time_sec'):
+                mip_solve_times.append(float(shielding.last_mip_solve_time_sec))
             
             # Check feasibility (if result is exactly u_nom when unsafe? Logic inside handles it)
             # PCBF_Quad3D returns u_nom if failed.
@@ -392,7 +426,20 @@ def run_simulation(args):
         
         if step % 200 == 0:
             dist_goal = np.linalg.norm(current_state[:2] - env.goal_pos)
-            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[6:8]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")        # 4. Check Collision
+            print(f"STEP[{step}]: Pos={current_state[:2]} | Vel={current_state[6:8]} | GoalDist={dist_goal:.2f} | WP={nom_ctrl.wp_idx}/{len(nom_ctrl.waypoints)}")
+            if args.algo == 'mip_mpc' and hasattr(shielding, 'last_total_time_sec'):
+                print(
+                    "  MIP-MPC timing: total="
+                    f"{1000.0 * shielding.last_total_time_sec:.1f} ms, "
+                    f"rollout={1000.0 * getattr(shielding, 'last_policy_eval_time_sec', 0.0):.1f} ms, "
+                    f"mip={1000.0 * getattr(shielding, 'last_mip_solve_time_sec', 0.0):.1f} ms | "
+                    f"solver={getattr(shielding, 'last_solver_name', '?')} "
+                    f"status={getattr(shielding, 'last_solver_status', '?')} "
+                    f"policy={getattr(shielding, 'last_selected_policy_idx', -1)} "
+                    f"safety={getattr(shielding, 'last_selected_policy_safety', float('nan')):.3f}"
+                )
+
+        # 4. Check Collision
         # Static
         for obs in statics:
             dist = np.linalg.norm(current_state[:2] - np.array([obs['x'], obs['y']]))
@@ -449,16 +496,24 @@ def run_simulation(args):
     if saver: saver.export_video(f"{args.algo}_lvl{args.level}.mp4")
     if not args.no_render: plt.close(fig)
     
-    return {
+    result = {
         'nominal_tracking': nominal_track_steps / max(total_steps, 1),
         'collision': collision,
         'infeasible': infeasible,
         'reach_goal': reached_goal
     }
+    if solve_times:
+        result['avg_solve_ms'] = 1000.0 * float(np.mean(solve_times))
+        result['max_solve_ms'] = 1000.0 * float(np.max(solve_times))
+    if policy_eval_times:
+        result['avg_rollout_ms'] = 1000.0 * float(np.mean(policy_eval_times))
+    if mip_solve_times:
+        result['avg_mip_ms'] = 1000.0 * float(np.mean(mip_solve_times))
+    return result
 
 def run_sweep(args):
     print("Starting Benchmark Sweep...")
-    algos = ['pcbf', 'mpcbf', 'gatekeeper', 'mps', 'backup_cbf']
+    algos = ['pcbf', 'mpcbf', 'mip_mpc', 'gatekeeper', 'mps', 'backup_cbf']
     
     target_levels = range(6)
     if args.sweep_levels:
@@ -542,7 +597,7 @@ def plot_results(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
+    parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps'])
     parser.add_argument('--level', type=str, default='1')
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')

@@ -333,6 +333,10 @@ class MPCBF(PCBF):
         # Setup multi-policy visualization
         if ax is not None:
             self._setup_multi_visualization()
+
+        # For MPCBF visualization naming, keep terminology explicit.
+        if self.backup_traj_line is not None:
+            self.backup_traj_line.set_label('PL-CBF fallback rollout')
         
     def _setup_multi_policies(self):
         """Setup parameters for all backup policies."""
@@ -763,6 +767,34 @@ class MPCBF(PCBF):
                     line.set_zorder(17)
             else:
                 line.set_data([], [])
+
+    def _compute_policy_control(
+        self,
+        policy_name: str,
+        robot_state: np.ndarray,
+        u_nom: np.ndarray,
+    ) -> np.ndarray:
+        """Compute one-step control from the selected policy for QP fallback."""
+        if policy_name == 'nominal':
+            return np.array(u_nom, dtype=float).reshape(-1)
+
+        config = self.policy_configs.get(policy_name)
+        if config is None:
+            return np.array(u_nom, dtype=float).reshape(-1)
+
+        policy_type = config['type']
+        policy_params = config['params']
+        x_jax = jnp.array(robot_state)
+
+        if policy_type == 'lane_change':
+            u = np.array(LaneChangeControllerJAX.compute(x_jax, policy_params), dtype=float)
+            return u.reshape(-1)
+
+        if policy_type == 'stop':
+            u = np.array(StoppingControllerJAX.compute(x_jax, policy_params), dtype=float)
+            return u.reshape(-1)
+
+        return np.array(u_nom, dtype=float).reshape(-1)
     
     def solve_control_problem(
         self,
@@ -847,10 +879,7 @@ class MPCBF(PCBF):
         
         self.curr_step += 1
         
-        # ALWAYS solve the CBF-QP with the selected (most relaxed) constraint.
-        # If constraint > 0 at u_nom, the QP will naturally return u_nom since it's feasible.
-        # If constraint < 0 at u_nom, the QP will find minimal deviation to satisfy constraint.
-        
+
         # UPDATE QP ALPHA to match selected policy
         instance_alphas = getattr(self, 'alphas', {})
         if best_policy in instance_alphas:
@@ -859,8 +888,15 @@ class MPCBF(PCBF):
              self.cbf_alpha = POLICY_ALPHA[best_policy]
         # else keep existing self.cbf_alpha
         
-        # Solve CBF-QP with best policy's constraint
-        u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
+        # Solve CBF-QP with best policy's constraint.
+        try:
+            u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
+        except ValueError as err:
+            if V_best > 0.0:
+                self.status = 'policy_fallback'
+                u_safe = self._compute_policy_control(best_policy, robot_state, u_nom)
+            else:
+                raise err
         
         # Update visualization
         self._update_multi_visualization(traj_dict, best_policy)
@@ -884,4 +920,3 @@ class MPCBF(PCBF):
             self.multi_backup_trajs[name].clear()
         self.backup_trajs.clear()
         
-

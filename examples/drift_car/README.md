@@ -44,7 +44,31 @@ uv run python examples/drift_car/test_drift_pcbf.py --test straight_safe --algo 
 ## Arguments
 
 - `--test`: Scenarios include `high_friction`, `low_friction`, `puddle_surprise`, `straight_safe`, `far_left_safe`.
-- `--algo`: Safety filter algorithms: `pcbf`, `mpcbf`, `gatekeeper`, `mps`.
+- `--algo`: Safety filter algorithms: `pcbf`, `mpcbf`, `gatekeeper`, `mps`, `backupcbf`.
 - `--obs`: Number of obstacles (1 or 2).
 - `--max-operator`: Selection operator for MPCBF. The default is `input_space`.
 - `--save`: Optional flag to save the animation as a video.
+
+## Representative 13-Case Animation Set (Black Ice, 2 Obstacles)
+
+The test name is fixed to `puddle_surprise` and `--obs 2` to match the black-ice surprise setup.
+
+```bash
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo mpcbf --backup lane_change
+
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo backupcbf --backup stop
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo backupcbf --backup lane_change_left
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo backupcbf --backup lane_change_right
+
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo mps --backup stop
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo mps --backup lane_change_left
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo mps --backup lane_change_right
+
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo gatekeeper --backup stop
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo gatekeeper --backup lane_change_left
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo gatekeeper --backup lane_change_right
+
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo pcbf --backup stop
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo pcbf --backup lane_change_left
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo pcbf --backup lane_change_right
+```

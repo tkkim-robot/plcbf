@@ -426,6 +426,28 @@ class PCBF(PCBFBase):
         except cp.error.SolverError as e:
             self.status = 'error'
             raise ValueError(f"CBF-QP solver error: {e}")
+
+    def _compute_backup_policy_control(self, robot_state: np.ndarray) -> np.ndarray:
+        """Compute one-step backup policy control for infeasibility fallback."""
+        x_jax = jnp.array(robot_state)
+
+        if self.policy_type == 'lane_change' and self.policy_params is not None:
+            u = np.array(LaneChangeControllerJAX.compute(x_jax, self.policy_params), dtype=float)
+            return u.reshape(-1)
+
+        if self.policy_type == 'stop' and self.policy_params is not None:
+            u = np.array(StoppingControllerJAX.compute(x_jax, self.policy_params), dtype=float)
+            return u.reshape(-1)
+
+        if self.policy_type == 'custom' and self.backup_policy_jax is not None:
+            if hasattr(self.backup_policy_jax, "compute_control_numpy"):
+                u = np.array(self.backup_policy_jax.compute_control_numpy(np.array(robot_state)), dtype=float)
+                return u.reshape(-1)
+            if hasattr(self.backup_policy_jax, "__call__"):
+                u = np.array(self.backup_policy_jax(x_jax), dtype=float)
+                return u.reshape(-1)
+
+        return np.zeros(2, dtype=float)
     
     def solve_control_problem(
         self,
@@ -470,7 +492,15 @@ class PCBF(PCBFBase):
         f = np.array(self.dynamics.f_full(x0_jax, self.current_friction))
         G = np.array(self.dynamics.g_full(x0_jax))
         
-        u_safe = self._solve_cbf_qp(u_nom, V, grad_V, f, G)
+        try:
+            u_safe = self._solve_cbf_qp(u_nom, V, grad_V, f, G)
+        except ValueError as err:
+            # Fair fallback: use the backup policy only when its safety value is positive.
+            if V > 0.0:
+                self.status = 'policy_fallback'
+                u_safe = self._compute_backup_policy_control(robot_state)
+            else:
+                raise err
         
         self._update_visualization(trajectory)
         
@@ -482,7 +512,7 @@ class PCBF(PCBFBase):
             return
         self.backup_traj_line, = self.ax.plot(
             [], [], '-', color='cyan', linewidth=2, alpha=0.8,
-            label='PCBF backup rollout', zorder=18
+            label='PCBF fallback rollout', zorder=18
         )
     
     def _update_visualization(self, trajectory: np.ndarray):
