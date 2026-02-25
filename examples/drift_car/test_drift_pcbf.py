@@ -57,6 +57,7 @@ Examples:
 
 import sys
 import os
+import time
 
 # Add project root to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
@@ -72,6 +73,7 @@ from safe_control.envs.drifting_env import DriftingEnv
 from safe_control.robots.drifting_car import DriftingCar, DriftingCarSimulator
 from safe_control.position_control.mpcc import MPCC
 from safe_control.position_control.backup_controller import LaneChangeController, StoppingController
+from safe_control.position_control.backup_cbf_qp import BackupCBF
 from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
@@ -82,10 +84,65 @@ from examples.drift_car.algorithms.mpcbf_drift import MPCBF, MAX_OPERATOR_TYPES
 
 
 # =============================================================================
+# Helper Controllers (Script-local)
+# =============================================================================
+
+def _angle_normalize_np(x: float) -> float:
+    """Normalize angle to [-pi, pi]."""
+    return float(((x + np.pi) % (2.0 * np.pi)) - np.pi)
+
+
+class JAXAlignedLaneChangeController(LaneChangeController):
+    """
+    Lane-change backup controller with control law matched to the JAX version.
+    This is local to this test script to avoid side effects in shared modules.
+    """
+
+    def __init__(self, robot_spec, dt, direction='left'):
+        super().__init__(robot_spec, dt, direction=direction)
+        # Match examples/drift_car/controllers/drift_policies_jax.py defaults.
+        self.Kp_y = 0.15
+        self.Kp_theta = 1.5
+        self.Kd_theta = 0.3
+        self.Kp_delta = 3.0
+        self.Kp_v = 500.0
+        self.Kp_tau_dot = 2.0
+        self.target_velocity = robot_spec.get('v_ref', 8.0)
+        self.theta_des_max = np.deg2rad(15.0)
+
+    def compute_control(self, state, target_y):
+        x, y, theta, r, beta, V, delta, tau = state.flatten()
+        V = max(V, 0.1)
+
+        # Match JAX implementation exactly: no lateral velocity damping, use theta only.
+        y_error = target_y - y
+        theta_des = np.arctan(self.Kp_y * y_error)
+        theta_des = np.clip(theta_des, -self.theta_des_max, self.theta_des_max)
+
+        theta_error = _angle_normalize_np(theta_des - theta)
+        delta_des = self.Kp_theta * theta_error - self.Kd_theta * r
+        delta_des = np.clip(delta_des, -self.delta_max, self.delta_max)
+
+        delta_error = delta_des - delta
+        delta_dot = self.Kp_delta * delta_error
+        delta_dot = np.clip(delta_dot, -self.delta_dot_max, self.delta_dot_max)
+
+        V_error = self.target_velocity - V
+        tau_des = self.Kp_v * V_error
+        tau_des = np.clip(tau_des, -self.tau_max, self.tau_max)
+
+        tau_error = tau_des - tau
+        tau_dot = self.Kp_tau_dot * tau_error
+        tau_dot = np.clip(tau_dot, -self.tau_dot_max, self.tau_dot_max)
+
+        return np.array([[delta_dot], [tau_dot]])
+
+
+# =============================================================================
 # Algorithm Types
 # =============================================================================
 
-ALGO_TYPES = ['gatekeeper', 'mps', 'pcbf', 'mpcbf']
+ALGO_TYPES = ['gatekeeper', 'mps', 'backupcbf', 'pcbf', 'mpcbf']
 
 
 # =============================================================================
@@ -173,6 +230,7 @@ class SimulationConfig:
     initial_velocity: float = 10.0        # Starting velocity [m/s]
     target_velocity: float = 10.0         # Target velocity [m/s]
     pcbf_alpha: float = 5.0              # PCBF class-K function parameter (lower = activates earlier)
+    timing_warmup_steps_jax: int = 5     # Steps to skip for JAX compile warmup in timing stats
 
 
 @dataclass
@@ -215,6 +273,7 @@ class TestConfig:
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
     max_operator: str = 'input_space'  # MPCBF selection operator: 'c', 'v', or 'input_space'
+    no_render: bool = False  # Disable rendering/plotting for compute-time evaluation
 
 
 # =============================================================================
@@ -233,10 +292,15 @@ def setup_environment(config: TestConfig) -> Tuple[DriftingEnv, plt.Axes, plt.Fi
         num_lanes=track.num_lanes
     )
     
+    if config.no_render:
+        return env, None, None
+
     plt.ion()
     ax, fig = env.setup_plot()
     algo_name = config.algo_type.upper()
     fig.canvas.manager.set_window_title(f'{algo_name} Test: {config.name}')
+    # Reserve space on the right for an outside legend.
+    fig.subplots_adjust(right=0.79)
     
     return env, ax, fig
 
@@ -305,7 +369,7 @@ def setup_controllers(
         # Determine direction based on backup type
         if config.backup_type == 'lane_change_left':
             direction = 'left'
-            backup_target = max(left_lane_y, 5.0)  # At least 5.0 to clear obstacle
+            backup_target = left_lane_y
         elif config.backup_type == 'lane_change_left_2':
             direction = 'left_2'
             # Assuming lane width is 4.0, or derived from difference
@@ -315,23 +379,23 @@ def setup_controllers(
             print(f"  Using LANE CHANGE LEFT 2 (target y={backup_target:.2f})")
         elif config.backup_type == 'lane_change_right':
             direction = 'right'
-            backup_target = min(right_lane_y, -5.0)  # At least -5.0 to clear obstacle
+            backup_target = right_lane_y
         else:  # 'lane_change' - auto-select based on number of obstacles
             # With 2 obstacles (middle lane + left lane), go right
             # With 1 obstacle (middle lane only), go left
             if config.num_obstacles >= 2:
                 direction = 'right'
-                backup_target = min(right_lane_y, -5.0)
+                backup_target = right_lane_y
             else:
                 direction = 'left'
-                backup_target = max(left_lane_y, 5.0)
+                backup_target = left_lane_y
         
         
         # For left_2, we use explicit target with 'left' direction controller logic
         # Ideally the controller class handles 'left' generally if given a target
         ctrl_direction = 'left' if config.backup_type == 'lane_change_left_2' else direction
         
-        backup_controller = LaneChangeController(car.robot_spec, sim.dt, direction=ctrl_direction)
+        backup_controller = JAXAlignedLaneChangeController(car.robot_spec, sim.dt, direction=ctrl_direction)
         print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
@@ -364,6 +428,15 @@ def setup_controllers(
             ax=ax
         )
         print(f"  Using PCBF algorithm (CBF-QP with backup rollout)")
+    elif config.algo_type == 'backupcbf':
+        shielding = BackupCBF(
+            robot=car,
+            robot_spec=car.robot_spec,
+            dt=sim.dt,
+            backup_horizon=sim.backup_horizon_time,
+            ax=ax
+        )
+        print(f"  Using BackupCBF algorithm (single backup policy CBF-QP)")
     elif config.algo_type == 'mps':
         shielding = MPS(
             robot=car,
@@ -426,26 +499,34 @@ def setup_obstacles_and_puddles(
 
 
 def setup_visualization(
-    ax: plt.Axes, 
+    ax: Optional[plt.Axes], 
     env: DriftingEnv, 
     middle_lane_y: float, 
     left_lane_y: float,
     right_lane_y: float
 ) -> Tuple:
     """Setup visualization elements."""
+    if ax is None:
+        return None, None
+
     ref_x = env.centerline[:, 0]
     
     # Reference paths
     ax.plot(ref_x, np.full_like(ref_x, middle_lane_y), 
             'g-', linewidth=1, alpha=0.3, label='Reference (middle lane)')
     ax.plot(ref_x, np.full_like(ref_x, left_lane_y), 
-            'orange', linewidth=1, alpha=0.3, linestyle=':', label='Backup target')
+            'orange', linewidth=1, alpha=0.3, linestyle=':', label='_nolegend_')
     
     # Dynamic visualization
-    ref_horizon_line, = ax.plot([], [], 'y-', linewidth=3, alpha=0.9, label='MPCC horizon')
-    mpc_pred_line, = ax.plot([], [], 'r--', linewidth=2, alpha=0.8, label='MPCC prediction')
+    ref_horizon_line, = ax.plot([], [], 'y-', linewidth=3, alpha=0.9, label='MPCC reference')
+    mpc_pred_line, = ax.plot([], [], 'r--', linewidth=2, alpha=0.8, label='MPCC trajectory')
     
-    ax.legend(loc='upper right', fontsize=8)
+    ax.legend(
+        loc='upper left',
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
+        fontsize=9,  # Slightly larger than previous value (8)
+    )
     
     return ref_horizon_line, mpc_pred_line
 
@@ -463,8 +544,8 @@ def run_simulation(
     simulator: DriftingCarSimulator,
     ref_horizon_line,
     mpc_pred_line,
-    ax: plt.Axes,
-    fig: plt.Figure,
+    ax: Optional[plt.Axes],
+    fig: Optional[plt.Figure],
     animation_saver: Optional[AnimationSaver] = None,
 ) -> Dict[str, Any]:
     """Run the simulation loop and return results."""
@@ -480,8 +561,30 @@ def run_simulation(
     backup_steps = 0
     collision_occurred = False
     collision_step = None
-    
+    solve_times_s = []
+    solve_calls = 0
+    warmup_skip = sim.timing_warmup_steps_jax if isinstance(shielding, (PCBF, MPCBF)) else 0
+
     print(f"\nRunning simulation for {sim.tf}s...")
+
+    def draw_terminal_marker_and_hold(marker_pos):
+        """Draw terminal marker and hold final frame for ~1 second."""
+        if ax is None or fig is None:
+            return
+        # Remove any pre-existing exclamation markers to avoid duplicates.
+        for txt in list(ax.texts):
+            if txt.get_text() == "!":
+                txt.remove()
+        ax.text(
+            marker_pos[0], marker_pos[1], "!",
+            color='red', fontsize=40, fontweight='bold',
+            ha='center', va='center', zorder=100
+        )
+        plt.draw()
+        if animation_saver is not None:
+            hold_frames = max(1, int(getattr(animation_saver, 'fps', 30)))
+            for _ in range(hold_frames):
+                animation_saver.save_frame(fig, force=True)
     
     for step in range(num_steps):
         state = car.get_state()
@@ -506,8 +609,8 @@ def run_simulation(
             mpcc_control = mpcc.solve_control_problem(state)
             pred_states, pred_controls = mpcc.get_full_predictions()
             
-            # For Gatekeeper and MPS, set the nominal trajectory
-            if isinstance(shielding, (Gatekeeper, MPS)):
+            # For baseline shielding methods, supply externally planned nominal trajectory.
+            if isinstance(shielding, (BackupCBF, Gatekeeper, MPS)):
                 if pred_states is not None and pred_controls is not None:
                     shielding.set_nominal_trajectory(pred_states, pred_controls)
         except Exception as e:
@@ -518,6 +621,8 @@ def run_simulation(
         # Shielding validates and returns committed control
         # Shielding validates and returns committed control
         try:
+            solve_calls += 1
+            solve_t0 = time.perf_counter()
             if isinstance(shielding, MPCBF):
                 # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
                 control_ref = {'u_ref': mpcc_control}
@@ -535,13 +640,21 @@ def run_simulation(
             else:
                 # Gatekeeper/MPS
                 U = shielding.solve_control_problem(state, friction=car.get_friction())
+            solve_dt = time.perf_counter() - solve_t0
+            if solve_calls > warmup_skip:
+                solve_times_s.append(solve_dt)
         except ValueError as e:
+            solve_dt = time.perf_counter() - solve_t0
+            if solve_calls > warmup_skip:
+                solve_times_s.append(solve_dt)
             print(f"\n*** INFEASIBLE: {e} ***")
-            # Draw a large red exclamation mark
-            ax.text(pos[0], pos[1], "!", color='red', fontsize=40, fontweight='bold', 
-                    ha='center', va='center', zorder=100)
-            plt.draw()
-            plt.pause(3.0)
+            # Show infeasible terminal marker and keep it visible in exported video.
+            if not config.no_render:
+                env.update_plot_frame(ax, pos, window_size=window_size)
+                simulator.draw_plot(pause=0.001)
+            draw_terminal_marker_and_hold(pos)
+            if not config.no_render:
+                plt.pause(0.2)
             
             # Return failure result
             result = {
@@ -552,7 +665,10 @@ def run_simulation(
                 'backup_steps': backup_steps,
                 'nominal_ratio': nominal_steps / max(step, 1),
                 'backup_ratio': backup_steps / max(step, 1),
-                'passed': False
+                'passed': False,
+                'avg_safety_solve_ms': float(1000.0 * np.mean(solve_times_s)) if len(solve_times_s) > 0 else float('nan'),
+                'timing_samples': len(solve_times_s),
+                'timing_warmup_skipped': warmup_skip,
             }
             return result
         
@@ -568,14 +684,17 @@ def run_simulation(
         # Update visualizations
         ref_horizon = mpcc.get_reference_horizon()
         if ref_horizon is not None:
-            ref_horizon_line.set_data(ref_horizon[0, :], ref_horizon[1, :])
+            if ref_horizon_line is not None:
+                ref_horizon_line.set_data(ref_horizon[0, :], ref_horizon[1, :])
         
         pred_states_viz, _ = mpcc.get_predictions()
         if pred_states_viz is not None:
-            mpc_pred_line.set_data(pred_states_viz[0, :], pred_states_viz[1, :])
+            if mpc_pred_line is not None:
+                mpc_pred_line.set_data(pred_states_viz[0, :], pred_states_viz[1, :])
         
-        env.update_plot_frame(ax, pos, window_size=window_size)
-        simulator.draw_plot(pause=0.001)
+        if not config.no_render:
+            env.update_plot_frame(ax, pos, window_size=window_size)
+            simulator.draw_plot(pause=0.001)
         
         # Save animation frame
         if animation_saver is not None:
@@ -600,10 +719,11 @@ def run_simulation(
             collision_step = step
             collision_type = getattr(simulator, 'collision_type', 'unknown')
             print(f"\n*** COLLISION ({collision_type}) at step {step} ***")
-            print(f"  Position: ({pos[0]:.2f}, {pos[1]:.2f})")
-            if animation_saver is not None:
-                animation_saver.save_frame(fig, force=True)
-            plt.pause(2.0)
+            collision_pos = car.get_position()
+            print(f"  Position: ({collision_pos[0]:.2f}, {collision_pos[1]:.2f})")
+            draw_terminal_marker_and_hold(collision_pos)
+            if not config.no_render:
+                plt.pause(0.2)
             break
         
         # End if reached track end
@@ -613,6 +733,7 @@ def run_simulation(
     
     # Return results
     total_steps = nominal_steps + backup_steps
+    avg_solve_ms = float(1000.0 * np.mean(solve_times_s)) if len(solve_times_s) > 0 else float('nan')
     return {
         'collision': collision_occurred,
         'collision_step': collision_step,
@@ -621,6 +742,9 @@ def run_simulation(
         'backup_steps': backup_steps,
         'nominal_ratio': nominal_steps / max(total_steps, 1),
         'backup_ratio': backup_steps / max(total_steps, 1),
+        'avg_safety_solve_ms': avg_solve_ms,
+        'timing_samples': len(solve_times_s),
+        'timing_warmup_skipped': warmup_skip,
     }
 
 
@@ -642,10 +766,13 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     setup_obstacles_and_puddles(config, env, middle_lane_y, left_lane_y, right_lane_y)
     ref_horizon_line, mpc_pred_line = setup_visualization(ax, env, middle_lane_y, left_lane_y, right_lane_y)
     
-    simulator = DriftingCarSimulator(car, env, show_animation=True)
+    simulator = DriftingCarSimulator(car, env, show_animation=(not config.no_render))
     
     # Setup animation saver if enabled
     animation_saver = None
+    if config.save_animation and config.no_render:
+        print("\n  `--save` requires rendering. Disabling save because `--no-render` is set.")
+        config.save_animation = False
     if config.save_animation:
         # Create unique output directory for this test
         safe_name = config.name.lower().replace(' ', '_')
@@ -679,6 +806,10 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     print(f"  Total steps: {results['total_steps']}")
     print(f"  Nominal: {results['nominal_steps']} ({100*results['nominal_ratio']:.1f}%)")
     print(f"  Backup: {results['backup_steps']} ({100*results['backup_ratio']:.1f}%)")
+    print(
+        f"  Avg safety solve time: {results.get('avg_safety_solve_ms', float('nan')):.3f} ms "
+        f"(samples={results.get('timing_samples', 0)}, warmup_skipped={results.get('timing_warmup_skipped', 0)})"
+    )
     
     # Check expectation
     # Test FAILS if:
@@ -699,10 +830,10 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     print("-" * 50)
     
     # Pause to see the result if failed or finished
-    plt.pause(3.0)
-    
-    plt.ioff()
-    plt.close('all')
+    if not config.no_render:
+        plt.pause(3.0)
+        plt.ioff()
+        plt.close('all')
     
     return results
 
@@ -827,13 +958,13 @@ def create_far_left_safe_test() -> TestConfig:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/PCBF)')
+    parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/BackupCBF/PCBF/MPCBF)')
     parser.add_argument('--test', type=str, default='high_friction',
                         choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'far_left_safe', 'all'],
                         help='Which test to run')
     parser.add_argument('--algo', type=str, default='pcbf',
                         choices=ALGO_TYPES,
-                        help='Shielding algorithm: gatekeeper, mps, or pcbf (default)')
+                        help='Shielding algorithm: gatekeeper, mps, backupcbf, pcbf, or mpcbf')
     parser.add_argument('--backup', type=str, default='lane_change',
                         choices=BACKUP_TYPES,
                         help='Backup controller type: lane_change (default) or stop')
@@ -842,6 +973,8 @@ def main():
                         help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
+    parser.add_argument('--no-render', action='store_true',
+                        help='Disable plotting/animation rendering (for compute-time measurement)')
     parser.add_argument('--max-operator', type=str, default='input_space',
                         choices=MAX_OPERATOR_TYPES,
                         help=f"Selection operator (default: input_space, choices: {MAX_OPERATOR_TYPES})")
@@ -934,6 +1067,7 @@ def main():
             config.backup_type = args.backup
             config.num_obstacles = args.obs
             config.max_operator = getattr(args, 'max_operator', 'c')
+            config.no_render = args.no_render
             # Update expected collision based on configuration
             config.expected_collision = get_expected_collision(name, args.backup, args.obs, args.algo)
             # Update name to include algo, backup type and obstacle count
@@ -961,6 +1095,7 @@ def main():
         config.backup_type = args.backup
         config.num_obstacles = args.obs
         config.max_operator = getattr(args, 'max_operator', 'c')
+        config.no_render = args.no_render
         # Update expected collision based on configuration
         config.expected_collision = get_expected_collision(args.test, args.backup, args.obs, args.algo)
         # Update name to include algo, backup type and obstacle count
@@ -972,4 +1107,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
