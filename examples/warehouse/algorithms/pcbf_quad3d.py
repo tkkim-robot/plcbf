@@ -20,7 +20,7 @@ from examples.warehouse.controllers.policies_quad3d_jax import (
     _clip_xy_accel, _accel_to_u
 )
 from examples.drift_car.algorithms.pcbf_drift import smooth_min
-from mpcbf.pcbf import PCBFBase
+from plcbf.pcbf import PCBFBase
 
 
 # =============================================================================

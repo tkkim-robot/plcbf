@@ -1,7 +1,7 @@
 """
 Mixed-integer MPC baseline for Warehouse Quad3D.
 
-This is a deliberately heavy baseline for runtime comparison with MPCBF:
+This is a deliberately heavy baseline for runtime comparison with PLCBF:
 - Build fallback rollouts for many angle policies (32/64 tunable)
 - Compute per-policy safety value V_i = min_t h_i(t)
 - Solve a mixed-integer MPC with OR-style policy-selection constraints

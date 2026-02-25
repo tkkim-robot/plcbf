@@ -3,10 +3,10 @@ Created on February 9th, 2026
 @author: Taekyung Kim
 
 @description:
-Base class for MPCBF (Multiple Policy Control Barrier Function) implementations.
+Base class for PLCBF (Multiple Policy Control Barrier Function) implementations.
 
-MPCBF extends PCBF by evaluating multiple backup policies and selecting the best one.
-The structure is: MPCBFBase extends PCBFBase, adding multi-policy logic.
+PLCBF extends PCBF by evaluating multiple backup policies and selecting the best one.
+The structure is: PLCBFBase extends PCBFBase, adding multi-policy logic.
 
 Key differences from PCBF:
 1. Maintains multiple policy configurations
@@ -20,7 +20,7 @@ Subclasses should:
 - Override `solve_control_problem()` to add multi-policy evaluation
 
 Example:
-    class MPCBF_Scenario(PCBF_Scenario):
+    class PLCBF_Scenario(PCBF_Scenario):
         def _setup_policies(self):
             # Define multiple backup policies
             pass
@@ -30,10 +30,10 @@ Example:
             pass
 """
 
-from mpcbf.pcbf import PCBFBase
+from plcbf.pcbf import PCBFBase
 
-# MPCBFBase is conceptually an extension of PCBFBase
-# In practice, scenario-specific MPCBF classes inherit from their PCBF class
-# Example: MPCBF_DI(PCBF_DI) where PCBF_DI(PCBFBase)
+# PLCBFBase is conceptually an extension of PCBFBase
+# In practice, scenario-specific PLCBF classes inherit from their PCBF class
+# Example: PLCBF_DI(PCBF_DI) where PCBF_DI(PCBFBase)
 
-__all__ = ['PCBFBase']  # Re-export for MPCBF implementations
+__all__ = ['PCBFBase']  # Re-export for PLCBF implementations

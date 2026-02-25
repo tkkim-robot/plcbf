@@ -31,7 +31,7 @@ from examples.drift_car.controllers.drift_policies_jax import (
 )
 
 # Import base class
-from mpcbf.pcbf import PCBFBase
+from plcbf.pcbf import PCBFBase
 
 # =============================================================================
 # Value Function Computation

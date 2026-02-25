@@ -3,9 +3,9 @@ Created on January 7th, 2026
 @author: Taekyung Kim
 
 @description:
-Multiple Policy Control Barrier Function (MPCBF) implementation in JAX.
+Multiple Policy Control Barrier Function (PLCBF) implementation in JAX.
 
-MPCBF extends PCBF by maintaining multiple backup policies and selecting
+PLCBF extends PCBF by maintaining multiple backup policies and selecting
 the constraint from the policy with maximum CBF constraint value (Vdot + alpha*V).
 
 Multiple Policies:
@@ -25,7 +25,7 @@ Selection Criterion:
 - Select policy with max feasible space (by default) (most permissive constraint that's still safe)
 - Use that constraint in the QP
 
-@required-scripts: mpcbf/pcbf.py
+@required-scripts: plcbf/pcbf.py
 """
 
 import functools as ft
@@ -267,10 +267,10 @@ POLICY_ALPHA = {
 
 
 # =============================================================================
-# MPCBF Controller
+# PLCBF Controller
 # =============================================================================
 
-class MPCBF(PCBF):
+class PLCBF(PCBF):
     """
     Multiple Policy Control Barrier Function controller.
     
@@ -293,7 +293,7 @@ class MPCBF(PCBF):
         ax=None
     ):
         """
-        Initialize the MPCBF controller.
+        Initialize the PLCBF controller.
         
         Args:
             max_operator: Selection operator for choosing best policy:
@@ -334,7 +334,7 @@ class MPCBF(PCBF):
         if ax is not None:
             self._setup_multi_visualization()
 
-        # For MPCBF visualization naming, keep terminology explicit.
+        # For PLCBF visualization naming, keep terminology explicit.
         if self.backup_traj_line is not None:
             self.backup_traj_line.set_label('PL-CBF fallback rollout')
         
@@ -805,7 +805,7 @@ class MPCBF(PCBF):
         nominal_controls: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Main MPCBF control loop - compute safe control using multi-policy CBF.
+        Main PLCBF control loop - compute safe control using multi-policy CBF.
         
         Selection is based on maximum CBF constraint value (Vdot + alpha*V),
         not just maximum V.
@@ -873,9 +873,9 @@ class MPCBF(PCBF):
             v_str = ", ".join([f"{k}:{V_dict[k]:.2f}" for k in sorted(V_dict.keys()) if V_dict[k] > -np.inf])
             score_str = ", ".join([f"{k}:{score_dict[k]:.2f}" for k in sorted(score_dict.keys()) if score_dict[k] > -np.inf])
             area_str = ", ".join([f"{k}:{area_dict.get(k, 0):.0f}" for k in sorted(V_dict.keys()) if k in area_dict])
-            print(f"  [MPCBF] V: {v_str}")
-            print(f"  [MPCBF] area: {area_str}")
-            print(f"  [MPCBF] {self.max_operator}: {score_str} -> best={best_policy}")
+            print(f"  [PLCBF] V: {v_str}")
+            print(f"  [PLCBF] area: {area_str}")
+            print(f"  [PLCBF] {self.max_operator}: {score_str} -> best={best_policy}")
         
         self.curr_step += 1
         
@@ -904,10 +904,10 @@ class MPCBF(PCBF):
         return u_safe.reshape(-1, 1)
     
     def get_status(self):
-        """Get current MPCBF status including best policy."""
+        """Get current PLCBF status including best policy."""
         status = super().get_status()
         status['best_policy'] = self.best_policy_name
-        status['algorithm'] = 'mpcbf'
+        status['algorithm'] = 'plcbf'
         return status
     
     def get_multi_backup_trajectories(self):

@@ -24,3 +24,5 @@ temp.sh
 wandb/
 
 docs/
+
+examples/drift_car/*.md

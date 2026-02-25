@@ -4,7 +4,7 @@ Created on February 4th, 2026
 
 @description:
 Test script for Warehouse Scenario with Double Integrator.
-Tests PCBF, MPCBF, Gatekeeper, MPS, and BackupCBF.
+Tests PCBF, PLCBF, Gatekeeper, MPS, and BackupCBF.
 """
 
 import sys
@@ -40,9 +40,9 @@ from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
-# Core algorithms (PCBF/MPCBF)
+# Core algorithms (PCBF/PLCBF)
 from examples.warehouse.algorithms.pcbf_di import PCBF_DI
-from examples.warehouse.algorithms.mpcbf_di import MPCBF_DI
+from examples.warehouse.algorithms.plcbf_di import PLCBF_DI
 from examples.warehouse.controllers.policies_di_jax import AnglePolicyJAX, AnglePolicyParams
 from examples.warehouse.dynamics.dynamics_di_jax import DIDynamicsParams
 
@@ -110,8 +110,8 @@ def setup_test(algo, level, safety_margin=0.5):
             
         filter_algo.set_environment(env)
             
-    elif algo == 'mpcbf':
-        filter_algo = MPCBF_DI(
+    elif algo == 'plcbf':
+        filter_algo = PLCBF_DI(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
             cbf_alpha=args.alpha, 
@@ -236,14 +236,14 @@ def run_simulation(args):
         statics = env.get_static_obstacles()
         
         # 2. Update Shielding Info
-        if args.algo in ['pcbf', 'mpcbf']:
+        if args.algo in ['pcbf', 'plcbf']:
             shielding.update_obstacles(ghosts, statics)
-            # PCBF/MPCBF need nominal reference u
+            # PCBF/PLCBF need nominal reference u
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
             
-            # Predict nominal trajectory for MPCBF visualization (optional)
-            if args.algo == 'mpcbf':
+            # Predict nominal trajectory for PLCBF visualization (optional)
+            if args.algo == 'plcbf':
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             
@@ -391,7 +391,7 @@ def run_simulation(args):
 
 def run_sweep(args):
     print("Starting Benchmark Sweep...")
-    algos = ['pcbf', 'mpcbf', 'gatekeeper', 'mps', 'backup_cbf']
+    algos = ['pcbf', 'plcbf', 'gatekeeper', 'mps', 'backup_cbf']
     
     target_levels = range(6)
     if args.sweep_levels:
@@ -475,7 +475,7 @@ def plot_results(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'backup_cbf', 'gatekeeper', 'mps'])
+    parser.add_argument('--algo', type=str, default='plcbf', choices=['pcbf', 'plcbf', 'backup_cbf', 'gatekeeper', 'mps'])
     parser.add_argument('--level', type=str, default='1')
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')

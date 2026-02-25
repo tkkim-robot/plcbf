@@ -2,7 +2,7 @@
 Benchmark for drift-car black-ice puddle-surprise scenario.
 
 Compares 13 variants:
-1) MPCBF (multi-policy)
+1) PLCBF (multi-policy)
 2) BackupCBF with 3 fixed backup policies (stop/left/right)
 3) MPS with 3 fixed backup policies (stop/left/right)
 4) Gatekeeper with 3 fixed backup policies (stop/left/right)
@@ -40,7 +40,7 @@ from safe_control.robots.drifting_car import DriftingCar, DriftingCarSimulator
 from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 
-from examples.drift_car.algorithms.mpcbf_drift import MPCBF
+from examples.drift_car.algorithms.plcbf_drift import PLCBF
 from examples.drift_car.algorithms.pcbf_drift import PCBF
 
 QUIET_SINK = open(os.devnull, "w", encoding="utf-8")
@@ -70,8 +70,8 @@ class SimConfig:
 class AlgoVariant:
     key: str
     label: str
-    algo: str  # mpcbf, backup_cbf, mps, gatekeeper, pcbf
-    backup_policy: Optional[str]  # None for mpcbf, else stop/lane_change_left/lane_change_right
+    algo: str  # plcbf, backup_cbf, mps, gatekeeper, pcbf
+    backup_policy: Optional[str]  # None for plcbf, else stop/lane_change_left/lane_change_right
 
 
 @dataclass(frozen=True)
@@ -123,7 +123,7 @@ def build_vehicle_spec() -> Dict[str, float]:
 
 def make_variants() -> List[AlgoVariant]:
     variants: List[AlgoVariant] = [
-        AlgoVariant("mpcbf", "MPCBF", "mpcbf", None),
+        AlgoVariant("plcbf", "PLCBF", "plcbf", None),
     ]
 
     families = [
@@ -278,8 +278,8 @@ def setup_shielding(
     lanes: Dict[str, float],
     cfg: SimConfig,
 ):
-    if variant.algo == "mpcbf":
-        shielding = MPCBF(
+    if variant.algo == "plcbf":
+        shielding = PLCBF(
             robot=car,
             robot_spec=car.robot_spec,
             dt=cfg.dt,
@@ -368,7 +368,7 @@ def solve_safe_control(
     pred_controls: Optional[np.ndarray],
     friction: float,
 ):
-    if variant.algo == "mpcbf":
+    if variant.algo == "plcbf":
         return shielding.solve_control_problem(
             state,
             control_ref={"u_ref": u_nom},

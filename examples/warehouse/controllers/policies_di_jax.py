@@ -3,7 +3,7 @@ Created on February 4th, 2026
 @author: Taekyung Kim
 
 @description:
-JAX-compatible backup policies for Double Integrator PCBF/MPCBF.
+JAX-compatible backup policies for Double Integrator PCBF/PLCBF.
 """
 
 from typing import NamedTuple

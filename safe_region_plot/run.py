@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from .dynamics_sim import DoubleIntegratorSim
 from .dynamics_hj import DoubleIntegratorHJ
 from .backup import StopBackupController, TurnBackupController
-from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, MPCBFWrapper
+from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, PLCBFWrapper
 from .analysis import compute_viability_kernel, evaluate_filter
 
 def main():
@@ -164,27 +164,27 @@ def main():
     eval_y = np.linspace(-2.5, 2.5, args.res)
     
     policies = ["stop", "turn"]
-    methods = ["BackupCBF", "MPS", "Gatekeeper", "PCBF", "MPCBF"]
+    methods = ["BackupCBF", "MPS", "Gatekeeper", "PCBF", "PLCBF"]
     colors = {
         'BackupCBF': 'blue', 
         'MPS': 'green', 
         'Gatekeeper': 'orange',
         'PCBF': 'purple',
-        'MPCBF': 'brown'
+        'PLCBF': 'brown'
     }
     fill_alphas = {
         'BackupCBF': 0.1, 
         'MPS': 0.2, 
         'Gatekeeper': 0.3,
         'PCBF': 0.15,
-        'MPCBF': 0.25
+        'PLCBF': 0.25
     }
 
     # Filter methods/policies if requested
     if args.method:
         if args.method not in methods:
             print(f"Warning: Method {args.method} not in default list " + str(methods))
-    all_methods = ['MPS', 'Gatekeeper', 'BackupCBF', 'PCBF', 'MPCBF']
+    all_methods = ['MPS', 'Gatekeeper', 'BackupCBF', 'PCBF', 'PLCBF']
     if args.method == 'ALL' or args.method is None:
         methods = all_methods
     else:
@@ -199,9 +199,9 @@ def main():
         
     for policy_name in policy_names:
         # Adaptive Alpha Configuration
-        if args.method == 'MPCBF':
+        if args.method == 'PLCBF':
              pcbf_alpha = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-             print(f"Processing policy: {policy_name} (MPCBF Alpha: {pcbf_alpha})")
+             print(f"Processing policy: {policy_name} (PLCBF Alpha: {pcbf_alpha})")
         elif policy_name == "stop":
             pcbf_alpha = 1.0
             print(f"Processing policy: {policy_name} (Alpha: {pcbf_alpha})")
@@ -212,7 +212,7 @@ def main():
         results = {}
         
         # Determine Backup Controller
-        if policy_name in ["turn_up", "turn_down"] and args.method != 'MPCBF':
+        if policy_name in ["turn_up", "turn_down"] and args.method != 'PLCBF':
              # Force direction using potential field threshold
              # turn_up: decision_y = -100 (y > -100 -> UP)
              # turn_down: decision_y = 100 (y < 100 -> DOWN)
@@ -223,9 +223,9 @@ def main():
             
         for method in methods:
             # File Handling
-            if method == 'MPCBF':
-                # Force shared file for MPCBF
-                method_file = os.path.join(args.save_path, f"result_MPCBF_shared_res{args.res}.npz")
+            if method == 'PLCBF':
+                # Force shared file for PLCBF
+                method_file = os.path.join(args.save_path, f"result_PLCBF_shared_res{args.res}.npz")
             else:
                 method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
             
@@ -245,7 +245,7 @@ def main():
                     'MPS': MPSWrapper, 
                     'Gatekeeper': GatekeeperWrapper, 
                     'PCBF': PCBFWrapper, 
-                    'MPCBF': MPCBFWrapper
+                    'PLCBF': PLCBFWrapper
                 }[method]
                 
                 # MockEnv definition (local)
@@ -270,11 +270,11 @@ def main():
                     
                     if method == "BackupCBF":
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
-                    elif method == "MPCBF":
-                         # MPCBF MUST use the fixed heterogeneous alpha dict for Grid Generation too!
+                    elif method == "PLCBF":
+                         # PLCBF MUST use the fixed heterogeneous alpha dict for Grid Generation too!
                          # This resolves the discrepancy between Stop/Turn plots.
-                         mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                         plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
                     elif method == "PCBF":
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
                     else:
@@ -293,7 +293,7 @@ def main():
                     if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock)
                     if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock)
                     if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock)
-                    if hasattr(fw, 'set_environment'): fw.set_environment(env_mock) # For PCBF/MPCBF custom methods
+                    if hasattr(fw, 'set_environment'): fw.set_environment(env_mock) # For PCBF/PLCBF custom methods
                     
                     return fw
 
@@ -309,7 +309,7 @@ def main():
         if args.subfigures:
             # 5 methods -> 5 columns? Or 2 rows, 3 cols (one empty)?
             # User wants: "put these two new figure next to gatekeeeper"
-            # Current: BCBF, MPS, GK. New: PCBF, MPCBF. Total 5.
+            # Current: BCBF, MPS, GK. New: PCBF, PLCBF. Total 5.
             # Layout: 2 rows (Boundary, Safe Set). 5 Columns.
             fig, axes = plt.subplots(2, 5, figsize=(25, 10))
             fig.suptitle(f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])", fontsize=20)
@@ -408,13 +408,13 @@ def main():
                         is_safe_traj = True
                         
                         # Re-init filter for this trajectory
-                        wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'MPCBF': MPCBFWrapper}[method]
+                        wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'PLCBF': PLCBFWrapper}[method]
                         if method == "BackupCBF":
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
-                        elif method == "MPCBF":
-                             # MPCBF MUST use the fixed heterogeneous alpha dict regardless of the current plot policy
-                             mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                        elif method == "PLCBF":
+                             # PLCBF MUST use the fixed heterogeneous alpha dict regardless of the current plot policy
+                             plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
                         elif method == "PCBF":
                              fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
                         else:

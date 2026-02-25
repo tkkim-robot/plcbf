@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import os
 from safe_control.robots.double_integrator2D import DoubleIntegrator2D
 from safe_region_plot.backup import StopBackupController, TurnBackupController
-from safe_region_plot.filters import MPCBFWrapper
+from safe_region_plot.filters import PLCBFWrapper
 
 def debug_pcbf_traj():
     print("Initializing PCBF Debug Trajectory...")
@@ -55,10 +55,10 @@ def debug_pcbf_traj():
     # backup_controller = StopBackupController(a_max=robot_spec['a_max'])
     backup_controller = TurnBackupController(a_max=robot_spec['a_max'])
     
-    # MPCBF Wrapper with Heterogeneous Alphas
+    # PLCBF Wrapper with Heterogeneous Alphas
     alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
     
-    fw = MPCBFWrapper(
+    fw = PLCBFWrapper(
         robot, robot_spec, backup_controller, 
         dt=dt, 
         backup_horizon=t_max, 
@@ -197,7 +197,7 @@ def debug_pcbf_traj():
     ax.grid(True)
     ax.legend()
     
-    out_path = 'safe_region_plot/output/debug_mpcbf_traj.png'
+    out_path = 'safe_region_plot/output/debug_plcbf_traj.png'
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_path)

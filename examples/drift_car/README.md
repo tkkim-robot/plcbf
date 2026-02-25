@@ -1,6 +1,6 @@
 # Drift Car Safety Shielding Examples
 
-This directory contains examples of safety filters (PCBF and MPCBF) applied to a drifting car model.
+This directory contains examples of safety filters (PCBF and PLCBF) applied to a drifting car model.
 
 ## Running Tests
 
@@ -20,33 +20,33 @@ Standard safety test in nominal high-friction conditions.
 # PCBF Baseline
 uv run python examples/drift_car/test_drift_pcbf.py --test high_friction --algo pcbf --obs 1
 
-# MPCBF (Multi-Policy)
-uv run python examples/drift_car/test_drift_pcbf.py --test high_friction --algo mpcbf --obs 1
+# PLCBF (Multi-Policy)
+uv run python examples/drift_car/test_drift_pcbf.py --test high_friction --algo plcbf --obs 1
 ```
 
 #### 2. Puddle Surprise (Dynamic Refinement)
 Evaluate how the filters handle an unexpected low-friction puddle.
 ```bash
-# MPCBF with 1 obstacle
-uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --algo mpcbf --obs 1
+# PLCBF with 1 obstacle
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --algo plcbf --obs 1
 
-# MPCBF with 2 obstacles (Blocks left lane, forces right maneuver)
-uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --algo mpcbf --obs 2
+# PLCBF with 2 obstacles (Blocks left lane, forces right maneuver)
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --algo plcbf --obs 2
 ```
 
 #### 3. Nominal Tracking Performance
-MPCBF typically exhibits superior tracking performance compared to standard PCBF by selecting policies that better align with the nominal intent while maintaining safety.
+PLCBF typically exhibits superior tracking performance compared to standard PCBF by selecting policies that better align with the nominal intent while maintaining safety.
 ```bash
 # Test nominal tracking in a safe scenario
-uv run python examples/drift_car/test_drift_pcbf.py --test straight_safe --algo mpcbf
+uv run python examples/drift_car/test_drift_pcbf.py --test straight_safe --algo plcbf
 ```
 
 ## Arguments
 
 - `--test`: Scenarios include `high_friction`, `low_friction`, `puddle_surprise`, `straight_safe`, `far_left_safe`.
-- `--algo`: Safety filter algorithms: `pcbf`, `mpcbf`, `gatekeeper`, `mps`, `backupcbf`.
+- `--algo`: Safety filter algorithms: `pcbf`, `plcbf`, `gatekeeper`, `mps`, `backupcbf`.
 - `--obs`: Number of obstacles (1 or 2).
-- `--max-operator`: Selection operator for MPCBF. The default is `input_space`.
+- `--max-operator`: Selection operator for PLCBF. The default is `input_space`.
 - `--save`: Optional flag to save the animation as a video.
 
 ## Representative 13-Case Animation Set (Black Ice, 2 Obstacles)
@@ -54,7 +54,7 @@ uv run python examples/drift_car/test_drift_pcbf.py --test straight_safe --algo 
 The test name is fixed to `puddle_surprise` and `--obs 2` to match the black-ice surprise setup.
 
 ```bash
-uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo mpcbf --backup lane_change
+uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo plcbf --backup lane_change
 
 uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo backupcbf --backup stop
 uv run python examples/drift_car/test_drift_pcbf.py --test puddle_surprise --obs 2 --algo backupcbf --backup lane_change_left

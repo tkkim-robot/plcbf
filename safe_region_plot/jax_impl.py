@@ -4,7 +4,47 @@ import jax.numpy as jnp
 from typing import NamedTuple, Tuple, Callable
 import functools
 from jax.tree_util import register_pytree_node_class
-from mpcbf.pcbf import smooth_min, compute_value_function
+
+
+def smooth_min(x: jnp.ndarray, temperature: float = 10.0) -> float:
+    """Smooth approximation of min using negative log-sum-exp."""
+    neg_x = -x
+    x_max = jnp.max(neg_x)
+    smooth_max_neg = x_max + jnp.log(jnp.mean(jnp.exp(temperature * (neg_x - x_max)))) / temperature
+    return -smooth_max_neg
+
+
+def compute_value_function(
+    dynamics,
+    policy: Callable[[jnp.ndarray], jnp.ndarray],
+    x0: jnp.ndarray,
+    obs_x: float,
+    obs_y: float,
+    obs_r: float,
+    rob_r: float,
+    horizon: int,
+    mu: float = 1.0,
+):
+    """Compute smooth-min safety value over rollout trajectory for one obstacle."""
+    del mu  # Dynamics object already carries friction in this module.
+
+    def step_fn(state):
+        u = policy(state)
+        return dynamics.step_full_state(state, u)
+
+    def body_fn(carry, _):
+        x_next = step_fn(carry)
+        return x_next, x_next
+
+    _, traj = jax.lax.scan(body_fn, x0, None, length=horizon)
+    traj = jnp.vstack([x0[None, :], traj])
+
+    dx = traj[:, 0] - obs_x
+    dy = traj[:, 1] - obs_y
+    dist = jnp.sqrt(dx * dx + dy * dy + 1e-8)
+    h_vals = dist - (obs_r + rob_r)
+    v_val = smooth_min(h_vals, temperature=20.0)
+    return v_val, traj
 
 
 # =============================================================================
@@ -166,7 +206,7 @@ def turn_policy(state: jnp.ndarray, params: TurnPolicyParams) -> jnp.ndarray:
 
 
 # =============================================================================
-# Value Function (Reuse from mpcbf.pcbf)
+# Value Function (Reuse from plcbf.pcbf)
 # =============================================================================
 # compute_h and rollout_value removed as they are redundant.
 
@@ -232,6 +272,6 @@ def compute_value_and_grad_turn(
         return val, grad
     return val, jnp.zeros_like(state)
 
-# For MPCBF, we need to compute multiple policies efficiently
+# For PLCBF, we need to compute multiple policies efficiently
 # But since we have distinct policy structs, we can just call them separately or use a vmap if uniform.
 # Since they have different params types (Stop vs Turn), separate calls are fine.

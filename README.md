@@ -1,11 +1,11 @@
-# mpcbf
+# plcbf
 
 ## Installation
 
 1. Clone the repository with submodules:
 ```bash
-git clone --recurse-submodules https://github.com/tkkim-robot/mpcbf.git
-cd mpcbf
+git clone --recurse-submodules https://github.com/tkkim-robot/plcbf.git
+cd plcbf
 ```
 
 2. If you already cloned without submodules:

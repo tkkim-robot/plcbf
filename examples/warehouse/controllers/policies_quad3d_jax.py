@@ -3,7 +3,7 @@ Created on February 11th, 2026
 @author: Taekyung Kim
 
 @description:
-JAX-compatible backup policies for Quad3D PCBF/MPCBF.
+JAX-compatible backup policies for Quad3D PCBF/PLCBF.
 """
 
 from typing import NamedTuple

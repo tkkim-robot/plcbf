@@ -85,8 +85,8 @@ from .jax_impl import (
     compute_value_and_grad_stop, compute_value_and_grad_turn,
     DoubleIntegratorDynamicsJAX
 )
-from mpcbf.pcbf import PCBF
-from mpcbf.mpcbf import MPCBF
+from plcbf.pcbf import PCBF
+from plcbf.plcbf import PLCBF
 import cvxpy as cp
 
 
@@ -255,7 +255,7 @@ class PCBF_DI(PCBF):
          return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
 
 
-class MPCBF_DI(MPCBF):
+class PLCBF_DI(PLCBF):
     def __init__(self, robot, robot_spec, dt, backup_horizon, alpha, backup_controller):
         # Handle dict alpha for base class call (pass dummy or first value)
         base_alpha = alpha['stop'] if isinstance(alpha, dict) else alpha
@@ -393,9 +393,9 @@ class PCBFWrapper(BaseDIWrapper):
         controller = PCBF_DI(robot, robot_spec, dt, backup_horizon, alpha, backup_controller)
         super().__init__(controller)
 
-class MPCBFWrapper(BaseDIWrapper):
+class PLCBFWrapper(BaseDIWrapper):
     def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0, alpha=5.0):
-        controller = MPCBF_DI(robot, robot_spec, dt, backup_horizon, alpha, backup_controller)
+        controller = PLCBF_DI(robot, robot_spec, dt, backup_horizon, alpha, backup_controller)
         super().__init__(controller)
 
 

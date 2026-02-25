@@ -3,7 +3,7 @@ Created on February 11th, 2026
 @author: Taekyung Kim
 
 @description:
-MPCBF implementation for Quad3D (MPCBF_Quad3D).
+PLCBF implementation for Quad3D (PLCBF_Quad3D).
 """
 
 from typing import Dict
@@ -86,9 +86,9 @@ def _halfspace_box_volume(a, b, u_min, u_max, eps=1e-9):
 MAX_OPERATOR_TYPES = ['v', 'input_space']
 
 
-class MPCBF_Quad3D(PCBF_Quad3D):
+class PLCBF_Quad3D(PCBF_Quad3D):
     """
-    MPCBF for Quad3D.
+    PLCBF for Quad3D.
     Evaluates multiple policies and selects the best one.
     """
 
@@ -456,7 +456,7 @@ class MPCBF_Quad3D(PCBF_Quad3D):
         if self.debug and self.curr_step % 50 == 0:
             lg_norm = float(np.linalg.norm(grad_best @ g))
             g_norm = float(np.linalg.norm(grad_best))
-            print(f"[MPCBF_Quad3D] step={self.curr_step} best={best_name} V={V_best:.3f} time_dV={self._last_time_derivative:.3f} |g|={g_norm:.3f} |Lg|={lg_norm:.3f}")
+            print(f"[PLCBF_Quad3D] step={self.curr_step} best={best_name} V={V_best:.3f} time_dV={self._last_time_derivative:.3f} |g|={g_norm:.3f} |Lg|={lg_norm:.3f}")
 
         u = cp.Variable(4)
         cost = cp.sum_squares(u - u_nom)

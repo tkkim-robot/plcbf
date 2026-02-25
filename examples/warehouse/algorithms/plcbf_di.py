@@ -3,7 +3,7 @@ Created on February 4th, 2026
 @author: Taekyung Kim
 
 @description:
-MPCBF for Double Integrator (MPCBF_DI).
+PLCBF for Double Integrator (PLCBF_DI).
 """
 
 from typing import Dict, Tuple, List, Optional
@@ -114,9 +114,9 @@ def _compute_feasible_area_jit(
 
 MAX_OPERATOR_TYPES = ['v', 'input_space']
 
-class MPCBF_DI(PCBF_DI):
+class PLCBF_DI(PCBF_DI):
     """
-    MPCBF for Double Integrator.
+    PLCBF for Double Integrator.
     Evaluates multiple policies and selects the best one.
     """
     
@@ -138,7 +138,7 @@ class MPCBF_DI(PCBF_DI):
             
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None) # Handle ax manually
         self.ax = ax
-        # Use fixed 2.0s horizon for MPCBF evaluation of dynamic obstacles
+        # Use fixed 2.0s horizon for PLCBF evaluation of dynamic obstacles
         self.eval_horizon_steps = int(2.0 / self.dt)
         
         # Policy Helpers
@@ -220,7 +220,7 @@ class MPCBF_DI(PCBF_DI):
         else:
             obs_array = jnp.zeros((0, 5))
 
-        # For MPCBF, use V only for dynamic obstacles; static handled by HO-CBF
+        # For PLCBF, use V only for dynamic obstacles; static handled by HO-CBF
         stat_obs_array_eval = jnp.zeros((0, 3))
         
             
@@ -365,7 +365,7 @@ class MPCBF_DI(PCBF_DI):
         if self.debug and self.curr_step % 50 == 0:
             lg_norm = float(np.linalg.norm(grad_best[2:4]))
             g_norm = float(np.linalg.norm(grad_best))
-            print(f"[MPCBF_DI] step={self.curr_step} best={best_name} V={V_best:.3f} time_dV={self._last_time_derivative:.3f} |g|={g_norm:.3f} |Lg|={lg_norm:.3f}")
+            print(f"[PLCBF_DI] step={self.curr_step} best={best_name} V={V_best:.3f} time_dV={self._last_time_derivative:.3f} |g|={g_norm:.3f} |Lg|={lg_norm:.3f}")
 
         # (Optional) Nominal CBF satisfaction can be computed here for analysis if needed
         f = np.array([state[2], state[3], 0, 0])
@@ -387,7 +387,7 @@ class MPCBF_DI(PCBF_DI):
             u_scaled[1] >= -1.0
         ]
         
-        # Safety Constraints (standardized via MPCBF_DI override)
+        # Safety Constraints (standardized via PLCBF_DI override)
         self._add_cbf_constraints(u, constraints, state, V_best, grad_best)
             
         prob = cp.Problem(cp.Minimize(cost), constraints)
@@ -455,10 +455,10 @@ class MPCBF_DI(PCBF_DI):
 
     def _add_cbf_constraints(self, u, constraints, state, V, grad_V, slack=0.0, include_dynamic=True, include_static=True):
         """
-        Add CBF constraints for MPCBF_DI.
+        Add CBF constraints for PLCBF_DI.
         
         Add HOCBF constarint for static obstacles (assumeing the robot knows the static obs)
-        Add MPCBF constraint for dynamic obstacles (robot doesn't know the dynamic obs in advanced)
+        Add PLCBF constraint for dynamic obstacles (robot doesn't know the dynamic obs in advanced)
         """
         f, _ = self._get_system_matrices(state)
         L_f_V = np.dot(grad_V, f)

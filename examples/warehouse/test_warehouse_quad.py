@@ -4,7 +4,7 @@ Created on February 11th, 2026
 
 @description:
 Test script for Warehouse Scenario with Quad3D dynamics.
-Tests PCBF, MPCBF, MIP-MPC, Gatekeeper, MPS, and BackupCBF.
+Tests PCBF, PLCBF, MIP-MPC, Gatekeeper, MPS, and BackupCBF.
 """
 
 import sys
@@ -40,9 +40,9 @@ from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
-# Core algorithms (PCBF/MPCBF)
+# Core algorithms (PCBF/PLCBF)
 from examples.warehouse.algorithms.pcbf_quad3d import PCBF_Quad3D
-from examples.warehouse.algorithms.mpcbf_quad3d import MPCBF_Quad3D
+from examples.warehouse.algorithms.plcbf_quad3d import PLCBF_Quad3D
 from examples.warehouse.algorithms.mip_mpc_quad3d import MIPMPC_Quad3D
 from examples.warehouse.controllers.policies_quad3d_jax import (
     AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams
@@ -172,8 +172,8 @@ def setup_test(algo, level, safety_margin=0.5):
             
         filter_algo.set_environment(env)
             
-    elif algo == 'mpcbf':
-        filter_algo = MPCBF_Quad3D(
+    elif algo == 'plcbf':
+        filter_algo = PLCBF_Quad3D(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
             cbf_alpha=args.alpha,
@@ -330,14 +330,14 @@ def run_simulation(args):
         statics = env.get_static_obstacles()
         
         # 2. Update Shielding Info
-        if args.algo in ['pcbf', 'mpcbf', 'mip_mpc']:
+        if args.algo in ['pcbf', 'plcbf', 'mip_mpc']:
             shielding.update_obstacles(ghosts, statics)
-            # PCBF/MPCBF need nominal reference u
+            # PCBF/PLCBF need nominal reference u
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
             
-            # Predict nominal trajectory for MPCBF visualization (optional)
-            if args.algo in ['mpcbf', 'mip_mpc']:
+            # Predict nominal trajectory for PLCBF visualization (optional)
+            if args.algo in ['plcbf', 'mip_mpc']:
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             
@@ -513,7 +513,7 @@ def run_simulation(args):
 
 def run_sweep(args):
     print("Starting Benchmark Sweep...")
-    algos = ['pcbf', 'mpcbf', 'mip_mpc', 'gatekeeper', 'mps', 'backup_cbf']
+    algos = ['pcbf', 'plcbf', 'mip_mpc', 'gatekeeper', 'mps', 'backup_cbf']
     
     target_levels = range(6)
     if args.sweep_levels:
@@ -597,7 +597,7 @@ def plot_results(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--algo', type=str, default='mpcbf', choices=['pcbf', 'mpcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps'])
+    parser.add_argument('--algo', type=str, default='plcbf', choices=['pcbf', 'plcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps'])
     parser.add_argument('--level', type=str, default='1')
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')

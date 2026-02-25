@@ -10,7 +10,7 @@ import numpy as np
 import jax.numpy as jnp
 
 
-ALGOS = ['pcbf', 'mpcbf', 'gatekeeper', 'mps', 'backup_cbf']
+ALGOS = ['pcbf', 'plcbf', 'gatekeeper', 'mps', 'backup_cbf']
 
 
 def _time_solve(fn):
@@ -60,12 +60,12 @@ def run_one_quad(algo, level, safety_margin, alpha, max_steps, warmup_steps):
         u_nom = None
         u_safe = None
 
-        if algo in ['pcbf', 'mpcbf']:
+        if algo in ['pcbf', 'plcbf']:
             shielding.update_obstacles(ghosts, statics)
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
 
-            if algo == 'mpcbf':
+            if algo == 'plcbf':
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             elif algo == 'pcbf':
@@ -202,12 +202,12 @@ def run_one_di(algo, level, safety_margin, alpha, max_steps, warmup_steps):
         u_nom = None
         u_safe = None
 
-        if algo in ['pcbf', 'mpcbf']:
+        if algo in ['pcbf', 'plcbf']:
             shielding.update_obstacles(ghosts, statics)
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
 
-            if algo == 'mpcbf':
+            if algo == 'plcbf':
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             elif algo == 'pcbf':

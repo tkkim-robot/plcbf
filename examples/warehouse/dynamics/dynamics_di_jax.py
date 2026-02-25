@@ -3,7 +3,7 @@ Created on February 4th, 2026
 @author: Taekyung Kim
 
 @description:
-JAX-compatible Double Integrator dynamics for PCBF/MPCBF.
+JAX-compatible Double Integrator dynamics for PCBF/PLCBF.
 
 State: [x, y, vx, vy] (4 states)
 Control: [ax, ay] (2 controls)

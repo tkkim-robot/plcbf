@@ -20,7 +20,7 @@ from examples.warehouse.controllers.policies_di_jax import (
     AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
 )
 from examples.drift_car.algorithms.pcbf_drift import smooth_min
-from mpcbf.pcbf import PCBFBase
+from plcbf.pcbf import PCBFBase
 
 # =============================================================================
 # Value Function Computation (JAX)

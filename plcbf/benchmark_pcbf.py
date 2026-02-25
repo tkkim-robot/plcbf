@@ -3,7 +3,7 @@ Benchmark script for PCBF performance testing.
 Measures average computation time per step without visualization.
 
 Usage:
-    uv run python -m mpcbf.benchmark_pcbf [--steps N]
+    uv run python -m plcbf.benchmark_pcbf [--steps N]
 """
 
 import sys
@@ -19,8 +19,8 @@ from safe_control.envs.drifting_env import DriftingEnv
 from safe_control.robots.drifting_car import DriftingCar
 from safe_control.position_control.mpcc import MPCC
 from safe_control.position_control.backup_controller import LaneChangeController
-from mpcbf.pcbf import PCBF
-from mpcbf.mpcbf import MPCBF
+from plcbf.pcbf import PCBF
+from plcbf.plcbf import PLCBF
 
 
 def create_test_setup(max_operator='input_space'):
@@ -105,8 +105,8 @@ def create_test_setup(max_operator='input_space'):
     pcbf.set_backup_controller(backup_controller, target=left_lane_y)
     pcbf.set_environment(env)
     
-    # MPCBF controller
-    mpcbf = MPCBF(
+    # PLCBF controller
+    plcbf = PLCBF(
         robot=car,
         robot_spec=car.robot_spec,
         dt=dt,
@@ -118,19 +118,19 @@ def create_test_setup(max_operator='input_space'):
         max_operator=max_operator,
         ax=None  # No visualization
     )
-    mpcbf.set_environment(env)
+    plcbf.set_environment(env)
     
-    return car, mpcc, pcbf, mpcbf, env, robot_spec
+    return car, mpcc, pcbf, plcbf, env, robot_spec
 
 
 def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
     """Run benchmark and return timing statistics."""
     print(f"Setting up benchmark (max_operator={max_operator})...")
-    car, mpcc, pcbf, mpcbf, env, robot_spec = create_test_setup(max_operator)
+    car, mpcc, pcbf, plcbf, env, robot_spec = create_test_setup(max_operator)
     
     # Storage for timing
     pcbf_times = []
-    mpcbf_times = []
+    plcbf_times = []
     mpcc_times = []
     
     print(f"Running {num_steps} steps (+ {warmup_steps} warmup)...")
@@ -157,10 +157,10 @@ def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
             pass  # Ignore infeasibility for timing benchmark
         t3 = time.perf_counter()
         
-        # Time MPCBF
+        # Time PLCBF
         t4 = time.perf_counter()
         try:
-            u_mpcbf = mpcbf.solve_control_problem(
+            u_plcbf = plcbf.solve_control_problem(
                 state, 
                 control_ref=control_ref,
                 nominal_trajectory=pred_states.T if pred_states is not None else None,
@@ -174,7 +174,7 @@ def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
         if step >= warmup_steps:
             mpcc_times.append(t1 - t0)
             pcbf_times.append(t3 - t2)
-            mpcbf_times.append(t5 - t4)
+            plcbf_times.append(t5 - t4)
         
         # Simple state update (no full simulation)
         # Just move forward slightly to test different states
@@ -188,7 +188,7 @@ def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
     
     # Compute statistics
     pcbf_times = np.array(pcbf_times) * 1000  # Convert to ms
-    mpcbf_times = np.array(mpcbf_times) * 1000
+    plcbf_times = np.array(plcbf_times) * 1000
     mpcc_times = np.array(mpcc_times) * 1000
     
     results = {
@@ -197,11 +197,11 @@ def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
         'pcbf_min': np.min(pcbf_times),
         'pcbf_max': np.max(pcbf_times),
         'pcbf_median': np.median(pcbf_times),
-        'mpcbf_mean': np.mean(mpcbf_times),
-        'mpcbf_std': np.std(mpcbf_times),
-        'mpcbf_min': np.min(mpcbf_times),
-        'mpcbf_max': np.max(mpcbf_times),
-        'mpcbf_median': np.median(mpcbf_times),
+        'plcbf_mean': np.mean(plcbf_times),
+        'plcbf_std': np.std(plcbf_times),
+        'plcbf_min': np.min(plcbf_times),
+        'plcbf_max': np.max(plcbf_times),
+        'plcbf_median': np.median(plcbf_times),
         'mpcc_mean': np.mean(mpcc_times),
         'mpcc_std': np.std(mpcc_times),
         'num_steps': num_steps,
@@ -213,7 +213,7 @@ def run_benchmark(num_steps=200, warmup_steps=10, max_operator='c'):
 def print_results(results, label=""):
     """Print benchmark results."""
     print(f"\n{'=' * 60}")
-    print(f"  PCBF/MPCBF Benchmark Results {label}")
+    print(f"  PCBF/PLCBF Benchmark Results {label}")
     print(f"{'=' * 60}")
     print(f"  Steps tested: {results['num_steps']}")
     print(f"\n  PCBF Timing (single policy):")
@@ -222,12 +222,12 @@ def print_results(results, label=""):
     print(f"    Median: {results['pcbf_median']:.3f} ms")
     print(f"    Min:    {results['pcbf_min']:.3f} ms")
     print(f"    Max:    {results['pcbf_max']:.3f} ms")
-    print(f"\n  MPCBF Timing (4 policies):")
-    print(f"    Mean:   {results['mpcbf_mean']:.3f} ms")
-    print(f"    Std:    {results['mpcbf_std']:.3f} ms")
-    print(f"    Median: {results['mpcbf_median']:.3f} ms")
-    print(f"    Min:    {results['mpcbf_min']:.3f} ms")
-    print(f"    Max:    {results['mpcbf_max']:.3f} ms")
+    print(f"\n  PLCBF Timing (4 policies):")
+    print(f"    Mean:   {results['plcbf_mean']:.3f} ms")
+    print(f"    Std:    {results['plcbf_std']:.3f} ms")
+    print(f"    Median: {results['plcbf_median']:.3f} ms")
+    print(f"    Min:    {results['plcbf_min']:.3f} ms")
+    print(f"    Max:    {results['plcbf_max']:.3f} ms")
     print(f"\n  MPCC Timing (reference):")
     print(f"    Mean:   {results['mpcc_mean']:.3f} ms")
     print(f"    Std:    {results['mpcc_std']:.3f} ms")
@@ -235,13 +235,13 @@ def print_results(results, label=""):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Benchmark PCBF/MPCBF performance')
+    parser = argparse.ArgumentParser(description='Benchmark PCBF/PLCBF performance')
     parser.add_argument('--steps', type=int, default=200,
                         help='Number of steps to benchmark (default: 200)')
     parser.add_argument('--warmup', type=int, default=10,
                         help='Number of warmup steps (default: 10)')
     parser.add_argument('--max-operator', type=str, default='input_space', choices=['c', 'v', 'input_space'],
-                        help='MPCBF selection operator (default: input_space)')
+                        help='PLCBF selection operator (default: input_space)')
     args = parser.parse_args()
     
     results = run_benchmark(num_steps=args.steps, warmup_steps=args.warmup, max_operator=args.max_operator)

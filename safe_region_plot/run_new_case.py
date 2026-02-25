@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from .dynamics_sim import DoubleIntegratorSim
 from .dynamics_hj import DoubleIntegratorHJ
 from .backup import StopBackupController, TurnBackupController, TargetHeightBackupController
-from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, MPCBFWrapper
+from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, PLCBFWrapper
 from .analysis import compute_viability_kernel, evaluate_filter
 
 def main():
@@ -156,21 +156,21 @@ def main():
         'MPS': MPSWrapper, 
         'Gatekeeper': GatekeeperWrapper, 
         'PCBF': PCBFWrapper, 
-        'MPCBF': MPCBFWrapper
+        'PLCBF': PLCBFWrapper
     }
     colors = {
         'BackupCBF': 'blue', 
         'MPS': 'green', 
         'Gatekeeper': 'orange',
         'PCBF': 'purple',
-        'MPCBF': 'brown'
+        'PLCBF': 'brown'
     }
     fill_alphas = {
         'BackupCBF': 0.1, 
         'MPS': 0.2, 
         'Gatekeeper': 0.3,
         'PCBF': 0.15,
-        'MPCBF': 0.25
+        'PLCBF': 0.25
     }
 
     # Filter methods/policies if requested
@@ -229,11 +229,11 @@ def main():
             
         for method in methods:
             # File Handling
-            if method == 'MPCBF':
-                # MPCBF is not officially supported for 'target_height' policy due to hardcoded policy names.
+            if method == 'PLCBF':
+                # PLCBF is not officially supported for 'target_height' policy due to hardcoded policy names.
                 # If forced, it will use its internal 'stop' or 'turn' logic.
-                print(f"Warning: MPCBF is not designed for 'target_height' policy. Behavior may be unexpected.")
-                method_file = os.path.join(args.save_path, f"result_MPCBF_target_height_res{args.res}.npz")
+                print(f"Warning: PLCBF is not designed for 'target_height' policy. Behavior may be unexpected.")
+                method_file = os.path.join(args.save_path, f"result_PLCBF_target_height_res{args.res}.npz")
             else:
                 method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
             
@@ -268,12 +268,12 @@ def main():
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
                     elif method == "PCBF": # If PCBF is forced
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=1.0) # Default alpha
-                    elif method == "MPCBF": # If MPCBF is forced
-                         # MPCBF needs a dict of alphas for its internal policies.
-                         # Since 'target_height' is not a built-in policy for MPCBF,
+                    elif method == "PLCBF": # If PLCBF is forced
+                         # PLCBF needs a dict of alphas for its internal policies.
+                         # Since 'target_height' is not a built-in policy for PLCBF,
                          # we'll provide a default alpha for its internal 'stop' policy.
-                         mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                         plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                         fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
                     else: # MPS, Gatekeeper
                          fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                     
@@ -294,7 +294,7 @@ def main():
                     if hasattr(fw, 'gk'): 
                         fw.gk.set_environment(env_mock)
                         fw.gk.set_nominal_controller(nominal_controller_fn)
-                    if hasattr(fw, 'set_environment'): fw.set_environment(env_mock) # For PCBF/MPCBF custom methods
+                    if hasattr(fw, 'set_environment'): fw.set_environment(env_mock) # For PCBF/PLCBF custom methods
                     
                     return fw
 
@@ -399,9 +399,9 @@ def main():
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
                         elif method == "PCBF":
                              fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=1.0)
-                        elif method == "MPCBF":
-                             mpcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=mpcbf_alphas)
+                        elif method == "PLCBF":
+                             plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
                         else:
                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
                         

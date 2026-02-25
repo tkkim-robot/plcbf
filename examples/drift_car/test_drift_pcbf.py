@@ -28,31 +28,31 @@ Number of Obstacles:
 - 2: Two obstacles - one in middle lane, one in left lane (blocks lane change backup)
 
 Usage:
-    cd mpcbf && uv run python -m mpcbf.test_drift_pcbf [--test TEST] [--algo ALGO] [--backup BACKUP] [--obs NUM] [--save]
+    cd plcbf && uv run python -m plcbf.test_drift_pcbf [--test TEST] [--algo ALGO] [--backup BACKUP] [--obs NUM] [--save]
 
 Examples:
     # Test with PCBF (new!)
-    uv run python -m mpcbf.test_drift_pcbf --test high_friction --algo pcbf
+    uv run python -m plcbf.test_drift_pcbf --test high_friction --algo pcbf
     
     # Test with gatekeeper (default)
-    uv run python -m mpcbf.test_drift_pcbf --test high_friction --algo gatekeeper
+    uv run python -m plcbf.test_drift_pcbf --test high_friction --algo gatekeeper
     
     # Test with MPS algorithm
-    uv run python -m mpcbf.test_drift_pcbf --test high_friction --algo mps
+    uv run python -m plcbf.test_drift_pcbf --test high_friction --algo mps
     
     # Test with stopping backup (expected to fail in puddle scenario)
-    uv run python -m mpcbf.test_drift_pcbf --test puddle_surprise --backup stop
+    uv run python -m plcbf.test_drift_pcbf --test puddle_surprise --backup stop
     
     # Test with 2 obstacles (lane change will fail due to blocked left lane)
-    uv run python -m mpcbf.test_drift_pcbf --test high_friction --backup lane_change --obs 2
+    uv run python -m plcbf.test_drift_pcbf --test high_friction --backup lane_change --obs 2
     
     # Save animation
-    uv run python -m mpcbf.test_drift_pcbf --test high_friction --save
+    uv run python -m plcbf.test_drift_pcbf --test high_friction --save
 
 @required-scripts: 
     - safe_control/shielding/gatekeeper.py
     - safe_control/shielding/mps.py
-    - mpcbf/pcbf.py
+    - plcbf/pcbf.py
 """
 
 import sys
@@ -78,9 +78,9 @@ from safe_control.shielding.gatekeeper import Gatekeeper
 from safe_control.shielding.mps import MPS
 from safe_control.utils.animation import AnimationSaver
 
-# Import PCBF and MPCBF from drift car algorithms
+# Import PCBF and PLCBF from drift car algorithms
 from examples.drift_car.algorithms.pcbf_drift import PCBF
-from examples.drift_car.algorithms.mpcbf_drift import MPCBF, MAX_OPERATOR_TYPES
+from examples.drift_car.algorithms.plcbf_drift import PLCBF, MAX_OPERATOR_TYPES
 
 
 # =============================================================================
@@ -142,7 +142,7 @@ class JAXAlignedLaneChangeController(LaneChangeController):
 # Algorithm Types
 # =============================================================================
 
-ALGO_TYPES = ['gatekeeper', 'mps', 'backupcbf', 'pcbf', 'mpcbf']
+ALGO_TYPES = ['gatekeeper', 'mps', 'backupcbf', 'pcbf', 'plcbf']
 
 
 # =============================================================================
@@ -241,7 +241,7 @@ class ObstacleConfig:
     theta: float = 0.0          # Heading angle
     body_length: float = 4.5
     body_width: float = 2.0
-    radius: float = 2.0         # Collision radius (reduced for MPCBF lane change margin)
+    radius: float = 2.0         # Collision radius (reduced for PLCBF lane change margin)
 
 
 # Number of obstacles options
@@ -272,7 +272,7 @@ class TestConfig:
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
-    max_operator: str = 'input_space'  # MPCBF selection operator: 'c', 'v', or 'input_space'
+    max_operator: str = 'input_space'  # PLCBF selection operator: 'c', 'v', or 'input_space'
     no_render: bool = False  # Disable rendering/plotting for compute-time evaluation
 
 
@@ -336,8 +336,8 @@ def setup_controllers(
     left_lane_y: float,
     right_lane_y: float,
     ax: plt.Axes
-) -> Tuple[MPCC, Union[Gatekeeper, MPS, PCBF, MPCBF]]:
-    """Setup MPCC and shielding controller (Gatekeeper, MPS, PCBF, or MPCBF)."""
+) -> Tuple[MPCC, Union[Gatekeeper, MPS, PCBF, PLCBF]]:
+    """Setup MPCC and shielding controller (Gatekeeper, MPS, PCBF, or PLCBF)."""
     sim = config.simulation
     robot_spec = config.vehicle.to_dict()
     
@@ -399,9 +399,9 @@ def setup_controllers(
         print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
-    if config.algo_type == 'mpcbf':
-        # MPCBF uses multiple policies internally (left/right lane change + stop)
-        shielding = MPCBF(
+    if config.algo_type == 'plcbf':
+        # PLCBF uses multiple policies internally (left/right lane change + stop)
+        shielding = PLCBF(
             robot=car,
             robot_spec=car.robot_spec,
             dt=sim.dt,
@@ -415,7 +415,7 @@ def setup_controllers(
         )
         actual_left = max(left_lane_y, 6.5)
         actual_right = min(right_lane_y, -6.5)
-        print(f"  Using MPCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
+        print(f"  Using PLCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
         print(f"    Policies: lane_change_left (y={left_lane_y:.1f}), lane_change_right (y={right_lane_y:.1f}), stop, nominal")
     elif config.algo_type == 'pcbf':
         shielding = PCBF(
@@ -458,8 +458,8 @@ def setup_controllers(
         )
         print(f"  Using GATEKEEPER algorithm (backward search)")
     
-    # Set backup controller (not needed for MPCBF which has built-in multi-policy)
-    if not isinstance(shielding, MPCBF):
+    # Set backup controller (not needed for PLCBF which has built-in multi-policy)
+    if not isinstance(shielding, PLCBF):
         shielding.set_backup_controller(backup_controller, target=backup_target)
     shielding.set_environment(env)
     
@@ -563,7 +563,7 @@ def run_simulation(
     collision_step = None
     solve_times_s = []
     solve_calls = 0
-    warmup_skip = sim.timing_warmup_steps_jax if isinstance(shielding, (PCBF, MPCBF)) else 0
+    warmup_skip = sim.timing_warmup_steps_jax if isinstance(shielding, (PCBF, PLCBF)) else 0
 
     print(f"\nRunning simulation for {sim.tf}s...")
 
@@ -594,8 +594,8 @@ def run_simulation(
         current_friction = env.get_friction_at_position(pos, default_friction=robot_spec['mu'])
         if abs(current_friction - car.get_friction()) > 0.01:
             car.set_friction(current_friction)
-            # Also update PCBF/MPCBF's friction
-            if isinstance(shielding, (PCBF, MPCBF)):
+            # Also update PCBF/PLCBF's friction
+            if isinstance(shielding, (PCBF, PLCBF)):
                 shielding.set_friction(current_friction)
             if abs(current_friction - last_friction) > 0.01:
                 if current_friction < robot_spec['mu']:
@@ -623,8 +623,8 @@ def run_simulation(
         try:
             solve_calls += 1
             solve_t0 = time.perf_counter()
-            if isinstance(shielding, MPCBF):
-                # MPCBF uses nominal control as reference + MPCC trajectory as one of the policies
+            if isinstance(shielding, PLCBF):
+                # PLCBF uses nominal control as reference + MPCC trajectory as one of the policies
                 control_ref = {'u_ref': mpcc_control}
                 U = shielding.solve_control_problem(
                     state, 
@@ -704,9 +704,9 @@ def run_simulation(
         if step % 50 == 0:
             V = car.get_velocity()
             status = shielding.get_status()
-            if isinstance(shielding, MPCBF):
+            if isinstance(shielding, PLCBF):
                 best = status.get('best_policy', 'unknown')
-                mode = f"MPCBF (status={status['status']}, best={best})"
+                mode = f"PLCBF (status={status['status']}, best={best})"
             elif isinstance(shielding, PCBF):
                 mode = f"PCBF (status={status['status']})"
             else:
@@ -958,13 +958,13 @@ def create_far_left_safe_test() -> TestConfig:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/BackupCBF/PCBF/MPCBF)')
+    parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/BackupCBF/PCBF/PLCBF)')
     parser.add_argument('--test', type=str, default='high_friction',
                         choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'far_left_safe', 'all'],
                         help='Which test to run')
     parser.add_argument('--algo', type=str, default='pcbf',
                         choices=ALGO_TYPES,
-                        help='Shielding algorithm: gatekeeper, mps, backupcbf, pcbf, or mpcbf')
+                        help='Shielding algorithm: gatekeeper, mps, backupcbf, pcbf, or plcbf')
     parser.add_argument('--backup', type=str, default='lane_change',
                         choices=BACKUP_TYPES,
                         help='Backup controller type: lane_change (default) or stop')
@@ -1008,7 +1008,7 @@ def main():
 
         # For straight_safe test, all algorithms should be safe if they pick straight
         if test_name == 'straight_safe':
-            if algo_type == 'mpcbf':
+            if algo_type == 'plcbf':
                  return False # MPCC policy should be selected
             # For PCBF with lane change, it might fail if forced to change lane
             # into an obstacle. But our logic handles obstacles via CBF.
@@ -1017,14 +1017,14 @@ def main():
             if backup_type == 'lane_change_right': return True # Hit right obstacle
             return False # Stop backup might work?
 
-        # MPCBF has multiple policies - generally safer
+        # PLCBF has multiple policies - generally safer
         # It will pick the best policy (max V) among: left, right, stop, mpcc
-        if algo_type == 'mpcbf':
-            # MPCBF should only fail in puddle_surprise 
+        if algo_type == 'plcbf':
+            # PLCBF should only fail in puddle_surprise 
             # (all policies fail when friction estimate is wrong)
             if test_name == 'puddle_surprise':
                 return False  # All policies fail with wrong friction estimate
-            return False  # MPCBF should handle all other cases
+            return False  # PLCBF should handle all other cases
         
         # With stopping backup
         if backup_type == 'stop':
