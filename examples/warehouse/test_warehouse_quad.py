@@ -51,12 +51,30 @@ from examples.warehouse.dynamics.dynamics_quad3d_jax import _build_quad3d_matric
 
 # Note: Controllers are imported from controllers.nominal_quad3d module
 
+# Empirical rollout reach (PLCBF fallback policies, level-7 short run) is ~13.03 m.
+# Use 13.0 m sensing radius for visualization across all methods.
+DEFAULT_SENSING_RANGE_M = 13.0
+DETECTED_GHOST_COLOR = '#f16d7a'      # pastel red
+UNDETECTED_GHOST_COLOR = '#fbe3e8'    # very light pink
+
 # =============================================================================
 # Setup Functions
 # =============================================================================
 
-def setup_test(algo, level, safety_margin=0.5):
+def setup_test(
+    algo,
+    level,
+    safety_margin=0.5,
+    plcbf_num_angle_policies=32,
+    mip_num_angle_policies=32,
+    alpha=None,
+):
     env = WarehouseEnv(level=level)
+    alpha_val = alpha
+    if alpha_val is None:
+        alpha_val = 6.0
+        if 'args' in globals() and hasattr(args, 'alpha'):
+            alpha_val = args.alpha
     
     # Robot Spec (Quad3D)
     robot_spec = {
@@ -176,9 +194,9 @@ def setup_test(algo, level, safety_margin=0.5):
         filter_algo = PLCBF_Quad3D(
             robot_spec, dt=env.dt,
             backup_horizon=backup_horizon,
-            cbf_alpha=args.alpha,
+            cbf_alpha=alpha_val,
             safety_margin=safety_margin,
-            num_angle_policies=32
+            num_angle_policies=plcbf_num_angle_policies
         )
         filter_algo.set_environment(env)
 
@@ -191,7 +209,7 @@ def setup_test(algo, level, safety_margin=0.5):
             dt=env.dt,
             mpc_horizon_steps=mip_horizon_steps,
             backup_horizon=mip_backup_horizon,
-            num_angle_policies=32,
+            num_angle_policies=mip_num_angle_policies,
             safety_margin=safety_margin,
             safety_threshold=0.0,
             xy_tube=3.0,
@@ -251,6 +269,8 @@ def run_simulation(args):
     
     # Plot Setup
     update_waypoint_markers = None
+    sensing_patch = None
+    update_ghost_detection_colors = None
     if not args.no_render:
         plt.ion()
         fig, ax1 = env.setup_plot()
@@ -289,6 +309,41 @@ def run_simulation(args):
 
             update_waypoint_markers = _update_waypoints
             update_waypoint_markers(force=True)
+
+        sensing_range = float(getattr(args, 'sensing_range', DEFAULT_SENSING_RANGE_M))
+        sensing_patch = plt.Circle(
+            (env.start_pos[0], env.start_pos[1]),
+            sensing_range,
+            fill=False,
+            linestyle='--',
+            linewidth=1.8,
+            edgecolor='deepskyblue',
+            alpha=0.85,
+            zorder=7,
+            label='Sensing range'
+        )
+        ax1.add_patch(sensing_patch)
+
+        def _update_ghost_detection_colors():
+            if not hasattr(env, 'ghost_patches'):
+                return
+            robot_xy = np.array(env.robot_pos, dtype=float)
+            for i, ghost in enumerate(env.ghosts):
+                if i >= len(env.ghost_patches):
+                    break
+                ghost_xy = np.array([ghost.get('x', 0.0), ghost.get('y', 0.0)], dtype=float)
+                ghost_r = float(ghost.get('radius', 0.0))
+                detected = np.linalg.norm(robot_xy - ghost_xy) <= (sensing_range + ghost_r)
+                patch = env.ghost_patches[i]
+                if detected:
+                    patch.set_facecolor(DETECTED_GHOST_COLOR)
+                    patch.set_alpha(0.95)
+                else:
+                    patch.set_facecolor(UNDETECTED_GHOST_COLOR)
+                    patch.set_alpha(0.9)
+
+        update_ghost_detection_colors = _update_ghost_detection_colors
+        update_ghost_detection_colors()
     else:
         fig, ax1 = None, None
         
@@ -487,6 +542,10 @@ def run_simulation(args):
                  env.robot_patch = plt.Circle(env.robot_pos, robot_spec['radius'], color='blue')
                  ax1.add_patch(env.robot_patch)
              env.robot_patch.center = env.robot_pos
+             if sensing_patch is not None:
+                 sensing_patch.center = env.robot_pos
+             if update_ghost_detection_colors is not None:
+                 update_ghost_detection_colors()
              
              fig.canvas.draw()
              fig.canvas.flush_events()
@@ -605,6 +664,7 @@ if __name__ == "__main__":
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
     parser.add_argument('--safety_margin', type=float, default=1.4, help="Additive safety margin (e.g. 0.5)")
     parser.add_argument('--alpha', type=float, default=6.0)
+    parser.add_argument('--sensing_range', type=float, default=DEFAULT_SENSING_RANGE_M, help="Sensing radius for visualization circle (meters)")
     args = parser.parse_args()
     
     if args.sweep:
