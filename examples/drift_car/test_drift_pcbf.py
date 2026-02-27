@@ -323,6 +323,8 @@ def setup_vehicle(config: TestConfig, env: DriftingEnv, ax: plt.Axes) -> Tuple[D
     ])
     
     robot_spec = config.vehicle.to_dict()
+    # Keep backup-controller speed target aligned with MPCC reference speed.
+    robot_spec['v_ref'] = float(config.simulation.target_velocity)
     car = DriftingCar(X0, robot_spec, config.simulation.dt, ax)
     
     return car, X0, middle_lane_y, left_lane_y, right_lane_y

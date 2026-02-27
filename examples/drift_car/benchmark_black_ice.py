@@ -350,6 +350,7 @@ def setup_shielding(
             backup_horizon=cfg.backup_horizon_time,
             cbf_alpha=5.0,
             safety_margin=1.0,
+            use_cbf_slack=False,
             ax=None,
         )
         shielding.set_backup_controller(backup_controller, target=backup_target)

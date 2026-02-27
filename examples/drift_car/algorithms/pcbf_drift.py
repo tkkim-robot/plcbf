@@ -220,6 +220,8 @@ class PCBF(PCBFBase):
         backup_horizon: float = 10.0,
         cbf_alpha: float = 1.0,
         safety_margin: float = 0.0,
+        use_cbf_slack: bool = True,
+        cbf_slack_weight: float = 5e5,
         ax=None,
     ):
         # Store robot instance (drift car specific)
@@ -245,6 +247,9 @@ class PCBF(PCBFBase):
         
         # Status
         self.status = 'optimal'
+        # Optional CBF relaxation: PLCBF can keep this on, while benchmark PCBF can disable it.
+        self.use_cbf_slack = bool(use_cbf_slack)
+        self.cbf_slack_weight = float(cbf_slack_weight)
         
         # JIT cache
         self._jit_value_and_grad = None
@@ -394,28 +399,34 @@ class PCBF(PCBFBase):
         u_scale = self.u_max
         u_nom_scaled = u_nom / u_scale
         u_scaled = cp.Variable(nu)
-        
+        cbf_slack = cp.Variable(nonneg=True) if self.use_cbf_slack else None
+
         weights = np.array([1.0, 10.0])
         weighted_diff = cp.multiply(weights, u_scaled - u_nom_scaled)
         cost = cp.sum_squares(weighted_diff)
+        if self.use_cbf_slack:
+            cost += self.cbf_slack_weight * cp.square(cbf_slack)
         
         grad_V_G = grad_V @ G
         grad_V_f = grad_V @ f
         cbf_rhs = grad_V_f + self.cbf_alpha * V
         A_cbf = -grad_V_G * u_scale
         
-        constraints = [
-            A_cbf @ u_scaled <= cbf_rhs + 1e-4,
-            u_scaled >= -1.0,
-            u_scaled <= 1.0,
-        ]
+        if self.use_cbf_slack:
+            cbf_constraint = A_cbf @ u_scaled <= cbf_rhs + 1e-4 + cbf_slack
+        else:
+            cbf_constraint = A_cbf @ u_scaled <= cbf_rhs + 1e-4
+        constraints = [cbf_constraint, u_scaled >= -1.0, u_scaled <= 1.0]
         
         try:
             problem = cp.Problem(cp.Minimize(cost), constraints)
             problem.solve(solver=cp.SCS, verbose=False, max_iters=2000, eps=1e-4)
             
             if problem.status in ['optimal', 'optimal_inaccurate']:
-                self.status = 'optimal'
+                if self.use_cbf_slack and cbf_slack.value is not None and cbf_slack.value > 1e-7:
+                    self.status = 'optimal_with_slack'
+                else:
+                    self.status = 'optimal'
                 return u_scaled.value * u_scale
             elif problem.status in ['infeasible', 'infeasible_inaccurate']:
                 self.status = 'infeasible'
