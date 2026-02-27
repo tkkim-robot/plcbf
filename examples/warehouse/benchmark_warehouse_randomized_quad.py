@@ -521,6 +521,61 @@ def refresh_timing_one_by_one(
     return refreshed
 
 
+def save_randomized_animations(
+    *,
+    algo_specs: List[AlgoSpec],
+    scenarios: List[TrialScenario],
+    args: argparse.Namespace,
+):
+    n_sets = max(0, min(int(args.animation_sets), len(scenarios)))
+    if n_sets <= 0:
+        print("No animation sets requested; skipping animation export.")
+        return
+
+    output_root = Path(args.animation_output_dir)
+    if not output_root.is_absolute():
+        output_root = Path(PROJECT_ROOT) / output_root
+    output_root = output_root / f"seed_{args.seed}"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n=== Saving randomized animations ({n_sets} scenario sets) ===")
+    print(f"Animation output root: {output_root}")
+
+    for idx in range(n_sets):
+        scenario = scenarios[idx]
+        scenario_dir = output_root / f"idx_{idx:02d}"
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        for algo_spec in algo_specs:
+            filename = f"warehouse_lvl{args.level}_{algo_spec.key}_idx{idx:02d}.mp4"
+            print(
+                f"[Animation] idx={idx:02d}/{n_sets - 1:02d} algo={algo_spec.key:10s} "
+                f"-> {scenario_dir / filename}"
+            )
+
+            anim_args = argparse.Namespace(
+                algo=algo_spec.key,
+                level=args.level,
+                no_render=False,
+                save=True,
+                save_dir=str(scenario_dir),
+                save_name=filename,
+                safety_margin=args.safety_margin,
+                alpha=args.alpha,
+                plcbf_num_angle_policies=args.plcbf_num_angle_policies,
+                mip_num_angle_policies=args.mip_num_angle_policies,
+                timing_warmup_steps=args.jit_warmup_steps,
+                sensing_range=args.sensing_range,
+                max_steps=args.max_steps,
+            )
+            result = test_quad.run_simulation(anim_args, scenario_ghosts=scenario.ghosts)
+            print(
+                f"  result: collision={int(result.get('collision', False))} "
+                f"infeasible={int(result.get('infeasible', False))} "
+                f"reach_goal={int(result.get('reach_goal', False))}"
+            )
+
+
 def format_markdown(
     *,
     summaries: List[SummaryRow],
@@ -578,11 +633,11 @@ def main():
     parser.add_argument("--num-trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--level", type=int, default=7)
-    parser.add_argument("--num-dynamic-obstacles", type=int, default=30)
+    parser.add_argument("--num-dynamic-obstacles", type=int, default=45)
 
-    parser.add_argument("--safety-margin", type=float, default=1.4)
+    parser.add_argument("--safety-margin", type=float, default=1.3)
     parser.add_argument("--alpha", type=float, default=6.0)
-    parser.add_argument("--max-steps", type=int, default=300)
+    parser.add_argument("--max-steps", type=int, default=350)
 
     parser.add_argument("--plcbf-num-angle-policies", type=int, default=64)
     parser.add_argument("--mip-num-angle-policies", type=int, default=32)
@@ -590,20 +645,30 @@ def main():
     parser.add_argument("--jit-warmup-steps", type=int, default=10)
     parser.add_argument("--tracking-tol", type=float, default=0.1)
 
-    parser.add_argument("--speed-min", type=float, default=2.2)
-    parser.add_argument("--speed-max", type=float, default=3.2)
-    parser.add_argument("--ghost-radius", type=float, default=2.0)
-    parser.add_argument("--inter-ghost-clearance", type=float, default=0.3)
+    parser.add_argument("--speed-min", type=float, default=3.0)
+    parser.add_argument("--speed-max", type=float, default=4.5)
+    parser.add_argument("--ghost-radius", type=float, default=2.4)
+    parser.add_argument("--inter-ghost-clearance", type=float, default=0.2)
 
-    parser.add_argument("--start-exclusion-max-x", type=float, default=25.0)
-    parser.add_argument("--start-exclusion-max-y", type=float, default=25.0)
-    parser.add_argument("--start-clearance-radius", type=float, default=12.0)
+    parser.add_argument("--start-exclusion-max-x", type=float, default=18.0)
+    parser.add_argument("--start-exclusion-max-y", type=float, default=18.0)
+    parser.add_argument("--start-clearance-radius", type=float, default=8.0)
+
 
     parser.add_argument("--skip-mip", action="store_true")
     parser.add_argument("--skip-timing-refresh", action="store_true")
     parser.add_argument("--timing-refresh-trials", type=int, default=1)
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--sensing-range", type=float, default=test_quad.DEFAULT_SENSING_RANGE_M)
+    parser.add_argument("--save-animations", action="store_true")
+    parser.add_argument("--animations-only", action="store_true")
+    parser.add_argument("--animation-sets", type=int, default=5)
+    parser.add_argument(
+        "--animation-output-dir",
+        type=str,
+        default="output/animations/warehouse_randomized_quad_sets",
+    )
 
     parser.add_argument(
         "--output-md",
@@ -641,6 +706,15 @@ def main():
         f"Generated {len(scenarios)} scenarios with {args.num_dynamic_obstacles} dynamic obstacles each "
         f"(seed={args.seed})."
     )
+
+    if args.animations_only and not args.save_animations:
+        raise ValueError("--animations-only requires --save-animations")
+
+    if args.save_animations:
+        save_randomized_animations(algo_specs=algo_specs, scenarios=scenarios, args=args)
+        if args.animations_only:
+            print("Animation-only run complete.")
+            return
 
     all_trial_results: Dict[str, List[TrialResult]] = {}
     summaries: List[SummaryRow] = []

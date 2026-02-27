@@ -65,8 +65,8 @@ UNDETECTED_GHOST_COLOR = '#fbe3e8'    # very light pink
 def setup_test(
     algo,
     level,
-    safety_margin=0.5,
-    plcbf_num_angle_policies=32,
+    safety_margin=1.3,
+    plcbf_num_angle_policies=64,
     mip_num_angle_policies=32,
     alpha=None,
 ):
@@ -263,14 +263,41 @@ def setup_test(
 # Main Loop
 # =============================================================================
 
-def run_simulation(args):
+def run_simulation(args, scenario_ghosts=None):
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = setup_test(
         args.algo,
         args.level,
         args.safety_margin,
-        plcbf_num_angle_policies=getattr(args, 'plcbf_num_angle_policies', 32),
+        plcbf_num_angle_policies=getattr(args, 'plcbf_num_angle_policies', 64),
         mip_num_angle_policies=getattr(args, 'mip_num_angle_policies', 32),
+        alpha=getattr(args, 'alpha', None),
     )
+
+    if scenario_ghosts is not None:
+        mapped_ghosts = []
+        for ghost in scenario_ghosts:
+            if isinstance(ghost, dict):
+                mapped_ghosts.append(
+                    {
+                        'x': float(ghost.get('x', 0.0)),
+                        'y': float(ghost.get('y', 0.0)),
+                        'vx': float(ghost.get('vx', 0.0)),
+                        'vy': float(ghost.get('vy', 0.0)),
+                        'radius': float(ghost.get('radius', 0.0)),
+                    }
+                )
+            else:
+                x, y, vx, vy, r = ghost
+                mapped_ghosts.append(
+                    {
+                        'x': float(x),
+                        'y': float(y),
+                        'vx': float(vx),
+                        'vy': float(vy),
+                        'radius': float(r),
+                    }
+                )
+        env.ghosts = mapped_ghosts
     
     # Plot Setup
     update_waypoint_markers = None
@@ -354,8 +381,9 @@ def run_simulation(args):
         
     saver = None
     if args.save and fig:
+        save_dir = getattr(args, 'save_dir', None) or f"output/animations/warehouse_{args.algo}_lvl{args.level}"
         saver = AnimationSaver(
-            f"output/animations/warehouse_{args.algo}_lvl{args.level}",
+            save_dir,
             save_per_frame=1,
             dpi=250,
             video_height=1080
@@ -367,7 +395,7 @@ def run_simulation(args):
     reached_goal = False
     nominal_track_steps = 0
     total_steps = 0
-    max_steps = 3000
+    max_steps = int(getattr(args, 'max_steps', 350))
     solve_times = []
     policy_eval_times = []
     mip_solve_times = []
@@ -564,7 +592,9 @@ def run_simulation(args):
              
              if saver: saver.save_frame(fig)
              
-    if saver: saver.export_video(f"{args.algo}_lvl{args.level}.mp4")
+    if saver:
+        save_name = getattr(args, 'save_name', None) or f"{args.algo}_lvl{args.level}.mp4"
+        saver.export_video(save_name)
     if not args.no_render: plt.close(fig)
     
     result = {
@@ -683,16 +713,19 @@ def plot_results(data):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', type=str, default='plcbf', choices=['pcbf', 'plcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps'])
-    parser.add_argument('--level', type=str, default='1')
+    parser.add_argument('--level', type=int, default=7)
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')
+    parser.add_argument('--save_dir', type=str, default=None, help='Optional animation output directory')
+    parser.add_argument('--save_name', type=str, default=None, help='Optional animation filename')
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
-    parser.add_argument('--safety_margin', type=float, default=1.4, help="Additive safety margin (e.g. 0.5)")
+    parser.add_argument('--safety_margin', type=float, default=1.3, help="Additive safety margin")
     parser.add_argument('--alpha', type=float, default=6.0)
-    parser.add_argument('--plcbf_num_angle_policies', type=int, default=32, help="Number of angle fallback policies for PLCBF")
+    parser.add_argument('--plcbf_num_angle_policies', type=int, default=64, help="Number of angle fallback policies for PLCBF")
     parser.add_argument('--mip_num_angle_policies', type=int, default=32, help="Number of angle fallback policies for MIP-MPC")
-    parser.add_argument('--timing_warmup_steps', type=int, default=5, help="Skip initial timing samples (JAX warmup/compile)")
+    parser.add_argument('--timing_warmup_steps', type=int, default=10, help="Skip initial timing samples (JAX warmup/compile)")
+    parser.add_argument('--max_steps', type=int, default=350, help='Maximum simulation steps')
     parser.add_argument('--sensing_range', type=float, default=DEFAULT_SENSING_RANGE_M, help="Sensing radius for visualization circle (meters)")
     args = parser.parse_args()
     
