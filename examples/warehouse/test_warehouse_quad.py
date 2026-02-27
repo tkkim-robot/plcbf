@@ -10,6 +10,7 @@ Tests PCBF, PLCBF, MIP-MPC, Gatekeeper, MPS, and BackupCBF.
 import sys
 import os
 import argparse
+import time
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -264,7 +265,11 @@ def setup_test(
 
 def run_simulation(args):
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = setup_test(
-        args.algo, args.level, args.safety_margin
+        args.algo,
+        args.level,
+        args.safety_margin,
+        plcbf_num_angle_policies=getattr(args, 'plcbf_num_angle_policies', 32),
+        mip_num_angle_policies=getattr(args, 'mip_num_angle_policies', 32),
     )
     
     # Plot Setup
@@ -416,10 +421,14 @@ def run_simulation(args):
                           )
                           shielding.set_policy('retrace_waypoint', new_params)
 
+            t_solve0 = time.perf_counter()
             u_safe = shielding.solve_control_problem(current_state, control_ref)
+            t_solve1 = time.perf_counter()
             u_safe = np.array(u_safe).flatten()
             if hasattr(shielding, 'last_total_time_sec'):
                 solve_times.append(float(shielding.last_total_time_sec))
+            else:
+                solve_times.append(float(t_solve1 - t_solve0))
             if hasattr(shielding, 'last_policy_eval_time_sec'):
                 policy_eval_times.append(float(shielding.last_policy_eval_time_sec))
             if hasattr(shielding, 'last_mip_solve_time_sec'):
@@ -463,8 +472,11 @@ def run_simulation(args):
                 shielding.set_nominal_trajectory(np.array(nom_traj_x), np.array(nom_traj_u))
             
             try:
+                t_solve0 = time.perf_counter()
                 u_safe = shielding.solve_control_problem(current_state)
+                t_solve1 = time.perf_counter()
                 u_safe = np.array(u_safe).flatten()
+                solve_times.append(float(t_solve1 - t_solve0))
             except ValueError as e:
                 print(f"Infeasible: {e}")
                 infeasible = True
@@ -561,13 +573,27 @@ def run_simulation(args):
         'infeasible': infeasible,
         'reach_goal': reached_goal
     }
-    if solve_times:
-        result['avg_solve_ms'] = 1000.0 * float(np.mean(solve_times))
-        result['max_solve_ms'] = 1000.0 * float(np.max(solve_times))
-    if policy_eval_times:
-        result['avg_rollout_ms'] = 1000.0 * float(np.mean(policy_eval_times))
-    if mip_solve_times:
-        result['avg_mip_ms'] = 1000.0 * float(np.mean(mip_solve_times))
+    warmup_skip = max(0, int(getattr(args, 'timing_warmup_steps', 0)))
+    result['timing_warmup_skipped'] = warmup_skip
+
+    def _skip_warmup(values):
+        if warmup_skip <= 0:
+            return values
+        if len(values) > warmup_skip:
+            return values[warmup_skip:]
+        return values
+
+    solve_times_eval = _skip_warmup(solve_times)
+    policy_eval_times_eval = _skip_warmup(policy_eval_times)
+    mip_solve_times_eval = _skip_warmup(mip_solve_times)
+
+    if solve_times_eval:
+        result['avg_solve_ms'] = 1000.0 * float(np.mean(solve_times_eval))
+        result['max_solve_ms'] = 1000.0 * float(np.max(solve_times_eval))
+    if policy_eval_times_eval:
+        result['avg_rollout_ms'] = 1000.0 * float(np.mean(policy_eval_times_eval))
+    if mip_solve_times_eval:
+        result['avg_mip_ms'] = 1000.0 * float(np.mean(mip_solve_times_eval))
     return result
 
 def run_sweep(args):
@@ -664,6 +690,9 @@ if __name__ == "__main__":
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
     parser.add_argument('--safety_margin', type=float, default=1.4, help="Additive safety margin (e.g. 0.5)")
     parser.add_argument('--alpha', type=float, default=6.0)
+    parser.add_argument('--plcbf_num_angle_policies', type=int, default=32, help="Number of angle fallback policies for PLCBF")
+    parser.add_argument('--mip_num_angle_policies', type=int, default=32, help="Number of angle fallback policies for MIP-MPC")
+    parser.add_argument('--timing_warmup_steps', type=int, default=5, help="Skip initial timing samples (JAX warmup/compile)")
     parser.add_argument('--sensing_range', type=float, default=DEFAULT_SENSING_RANGE_M, help="Sensing radius for visualization circle (meters)")
     args = parser.parse_args()
     
