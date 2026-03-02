@@ -609,6 +609,7 @@ def save_randomized_animations(
                 save_svg=args.save_svg,
                 paper_zoom_half_window=args.paper_zoom_half_window,
                 paper_arrow_length=args.paper_arrow_length,
+                paper_linewidth_scale=args.paper_linewidth_scale,
                 safety_margin=args.animation_safety_margin,
                 animation_safety_margin=args.animation_safety_margin,
                 alpha=args.alpha,
@@ -673,6 +674,7 @@ def render_randomized_animations(
                 save_svg=False,
                 paper_zoom_half_window=args.paper_zoom_half_window,
                 paper_arrow_length=args.paper_arrow_length,
+                paper_linewidth_scale=args.paper_linewidth_scale,
                 safety_margin=args.animation_safety_margin,
                 animation_safety_margin=args.animation_safety_margin,
                 alpha=args.alpha,
@@ -801,6 +803,12 @@ def main():
         type=float,
         default=test_quad.PAPER_ARROW_SCALE_M,
         help="Arrow length for dynamic-obstacle velocity direction in paper mode.",
+    )
+    parser.add_argument(
+        "--paper-linewidth-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to visualization line widths.",
     )
     parser.add_argument(
         "--paper-no-zoom",

@@ -101,6 +101,7 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         safety_margin: float = 0.0,
         num_angle_policies: int = 10,
         max_operator: str = 'input_space',
+        line_width_scale: float = 1.0,
         ax=None
     ):
         self.num_angle_policies = num_angle_policies
@@ -111,6 +112,7 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None)
         self.ax = ax
         self.eval_horizon_steps = int(self.backup_horizon / self.dt)
+        self.line_width_scale = max(1e-6, float(line_width_scale))
 
         self.policy_configs = {}
         self.angle_names = []
@@ -283,10 +285,11 @@ class PLCBF_Quad3D(PCBF_Quad3D):
             return
         import matplotlib.cm as cm
         cmap = cm.get_cmap('hsv', self.num_angle_policies + 1)
+        lw_base = 1.0 * self.line_width_scale
         for i in range(self.num_angle_policies):
             name = f'angle_{i}'
-            self.policy_lines[name], = self.ax.plot([], [], color=cmap(i), alpha=0.3, linewidth=1)
-        self.policy_lines['nominal'], = self.ax.plot([], [], color='k', linestyle='--', alpha=0.5, linewidth=1)
+            self.policy_lines[name], = self.ax.plot([], [], color=cmap(i), alpha=0.3, linewidth=lw_base)
+        self.policy_lines['nominal'], = self.ax.plot([], [], color='k', linestyle='--', alpha=0.5, linewidth=lw_base)
 
     def _setup_multi_visualization(self):
         self._setup_visualization()
@@ -298,10 +301,10 @@ class PLCBF_Quad3D(PCBF_Quad3D):
             if name in self.policy_lines:
                 self.policy_lines[name].set_data(traj[:, 0], traj[:, 1])
                 if name == self._last_best_name:
-                    self.policy_lines[name].set_linewidth(3)
+                    self.policy_lines[name].set_linewidth(3.0 * self.line_width_scale)
                     self.policy_lines[name].set_alpha(1.0)
                 else:
-                    self.policy_lines[name].set_linewidth(1)
+                    self.policy_lines[name].set_linewidth(1.0 * self.line_width_scale)
                     self.policy_lines[name].set_alpha(0.3)
 
     def solve_control_problem(self, state, control_ref=None):

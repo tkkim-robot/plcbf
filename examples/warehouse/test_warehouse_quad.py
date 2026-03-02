@@ -81,6 +81,7 @@ def setup_test(
     plcbf_num_angle_policies=64,
     mip_num_angle_policies=32,
     alpha=None,
+    line_width_scale=1.0,
 ):
     env = WarehouseEnv(level=level)
     alpha_val = alpha
@@ -209,7 +210,8 @@ def setup_test(
             backup_horizon=backup_horizon,
             cbf_alpha=alpha_val,
             safety_margin=safety_margin,
-            num_angle_policies=plcbf_num_angle_policies
+            num_angle_policies=plcbf_num_angle_policies,
+            line_width_scale=line_width_scale
         )
         filter_algo.set_environment(env)
 
@@ -280,6 +282,7 @@ def run_simulation(args, scenario_ghosts=None):
     paper_animation = bool(getattr(args, 'paper_animation', False))
     paper_no_zoom = bool(getattr(args, 'paper_no_zoom', False))
     save_svg = bool(getattr(args, 'save_svg', False))
+    line_width_scale = max(1e-6, float(getattr(args, 'paper_linewidth_scale', 1.0)))
     effective_safety_margin = float(getattr(args, 'safety_margin', 1.3))
     max_steps = int(getattr(args, 'max_steps', DEFAULT_BENCHMARK_MAX_STEPS))
     if save_mode:
@@ -296,6 +299,7 @@ def run_simulation(args, scenario_ghosts=None):
         plcbf_num_angle_policies=getattr(args, 'plcbf_num_angle_policies', 64),
         mip_num_angle_policies=getattr(args, 'mip_num_angle_policies', 32),
         alpha=getattr(args, 'alpha', None),
+        line_width_scale=line_width_scale,
     )
 
     if scenario_ghosts is not None:
@@ -379,7 +383,7 @@ def run_simulation(args, scenario_ghosts=None):
             sensing_range,
             fill=False,
             linestyle='--',
-            linewidth=1.8,
+            linewidth=1.8 * line_width_scale,
             edgecolor='deepskyblue',
             alpha=0.85,
             zorder=7,
@@ -392,7 +396,7 @@ def run_simulation(args, scenario_ghosts=None):
             robot_traj_x,
             robot_traj_y,
             color=ROBOT_TRAJECTORY_COLOR,
-            linewidth=ROBOT_TRAJECTORY_LINEWIDTH,
+            linewidth=ROBOT_TRAJECTORY_LINEWIDTH * line_width_scale,
             alpha=ROBOT_TRAJECTORY_ALPHA,
             zorder=0,
         )
@@ -433,7 +437,7 @@ def run_simulation(args, scenario_ghosts=None):
                     (ex, ey),
                     arrowstyle='-|>',
                     mutation_scale=14.0,
-                    linewidth=2.6,
+                    linewidth=2.6 * line_width_scale,
                     color=DETECTED_GHOST_COLOR,
                     alpha=0.95,
                     zorder=9,
@@ -918,6 +922,14 @@ if __name__ == "__main__":
         dest='paper_no_zoom',
         action='store_true',
         help='Disable paper-mode robot-centered zoom and keep full-map view.'
+    )
+    parser.add_argument(
+        '--paper_linewidth_scale',
+        '--paper-linewidth-scale',
+        dest='paper_linewidth_scale',
+        type=float,
+        default=1.0,
+        help='Scale factor applied to visualization line widths.'
     )
     parser.add_argument(
         '--paper_arrow_length',
