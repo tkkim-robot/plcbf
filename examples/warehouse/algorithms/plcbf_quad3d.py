@@ -442,16 +442,6 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         self._last_results = results
         self._last_best_name = best_name
 
-        if self.ax:
-            for name, (V, g, traj) in results.items():
-                if name in self.policy_lines:
-                    self.policy_lines[name].set_data(traj[:, 0], traj[:, 1])
-                    if name == best_name:
-                        self.policy_lines[name].set_linewidth(3)
-                        self.policy_lines[name].set_alpha(1.0)
-                    else:
-                        self.policy_lines[name].set_linewidth(1)
-                        self.policy_lines[name].set_alpha(0.3)
         self._last_time_derivative = time_derivatives.get(best_name, 0.0)
         if self.debug and self.curr_step % 50 == 0:
             lg_norm = float(np.linalg.norm(grad_best @ g))

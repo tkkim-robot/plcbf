@@ -14,6 +14,7 @@ import time
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
 from dataclasses import dataclass
 from typing import Optional, List, Any
 
@@ -55,8 +56,19 @@ from examples.warehouse.dynamics.dynamics_quad3d_jax import _build_quad3d_matric
 # Empirical rollout reach (PLCBF fallback policies, level-7 short run) is ~13.03 m.
 # Use 13.0 m sensing radius for visualization across all methods.
 DEFAULT_SENSING_RANGE_M = 13.0
+DEFAULT_BENCHMARK_MAX_STEPS = 350
+DEFAULT_ANIMATION_MAX_STEPS = 3000
+DEFAULT_ANIMATION_SAFETY_MARGIN = 1.4
 DETECTED_GHOST_COLOR = '#f16d7a'      # pastel red
 UNDETECTED_GHOST_COLOR = '#fbe3e8'    # very light pink
+ROBOT_TRAJECTORY_COLOR = '#5b8ff9'    # lighter blue than robot body
+ROBOT_TRAJECTORY_LINEWIDTH = 1.6
+ROBOT_TRAJECTORY_ALPHA = 0.5
+PAPER_ARROW_SCALE_M = 3.2
+PAPER_ARROW_MIN_SPEED = 1e-4
+DEFAULT_PAPER_HALF_WINDOW_M = 25.0    # ~50m x 50m view window
+DEFAULT_PAPER_ARROW_OUTER_OFFSET_M = 0.2
+FAILURE_HOLD_SECONDS = 1.0
 
 # =============================================================================
 # Setup Functions
@@ -264,10 +276,23 @@ def setup_test(
 # =============================================================================
 
 def run_simulation(args, scenario_ghosts=None):
+    save_mode = bool(getattr(args, 'save', False))
+    paper_animation = bool(getattr(args, 'paper_animation', False))
+    paper_no_zoom = bool(getattr(args, 'paper_no_zoom', False))
+    save_svg = bool(getattr(args, 'save_svg', False))
+    effective_safety_margin = float(getattr(args, 'safety_margin', 1.3))
+    max_steps = int(getattr(args, 'max_steps', DEFAULT_BENCHMARK_MAX_STEPS))
+    if save_mode:
+        # Animation runs use long-horizon defaults unless explicitly overridden.
+        effective_safety_margin = float(
+            getattr(args, 'animation_safety_margin', DEFAULT_ANIMATION_SAFETY_MARGIN)
+        )
+        max_steps = int(getattr(args, 'animation_max_steps', DEFAULT_ANIMATION_MAX_STEPS))
+
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = setup_test(
         args.algo,
         args.level,
-        args.safety_margin,
+        effective_safety_margin,
         plcbf_num_angle_policies=getattr(args, 'plcbf_num_angle_policies', 64),
         mip_num_angle_policies=getattr(args, 'mip_num_angle_policies', 32),
         alpha=getattr(args, 'alpha', None),
@@ -303,6 +328,12 @@ def run_simulation(args, scenario_ghosts=None):
     update_waypoint_markers = None
     sensing_patch = None
     update_ghost_detection_colors = None
+    ghost_velocity_arrows = None
+    paper_half_window = None
+    failure_marker_text = None
+    robot_traj_line = None
+    robot_traj_x = None
+    robot_traj_y = None
     if not args.no_render:
         plt.ion()
         fig, ax1 = env.setup_plot()
@@ -355,6 +386,70 @@ def run_simulation(args, scenario_ghosts=None):
             label='Sensing range'
         )
         ax1.add_patch(sensing_patch)
+        robot_traj_x = [float(env.start_pos[0])]
+        robot_traj_y = [float(env.start_pos[1])]
+        robot_traj_line, = ax1.plot(
+            robot_traj_x,
+            robot_traj_y,
+            color=ROBOT_TRAJECTORY_COLOR,
+            linewidth=ROBOT_TRAJECTORY_LINEWIDTH,
+            alpha=ROBOT_TRAJECTORY_ALPHA,
+            zorder=0,
+        )
+        failure_marker_text = ax1.text(
+            0.0, 0.0, '!',
+            color='red',
+            fontsize=40,
+            fontweight='bold',
+            ha='center',
+            va='center',
+            zorder=100,
+            visible=False
+        )
+
+        if paper_animation:
+            ghost_velocity_arrows = []
+            arrow_length = float(getattr(args, 'paper_arrow_length', PAPER_ARROW_SCALE_M))
+            for ghost in env.ghosts:
+                gx = float(ghost.get('x', 0.0))
+                gy = float(ghost.get('y', 0.0))
+                vx = float(ghost.get('vx', 0.0))
+                vy = float(ghost.get('vy', 0.0))
+                ghost_r = float(ghost.get('radius', 0.0))
+                speed = float(np.hypot(vx, vy))
+                if speed > PAPER_ARROW_MIN_SPEED:
+                    ux = vx / speed
+                    uy = vy / speed
+                    offset = ghost_r + DEFAULT_PAPER_ARROW_OUTER_OFFSET_M
+                    sx = gx + ux * offset
+                    sy = gy + uy * offset
+                    ex = sx + ux * arrow_length
+                    ey = sy + uy * arrow_length
+                else:
+                    sx, sy = gx, gy
+                    ex, ey = gx, gy
+                arrow = FancyArrowPatch(
+                    (sx, sy),
+                    (ex, ey),
+                    arrowstyle='-|>',
+                    mutation_scale=14.0,
+                    linewidth=2.6,
+                    color=DETECTED_GHOST_COLOR,
+                    alpha=0.95,
+                    zorder=9,
+                )
+                ax1.add_patch(arrow)
+                ghost_velocity_arrows.append(arrow)
+
+            if not paper_no_zoom:
+                requested_half_window = getattr(args, 'paper_zoom_half_window', None)
+                if requested_half_window is None:
+                    paper_half_window = max(DEFAULT_PAPER_HALF_WINDOW_M, sensing_range + 4.0)
+                else:
+                    paper_half_window = float(requested_half_window)
+                cx, cy = float(env.robot_pos[0]), float(env.robot_pos[1])
+                ax1.set_xlim(cx - paper_half_window, cx + paper_half_window)
+                ax1.set_ylim(cy - paper_half_window, cy + paper_half_window)
 
         def _update_ghost_detection_colors():
             if not hasattr(env, 'ghost_patches'):
@@ -367,12 +462,34 @@ def run_simulation(args, scenario_ghosts=None):
                 ghost_r = float(ghost.get('radius', 0.0))
                 detected = np.linalg.norm(robot_xy - ghost_xy) <= (sensing_range + ghost_r)
                 patch = env.ghost_patches[i]
-                if detected:
-                    patch.set_facecolor(DETECTED_GHOST_COLOR)
-                    patch.set_alpha(0.95)
-                else:
-                    patch.set_facecolor(UNDETECTED_GHOST_COLOR)
-                    patch.set_alpha(0.9)
+                color = DETECTED_GHOST_COLOR if detected else UNDETECTED_GHOST_COLOR
+                alpha = 0.95 if detected else 0.9
+                patch.set_facecolor(color)
+                patch.set_alpha(alpha)
+                if ghost_velocity_arrows is not None and i < len(ghost_velocity_arrows):
+                    vx = float(ghost.get('vx', 0.0))
+                    vy = float(ghost.get('vy', 0.0))
+                    speed = float(np.hypot(vx, vy))
+                    ghost_r = float(ghost.get('radius', 0.0))
+                    if speed > PAPER_ARROW_MIN_SPEED:
+                        arrow_len = float(getattr(args, 'paper_arrow_length', PAPER_ARROW_SCALE_M))
+                        ux = vx / speed
+                        uy = vy / speed
+                        offset = ghost_r + DEFAULT_PAPER_ARROW_OUTER_OFFSET_M
+                        sx = float(ghost_xy[0] + ux * offset)
+                        sy = float(ghost_xy[1] + uy * offset)
+                        ex = float(sx + ux * arrow_len)
+                        ey = float(sy + uy * arrow_len)
+                    else:
+                        sx = float(ghost_xy[0])
+                        sy = float(ghost_xy[1])
+                        ex = sx
+                        ey = sy
+                    start = (sx, sy)
+                    end = (ex, ey)
+                    ghost_velocity_arrows[i].set_positions(start, end)
+                    ghost_velocity_arrows[i].set_color(color)
+                    ghost_velocity_arrows[i].set_alpha(alpha)
 
         update_ghost_detection_colors = _update_ghost_detection_colors
         update_ghost_detection_colors()
@@ -380,6 +497,8 @@ def run_simulation(args, scenario_ghosts=None):
         fig, ax1 = None, None
         
     saver = None
+    save_name = getattr(args, 'save_name', None) or f"{args.algo}_lvl{args.level}.mp4"
+    svg_dir = None
     if args.save and fig:
         save_dir = getattr(args, 'save_dir', None) or f"output/animations/warehouse_{args.algo}_lvl{args.level}"
         saver = AnimationSaver(
@@ -388,6 +507,10 @@ def run_simulation(args, scenario_ghosts=None):
             dpi=250,
             video_height=1080
         )
+        if save_svg:
+            save_stem, _ = os.path.splitext(save_name)
+            svg_dir = os.path.join(save_dir, f"{save_stem}_svg_frames")
+            os.makedirs(svg_dir, exist_ok=True)
         
     # metrics
     infeasible = False
@@ -395,12 +518,28 @@ def run_simulation(args, scenario_ghosts=None):
     reached_goal = False
     nominal_track_steps = 0
     total_steps = 0
-    max_steps = int(getattr(args, 'max_steps', 350))
     solve_times = []
     policy_eval_times = []
     mip_solve_times = []
     
     print(f"Starting {args.algo} Level {args.level}...")
+
+    def _draw_failure_marker_and_hold(marker_xy):
+        if args.no_render or fig is None or ax1 is None:
+            return
+        if failure_marker_text is not None:
+            failure_marker_text.set_position((float(marker_xy[0]), float(marker_xy[1])))
+            failure_marker_text.set_visible(True)
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        hold_frames = max(1, int(round(FAILURE_HOLD_SECONDS / env.dt)))
+        if saver:
+            for _ in range(hold_frames):
+                saver.save_frame(fig)
+                if svg_dir and saver.frame_idx % max(1, saver.save_per_frame) == 0:
+                    frame_num = saver.frame_idx // max(1, saver.save_per_frame)
+                    svg_path = os.path.join(svg_dir, f"frame_{frame_num:05d}.svg")
+                    fig.savefig(svg_path, format='svg')
     
     for step in range(max_steps):
         # env doesn't simulate mechanics; use `current_state` for robot dynamics.
@@ -508,9 +647,8 @@ def run_simulation(args, scenario_ghosts=None):
             except ValueError as e:
                 print(f"Infeasible: {e}")
                 infeasible = True
-                u_safe = np.zeros(4) # Stop
-                if not args.no_render:
-                    ax1.text(current_state[0], current_state[1], "X", color='red', fontsize=20)
+                _draw_failure_marker_and_hold(current_state[:2])
+                break
         
         # 3. Step Robot
         # Apply u_safe to robot dynamics
@@ -518,6 +656,10 @@ def run_simulation(args, scenario_ghosts=None):
         
         # Update Env Robot Pos for visualization
         env.robot_pos = current_state[:2]
+        if robot_traj_line is not None and robot_traj_x is not None and robot_traj_y is not None:
+            robot_traj_x.append(float(env.robot_pos[0]))
+            robot_traj_y.append(float(env.robot_pos[1]))
+            robot_traj_line.set_data(robot_traj_x, robot_traj_y)
         
         if step % 200 == 0:
             dist_goal = np.linalg.norm(current_state[:2] - env.goal_pos)
@@ -566,6 +708,7 @@ def run_simulation(args, scenario_ghosts=None):
         total_steps += 1
         
         if collision:
+            _draw_failure_marker_and_hold(current_state[:2])
             break
             
         if not args.no_render:
@@ -586,15 +729,25 @@ def run_simulation(args, scenario_ghosts=None):
                  sensing_patch.center = env.robot_pos
              if update_ghost_detection_colors is not None:
                  update_ghost_detection_colors()
+             if paper_animation and (not paper_no_zoom) and paper_half_window is not None:
+                 cx, cy = float(env.robot_pos[0]), float(env.robot_pos[1])
+                 ax1.set_xlim(cx - paper_half_window, cx + paper_half_window)
+                 ax1.set_ylim(cy - paper_half_window, cy + paper_half_window)
              
              fig.canvas.draw()
              fig.canvas.flush_events()
              
-             if saver: saver.save_frame(fig)
+             if saver:
+                 saver.save_frame(fig)
+                 if svg_dir and saver.frame_idx % max(1, saver.save_per_frame) == 0:
+                     frame_num = saver.frame_idx // max(1, saver.save_per_frame)
+                     svg_path = os.path.join(svg_dir, f"frame_{frame_num:05d}.svg")
+                     fig.savefig(svg_path, format='svg')
              
     if saver:
-        save_name = getattr(args, 'save_name', None) or f"{args.algo}_lvl{args.level}.mp4"
         saver.export_video(save_name)
+        if svg_dir:
+            print(f"SVG frames saved to: {svg_dir}")
     if not args.no_render: plt.close(fig)
     
     result = {
@@ -721,12 +874,57 @@ if __name__ == "__main__":
     parser.add_argument('--sweep', action='store_true', help="Run all levels and algos")
     parser.add_argument('--sweep_levels', type=int, nargs='+', default=None, help='Specific levels to sweep (e.g. 0 1)')
     parser.add_argument('--safety_margin', type=float, default=1.3, help="Additive safety margin")
+    parser.add_argument(
+        '--animation_safety_margin',
+        type=float,
+        default=DEFAULT_ANIMATION_SAFETY_MARGIN,
+        help='Safety margin used when --save is enabled'
+    )
     parser.add_argument('--alpha', type=float, default=6.0)
     parser.add_argument('--plcbf_num_angle_policies', type=int, default=64, help="Number of angle fallback policies for PLCBF")
     parser.add_argument('--mip_num_angle_policies', type=int, default=32, help="Number of angle fallback policies for MIP-MPC")
     parser.add_argument('--timing_warmup_steps', type=int, default=10, help="Skip initial timing samples (JAX warmup/compile)")
-    parser.add_argument('--max_steps', type=int, default=350, help='Maximum simulation steps')
+    parser.add_argument('--max_steps', type=int, default=DEFAULT_BENCHMARK_MAX_STEPS, help='Maximum simulation steps')
+    parser.add_argument(
+        '--animation_max_steps',
+        type=int,
+        default=DEFAULT_ANIMATION_MAX_STEPS,
+        help='Maximum simulation steps used when --save is enabled'
+    )
     parser.add_argument('--sensing_range', type=float, default=DEFAULT_SENSING_RANGE_M, help="Sensing radius for visualization circle (meters)")
+    parser.add_argument(
+        '--paper_animation',
+        '--paper-animation',
+        dest='paper_animation',
+        action='store_true',
+        help='Enable paper-focused animation mode (dynamic-obstacle velocity arrows + robot-centered zoom).'
+    )
+    parser.add_argument(
+        '--save_svg',
+        '--save-svg',
+        dest='save_svg',
+        action='store_true',
+        help='When --save is enabled, also save per-frame SVG files and keep them.'
+    )
+    parser.add_argument(
+        '--paper_zoom_half_window',
+        type=float,
+        default=None,
+        help='Paper mode half-window in meters (default: ~30m).'
+    )
+    parser.add_argument(
+        '--paper_no_zoom',
+        '--paper-no-zoom',
+        dest='paper_no_zoom',
+        action='store_true',
+        help='Disable paper-mode robot-centered zoom and keep full-map view.'
+    )
+    parser.add_argument(
+        '--paper_arrow_length',
+        type=float,
+        default=PAPER_ARROW_SCALE_M,
+        help='Paper mode arrow length for dynamic obstacle velocity direction.'
+    )
     args = parser.parse_args()
     
     if args.sweep:

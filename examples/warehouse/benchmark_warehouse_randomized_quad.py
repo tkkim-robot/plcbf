@@ -521,15 +521,51 @@ def refresh_timing_one_by_one(
     return refreshed
 
 
+def _select_animation_work_items(
+    *,
+    algo_specs: List[AlgoSpec],
+    scenarios: List[TrialScenario],
+    args: argparse.Namespace,
+) -> Tuple[List[AlgoSpec], List[int]]:
+    selected_algo_specs = algo_specs
+    if args.animation_algos:
+        requested = set(args.animation_algos)
+        selected_algo_specs = [s for s in algo_specs if s.key in requested]
+    if not selected_algo_specs:
+        return [], []
+
+    if args.animation_indices:
+        selected_indices = sorted(set(int(i) for i in args.animation_indices))
+        invalid = [i for i in selected_indices if i < 0 or i >= len(scenarios)]
+        if invalid:
+            raise ValueError(
+                f"Invalid --animation-indices {invalid}; valid range is [0, {len(scenarios) - 1}]"
+            )
+    else:
+        n_sets = max(0, min(int(args.animation_sets), len(scenarios)))
+        if n_sets <= 0:
+            return [], []
+        selected_indices = list(range(n_sets))
+
+    return selected_algo_specs, selected_indices
+
+
 def save_randomized_animations(
     *,
     algo_specs: List[AlgoSpec],
     scenarios: List[TrialScenario],
     args: argparse.Namespace,
 ):
-    n_sets = max(0, min(int(args.animation_sets), len(scenarios)))
-    if n_sets <= 0:
-        print("No animation sets requested; skipping animation export.")
+    selected_algo_specs, selected_indices = _select_animation_work_items(
+        algo_specs=algo_specs,
+        scenarios=scenarios,
+        args=args,
+    )
+    if not selected_algo_specs:
+        print("No animation algorithms selected; skipping animation export.")
+        return
+    if not selected_indices:
+        print("No animation scenarios selected; skipping animation export.")
         return
 
     output_root = Path(args.animation_output_dir)
@@ -538,18 +574,26 @@ def save_randomized_animations(
     output_root = output_root / f"seed_{args.seed}"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Saving randomized animations ({n_sets} scenario sets) ===")
+    print(
+        f"\n=== Saving randomized animations ({len(selected_indices)} scenario sets, "
+        f"{len(selected_algo_specs)} algorithms) ==="
+    )
     print(f"Animation output root: {output_root}")
+    print(
+        "Animation defaults: "
+        f"safety_margin={args.animation_safety_margin:.2f}, "
+        f"max_steps={args.animation_max_steps}"
+    )
 
-    for idx in range(n_sets):
+    for idx in selected_indices:
         scenario = scenarios[idx]
         scenario_dir = output_root / f"idx_{idx:02d}"
         scenario_dir.mkdir(parents=True, exist_ok=True)
 
-        for algo_spec in algo_specs:
+        for algo_spec in selected_algo_specs:
             filename = f"warehouse_lvl{args.level}_{algo_spec.key}_idx{idx:02d}.mp4"
             print(
-                f"[Animation] idx={idx:02d}/{n_sets - 1:02d} algo={algo_spec.key:10s} "
+                f"[Animation] idx={idx:02d} algo={algo_spec.key:10s} "
                 f"-> {scenario_dir / filename}"
             )
 
@@ -560,15 +604,87 @@ def save_randomized_animations(
                 save=True,
                 save_dir=str(scenario_dir),
                 save_name=filename,
-                safety_margin=args.safety_margin,
+                paper_animation=args.paper_animation,
+                paper_no_zoom=args.paper_no_zoom,
+                save_svg=args.save_svg,
+                paper_zoom_half_window=args.paper_zoom_half_window,
+                paper_arrow_length=args.paper_arrow_length,
+                safety_margin=args.animation_safety_margin,
+                animation_safety_margin=args.animation_safety_margin,
                 alpha=args.alpha,
                 plcbf_num_angle_policies=args.plcbf_num_angle_policies,
                 mip_num_angle_policies=args.mip_num_angle_policies,
                 timing_warmup_steps=args.jit_warmup_steps,
                 sensing_range=args.sensing_range,
-                max_steps=args.max_steps,
+                max_steps=args.animation_max_steps,
+                animation_max_steps=args.animation_max_steps,
             )
             result = test_quad.run_simulation(anim_args, scenario_ghosts=scenario.ghosts)
+            print(
+                f"  result: collision={int(result.get('collision', False))} "
+                f"infeasible={int(result.get('infeasible', False))} "
+                f"reach_goal={int(result.get('reach_goal', False))}"
+            )
+
+
+def render_randomized_animations(
+    *,
+    algo_specs: List[AlgoSpec],
+    scenarios: List[TrialScenario],
+    args: argparse.Namespace,
+):
+    selected_algo_specs, selected_indices = _select_animation_work_items(
+        algo_specs=algo_specs,
+        scenarios=scenarios,
+        args=args,
+    )
+    if not selected_algo_specs:
+        print("No animation algorithms selected; skipping rendering.")
+        return
+    if not selected_indices:
+        print("No animation scenarios selected; skipping rendering.")
+        return
+
+    print(
+        f"\n=== Rendering randomized animations ({len(selected_indices)} scenario sets, "
+        f"{len(selected_algo_specs)} algorithms) ==="
+    )
+    print(
+        "Render defaults: "
+        f"safety_margin={args.animation_safety_margin:.2f}, "
+        f"max_steps={args.animation_max_steps}"
+    )
+
+    for idx in selected_indices:
+        scenario = scenarios[idx]
+
+        for algo_spec in selected_algo_specs:
+            print(f"[Render] idx={idx:02d} algo={algo_spec.key:10s}")
+
+            render_args = argparse.Namespace(
+                algo=algo_spec.key,
+                level=args.level,
+                no_render=False,
+                save=False,
+                save_dir=None,
+                save_name=None,
+                paper_animation=args.paper_animation,
+                paper_no_zoom=args.paper_no_zoom,
+                save_svg=False,
+                paper_zoom_half_window=args.paper_zoom_half_window,
+                paper_arrow_length=args.paper_arrow_length,
+                safety_margin=args.animation_safety_margin,
+                animation_safety_margin=args.animation_safety_margin,
+                alpha=args.alpha,
+                plcbf_num_angle_policies=args.plcbf_num_angle_policies,
+                mip_num_angle_policies=args.mip_num_angle_policies,
+                timing_warmup_steps=args.jit_warmup_steps,
+                sensing_range=args.sensing_range,
+                max_steps=args.animation_max_steps,
+                animation_max_steps=args.animation_max_steps,
+            )
+
+            result = test_quad.run_simulation(render_args, scenario_ghosts=scenario.ghosts)
             print(
                 f"  result: collision={int(result.get('collision', False))} "
                 f"infeasible={int(result.get('infeasible', False))} "
@@ -662,8 +778,54 @@ def main():
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--sensing-range", type=float, default=test_quad.DEFAULT_SENSING_RANGE_M)
     parser.add_argument("--save-animations", action="store_true")
+    parser.add_argument("--render", action="store_true")
     parser.add_argument("--animations-only", action="store_true")
+    parser.add_argument(
+        "--paper-animation",
+        action="store_true",
+        help="Enable paper-focused animation mode (velocity arrows + robot-centered zoom).",
+    )
+    parser.add_argument(
+        "--save-svg",
+        action="store_true",
+        help="When saving animations, also write per-frame SVG files (kept on disk).",
+    )
+    parser.add_argument(
+        "--paper-zoom-half-window",
+        type=float,
+        default=None,
+        help="Paper mode half-window in meters (default handled in test script).",
+    )
+    parser.add_argument(
+        "--paper-arrow-length",
+        type=float,
+        default=test_quad.PAPER_ARROW_SCALE_M,
+        help="Arrow length for dynamic-obstacle velocity direction in paper mode.",
+    )
+    parser.add_argument(
+        "--paper-no-zoom",
+        action="store_true",
+        help="Disable paper-mode robot-centered zoom (keep full-map view).",
+    )
     parser.add_argument("--animation-sets", type=int, default=5)
+    parser.add_argument("--animation-indices", type=int, nargs="+", default=None)
+    parser.add_argument(
+        "--animation-algos",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=[s.key for s in ALGO_SPECS],
+    )
+    parser.add_argument(
+        "--animation-safety-margin",
+        type=float,
+        default=test_quad.DEFAULT_ANIMATION_SAFETY_MARGIN,
+    )
+    parser.add_argument(
+        "--animation-max-steps",
+        type=int,
+        default=test_quad.DEFAULT_ANIMATION_MAX_STEPS,
+    )
     parser.add_argument(
         "--animation-output-dir",
         type=str,
@@ -709,6 +871,11 @@ def main():
 
     if args.animations_only and not args.save_animations:
         raise ValueError("--animations-only requires --save-animations")
+
+    if args.render:
+        render_randomized_animations(algo_specs=algo_specs, scenarios=scenarios, args=args)
+        print("Render-only run complete.")
+        return
 
     if args.save_animations:
         save_randomized_animations(algo_specs=algo_specs, scenarios=scenarios, args=args)

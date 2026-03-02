@@ -18,3 +18,22 @@ git submodule update --init --recursive
 uv sync
 ```
 
+## Warehouse Animation
+
+Run PLCBF simulation:
+```bash
+uv run python examples/warehouse/test_warehouse_quad.py
+```
+
+Reproduce animation in the project page:
+```bash
+uv run python examples/warehouse/benchmark_warehouse_randomized_quad.py \
+  --animation-algos plcbf \
+  --animation-indices 0 \
+  --render
+```
+
+Useful optional arguments:
+- `--animation-algos`: choose method(s), e.g. `--animation-algos plcbf pcbf`
+- `--save-animations`: save animations
+- `--animation-output-dir`: set output folder
