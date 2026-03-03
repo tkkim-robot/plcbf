@@ -140,9 +140,15 @@ class DoubleIntegratorDynamicsJAX:
         # u: [ax, ay]
         pos = x[:2]
         vel = x[2:]
-        
+
+        # Match safe_region_plot/dynamics_sim.py:
+        # per-axis saturation by mu*a_max and add sidewind in y acceleration.
+        limit = self.params.mu * self.params.a_max
+        u_sat = jnp.clip(u, -limit, limit)
+        accel = jnp.array([u_sat[0], u_sat[1] + self.params.sidewind])
+
         # Matches run.py Euler integration
-        vel_next = vel + u * self.params.dt
+        vel_next = vel + accel * self.params.dt
         pos_next = pos + vel_next * self.params.dt
         
         return jnp.concatenate([pos_next, vel_next])

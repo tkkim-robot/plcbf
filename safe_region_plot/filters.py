@@ -23,7 +23,7 @@ class BackupCBFWrapper(SafetyFilterWrapper):
         self._u_nom = u_nominal.reshape(-1, 1)
         # solve_control_problem returns control input
         u_safe = self.cbf.solve_control_problem(state)
-        return u_safe
+        return np.array(u_safe).reshape(-1, 1)
 
     def is_active(self, state, u_nominal):
         self.get_safe_control(state, u_nominal)
@@ -48,7 +48,7 @@ class MPSWrapper(SafetyFilterWrapper):
         # self.mps.committed_x_traj = None 
         # self.mps.committed_u_traj = None
         u_safe = self.mps.solve_control_problem(state)
-        return u_safe
+        return np.array(u_safe).reshape(-1, 1)
 
     def is_active(self, state, u_nominal):
         self.get_safe_control(state, u_nominal)
@@ -71,7 +71,7 @@ class GatekeeperWrapper(SafetyFilterWrapper):
         # self.gk.committed_x_traj = None
         # self.gk.committed_u_traj = None
         u_safe = self.gk.solve_control_problem(state)
-        return u_safe
+        return np.array(u_safe).reshape(-1, 1)
 
     def is_active(self, state, u_nominal):
         self.get_safe_control(state, u_nominal)
@@ -82,11 +82,11 @@ class GatekeeperWrapper(SafetyFilterWrapper):
 import jax.numpy as jnp
 from .jax_impl import (
     DoubleIntegratorParams, StopPolicyParams, TurnPolicyParams,
+    stop_policy, turn_policy,
     compute_value_and_grad_stop, compute_value_and_grad_turn,
     DoubleIntegratorDynamicsJAX
 )
-from plcbf.pcbf import PCBF
-from plcbf.plcbf import PLCBF
+from plcbf.pcbf import PCBFBase
 import cvxpy as cp
 
 
@@ -134,246 +134,171 @@ def solve_cbf_qp_di(self, u_nom, V, grad_V, f, G):
          raise ValueError("Solver Error")
 
 
-# =============================================================================
-# Subclasses for Double Integrator (Reuse Structure)
-# =============================================================================
+class PCBF_DI_Local(PCBFBase):
+    """Local DI PCBF controller used by safe_region_plot."""
 
-class PCBF_DI(PCBF):
-    """PCBF adapted for Double Integrator dynamics."""
-    
-    def __init__(self, robot, robot_spec, dt, backup_horizon, cbf_alpha, backup_controller):
-        super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha)
-        
-        # Overwrite Dynamics
+    def __init__(self, robot_spec, dt, backup_horizon, cbf_alpha, backup_controller):
         self.sys_params = DoubleIntegratorParams(
             a_max=robot_spec['a_max'],
             v_max=robot_spec['v_max'],
             radius=robot_spec['radius'],
             dt=dt,
             mu=robot_spec.get('mu', 1.0),
-            sidewind=robot_spec.get('sidewind', 0.0)
+            sidewind=robot_spec.get('sidewind', 0.0),
         )
+        self.obstacles = []
+        self.status = 'optimal'
+        super().__init__(
+            robot_spec=robot_spec,
+            dt=dt,
+            backup_horizon=backup_horizon,
+            cbf_alpha=cbf_alpha,
+            safety_margin=0.0,
+            ax=None,
+        )
+        act_limit = self.sys_params.mu * self.sys_params.a_max
+        self.u_min = np.array([-act_limit, -act_limit])
+        self.u_max = np.array([act_limit, act_limit])
+        self._set_policy_from_backup(backup_controller)
+
+    def _setup_dynamics(self):
         self.dynamics_jax = DoubleIntegratorDynamicsJAX(self.sys_params)
-        
-        # Overwrite Limits
-        self.u_min = np.array([-self.sys_params.a_max, -self.sys_params.a_max])
-        self.u_max = np.array([self.sys_params.a_max, self.sys_params.a_max])
-        # Obstacles
-        self.obstacles = [] # Will be updated from env
-        
-        # Alphas
-        if isinstance(cbf_alpha, dict):
-             self.alphas = cbf_alpha
-        else:
-             self.alphas = {'stop': cbf_alpha, 'turn_up': cbf_alpha, 'turn_down': cbf_alpha}
-        self.cbf_alpha = self.alphas['stop'] # Default initialization
 
-        # Parameters
-        
-        # Stop (Kept for reference if needed, or used by policy setup)
-        self.params_stop = StopPolicyParams(a_max=robot_spec['a_max'], k_v=backup_controller.k_v)
-
-        
-        self.backup_policy_jax = True # Bypass base check
-        
-        # Setup Policy
+    def _set_policy_from_backup(self, backup_controller):
         from .backup import StopBackupController, TurnBackupController
         if isinstance(backup_controller, StopBackupController):
-            self.policy_type = 'stop'
-            self.pol_params = StopPolicyParams(
+            self.set_policy('stop', StopPolicyParams(
                 a_max=backup_controller.a_max,
                 k_v=backup_controller.k_v
-            )
+            ))
         elif isinstance(backup_controller, TurnBackupController):
-            self.policy_type = 'turn'
-            # We must pass the dynamic targets from backup controller
-            # Assuming backup_controller has target_y_up and target_y_down
-            # If not present, default to 2.0 / -2.0
-            t_up = getattr(backup_controller, 'target_y_up', 2.0)
-            t_down = getattr(backup_controller, 'target_y_down', -2.0)
-            
-            self.pol_params = TurnPolicyParams(
+            self.set_policy('turn', TurnPolicyParams(
                 a_max=backup_controller.a_max,
                 k_v=backup_controller.k_v,
                 decision_y=backup_controller.decision_y,
-                target_y=0.0, # Dummy default
-                target_y_up=t_up,
-                target_y_down=t_down
-            )
+                target_y=0.0,
+                target_y_up=getattr(backup_controller, 'target_y_up', 2.0),
+                target_y_down=getattr(backup_controller, 'target_y_down', -2.0),
+            ))
         else:
-            raise ValueError("Unknown backup controller")
-            
-        # Bypass base class check in solve_control_problem
-        # The base class returns u_nom if this is None.
-        self.backup_policy_jax = True 
-        
-        self._jit_value_and_grad = None
+            raise ValueError("Unknown backup controller type")
+
+    def set_policy(self, policy_type: str, params):
+        self.policy_type = policy_type
+        self.policy_params = params
+
+    def _get_control_dim(self):
+        return 2
+
+    def _add_input_constraints(self, u, constraints):
+        constraints.append(u[0] <= self.u_max[0])
+        constraints.append(u[0] >= self.u_min[0])
+        constraints.append(u[1] <= self.u_max[1])
+        constraints.append(u[1] >= self.u_min[1])
+
+    def _get_system_matrices(self, state):
+        st = np.array(state).flatten()
+        f = np.array([st[2], st[3], 0.0, self.sys_params.sidewind])
+        g = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        return f, g
 
     def _update_obstacles(self):
-        """Override to ensure obstacles are loaded from env."""
         if self.env is not None and hasattr(self.env, 'obstacles'):
-             self.obstacles = self.env.obstacles
-             # DEBUG PRINT to confirm
-             # if len(self.obstacles) == 0:
-             #    print("DEBUG PCBF: Obstacles list is EMPTY!", flush=True)
-             # else:
-             #    # Print once to verify format
-             #    pass 
+            self.obstacles = self.env.obstacles
         else:
-             self.obstacles = []
+            self.obstacles = []
 
-    def _compute_value_and_grad(self, x0_jax):
+    def _compute_value_and_grad(self, state):
+        x0 = jnp.array(np.array(state).flatten())
         horizon_steps = self.backup_horizon_steps
-        
-        # DEBUG OBSTACLE Check
-        # if abs(x0_jax[0] + 4.0) < 0.2:
-        #      print(f"DEBUG JAX: x={x0_jax} len(obs)={len(self.obstacles)}", flush=True)
+        if len(self.obstacles) == 0:
+            return 100.0, np.zeros(4), np.array([np.array(state).flatten()])
 
-        if len(self.obstacles) > 0:
-            obs = self.obstacles[0]
-            # Handle Dict or List/Tuple
-            if isinstance(obs, dict):
-                obs_vals = [obs['x'], obs['y'], obs['radius']]
-            else:
-                obs_vals = [obs[0], obs[1], obs[2]]
-            obs_jax = jnp.array(obs_vals)
+        obs = self.obstacles[0]
+        if isinstance(obs, dict):
+            obs_vals = [obs['x'], obs['y'], obs.get('radius', obs.get('spec', {}).get('radius', 1.0))]
         else:
-            return 100.0, jnp.zeros(4), x0_jax[None, :]
-            
+            obs_vals = [obs[0], obs[1], obs[2]]
+        obs_jax = jnp.array(obs_vals)
+
         if self.policy_type == 'stop':
-            V, grad_V = compute_value_and_grad_stop(
-                x0_jax, self.sys_params, self.pol_params, obs_jax, horizon_steps
-            )
+            V, grad_V = compute_value_and_grad_stop(x0, self.sys_params, self.policy_params, obs_jax, horizon_steps)
         else:
-            V, grad_V = compute_value_and_grad_turn(
-                x0_jax, self.sys_params, self.pol_params, obs_jax, horizon_steps
-            )
+            V, grad_V = compute_value_and_grad_turn(x0, self.sys_params, self.policy_params, obs_jax, horizon_steps)
+        return float(V), np.array(grad_V), np.array([np.array(state).flatten()])
 
-        return float(V), np.array(grad_V), x0_jax[None, :]
+    def _add_cbf_constraints(self, u, constraints, state, V, grad_V):
+        f, g = self._get_system_matrices(state)
+        Lf = float(np.dot(grad_V, f))
+        Lg = np.array(grad_V) @ g
+        constraints.append(Lg @ u >= -self.cbf_alpha * V - Lf)
 
-    def _solve_cbf_qp(self, u_nom, V, grad_V, f, G):
-         return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
+    def solve_control_problem(self, state, control_ref=None, friction=None):
+        self._update_obstacles()
+        return super().solve_control_problem(np.array(state).flatten(), control_ref=control_ref, friction=friction)
 
 
-class PLCBF_DI(PLCBF):
-    def __init__(self, robot, robot_spec, dt, backup_horizon, alpha, backup_controller):
-        # Handle dict alpha for base class call (pass dummy or first value)
+class PLCBF_DI_Local(PCBF_DI_Local):
+    """Local DI PLCBF controller used by safe_region_plot."""
+
+    def __init__(self, robot_spec, dt, backup_horizon, alpha, backup_controller):
         base_alpha = alpha['stop'] if isinstance(alpha, dict) else alpha
-        
-        # Store KV for use in setup
-        self.backup_controller_kv = backup_controller.k_v
-
-        # Call Super Init (sets self.robot_spec and calls _setup_multi_policies)
-        super().__init__(robot, robot_spec, dt, backup_horizon, base_alpha, max_operator='c')
-        
-        # Initialize Dynamics AFTER super().__init__ to overwrite base class defaults
-        self.sys_params = DoubleIntegratorParams(
-            a_max=robot_spec['a_max'],
-            v_max=robot_spec['v_max'],
-            radius=robot_spec['radius'],
-            dt=dt,
-            mu=robot_spec.get('mu', 1.0),
-            sidewind=robot_spec.get('sidewind', 0.0)
-        )
-        self.dynamics_jax = DoubleIntegratorDynamicsJAX(self.sys_params)
-        self.u_min = np.array([-self.sys_params.a_max, -self.sys_params.a_max])
-        self.u_max = np.array([self.sys_params.a_max, self.sys_params.a_max])
-        
-        # Alphas Setup
+        super().__init__(robot_spec, dt, backup_horizon, base_alpha, backup_controller)
         if isinstance(alpha, dict):
-             self.alphas = alpha
+            self.alphas = alpha
         else:
-             self.alphas = {'stop': alpha, 'turn_up': alpha, 'turn_down': alpha}
-
-    def _setup_multi_policies(self):
-        """Setup policies for Double Integrator (Stop, Turn Up, Turn Down)."""
-        # Create params locally (or store if needed elsewhere)
-        # Turn Up (Force UP by setting decision_y low)
-        self.params_turn_up = TurnPolicyParams(
-            a_max=self.robot_spec['a_max'], 
-            k_v=1.0, 
-            decision_y=-100.0,
-            target_y=2.0,
-            target_y_up=2.0,
-            target_y_down=2.0
-        )
-        # Turn Down (Force DOWN by setting decision_y high)
-        self.params_turn_down = TurnPolicyParams(
-            a_max=self.robot_spec['a_max'], 
-            k_v=1.0, 
-            decision_y=100.0,
-            target_y=-2.0,
-            target_y_up=-2.0,
-            target_y_down=-2.0
-        )
-        # Stop
-        # Note: self.backup_controller_kv must be set before super().__init__ calls this
-        k_v = getattr(self, 'backup_controller_kv', 1.0) 
-        self.params_stop = StopPolicyParams(a_max=self.robot_spec['a_max'], k_v=k_v)
-
-        self.policy_configs = {
-             'stop': {
-                 'type': 'stop',
-                 'params': self.params_stop,
-                 'horizon': self.backup_horizon_steps
-             },
-             'turn_up': {
-                 'type': 'turn',
-                 'params': self.params_turn_up,
-                 'horizon': self.backup_horizon_steps
-             },
-             'turn_down': {
-                 'type': 'turn',
-                 'params': self.params_turn_down,
-                 'horizon': self.backup_horizon_steps
-             }
+            self.alphas = {'stop': alpha, 'turn_up': alpha, 'turn_down': alpha}
+        self.policy_bank = {
+            'stop': ('stop', StopPolicyParams(a_max=robot_spec['a_max'], k_v=getattr(backup_controller, 'k_v', 1.0))),
+            'turn_up': ('turn', TurnPolicyParams(a_max=robot_spec['a_max'], k_v=1.0, decision_y=-100.0, target_y=2.0, target_y_up=2.0, target_y_down=2.0)),
+            'turn_down': ('turn', TurnPolicyParams(a_max=robot_spec['a_max'], k_v=1.0, decision_y=100.0, target_y=-2.0, target_y_up=-2.0, target_y_down=-2.0)),
         }
-        
-        # Nominal "policy" is handled implicitly in compute_value (no params needed)
 
+    def solve_control_problem(self, state, control_ref=None, friction=None):
+        self._update_obstacles()
+        st = np.array(state).flatten()
+        u_nom = np.array(control_ref['u_ref']).flatten() if control_ref and 'u_ref' in control_ref else np.zeros(2)
+        if len(self.obstacles) == 0:
+            return u_nom.reshape(-1, 1)
 
-    def _compute_multi_value_and_grad(self, x0_jax):
-        horizon_steps = self.backup_horizon_steps
-        if len(self.obstacles) > 0:
-            obs = self.obstacles[0]
-            if isinstance(obs, dict):
-                obs_vals = [obs['x'], obs['y'], obs['radius']]
-            else:
-                obs_vals = [obs[0], obs[1], obs[2]]
-            
-            obs_jax = jnp.array(obs_vals)
+        obs = self.obstacles[0]
+        if isinstance(obs, dict):
+            obs_vals = [obs['x'], obs['y'], obs.get('radius', obs.get('spec', {}).get('radius', 1.0))]
         else:
-             V_dict = {n: 100.0 for n in self.policy_configs}
-             grad_V_dict = {n: np.zeros(4) for n in self.policy_configs}
-             V_dict['nominal'] = 100.0
-             grad_V_dict['nominal'] = np.zeros(4)
-             return V_dict, grad_V_dict, {}
+            obs_vals = [obs[0], obs[1], obs[2]]
+        obs_jax = jnp.array(obs_vals)
+        x0 = jnp.array(st)
 
-        V_dict = {}
-        grad_V_dict = {}
-        
-        # 1. Backup Policies
-        for name, config in self.policy_configs.items():
-            ptype = config['type']
-            params = config['params']
-            
+        best_name = None
+        best_V = -np.inf
+        best_grad = np.zeros(4)
+        best_policy = None
+        for name, (ptype, pparams) in self.policy_bank.items():
             if ptype == 'stop':
-                V, grad_V = compute_value_and_grad_stop(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
+                V, grad_V = compute_value_and_grad_stop(x0, self.sys_params, pparams, obs_jax, self.backup_horizon_steps)
             else:
-                V, grad_V = compute_value_and_grad_turn(x0_jax, self.sys_params, params, obs_jax, horizon_steps)
-            
-            V_dict[name] = float(V)
-            grad_V_dict[name] = np.array(grad_V)
-            
-        # 2. Nominal Policy
-        # Set to -inf to ensure we only rely on valid Backups for safety analysis unless explicit nominal trajectory is provided
-        V_dict['nominal'] = -np.inf 
-        grad_V_dict['nominal'] = np.zeros(4) # FIXME: you have to put nominal policy too
-            
-        return V_dict, grad_V_dict, {}
+                V, grad_V = compute_value_and_grad_turn(x0, self.sys_params, pparams, obs_jax, self.backup_horizon_steps)
+            V = float(V)
+            if V > best_V:
+                best_V = V
+                best_grad = np.array(grad_V)
+                best_name = name
+                best_policy = (ptype, pparams)
 
-    def _solve_cbf_qp(self, u_nom, V, grad_V, f, G):
-        return solve_cbf_qp_di(self, u_nom, V, grad_V, f, G)
+        self.cbf_alpha = float(self.alphas.get(best_name, self.alphas.get('stop', self.cbf_alpha)))
+        f, g = self._get_system_matrices(st)
+        try:
+            u_safe = solve_cbf_qp_di(self, u_nom, best_V, best_grad, f, g)
+            if u_safe is None:
+                raise ValueError("qp returned None")
+            return np.array(u_safe).reshape(-1, 1)
+        except Exception:
+            ptype, pparams = best_policy
+            if ptype == 'stop':
+                u_fb = np.array(stop_policy(x0, pparams))
+            else:
+                u_fb = np.array(turn_policy(x0, pparams))
+            return u_fb.reshape(-1, 1)
 
 
 # Base Wrapper Common Logic
@@ -383,21 +308,21 @@ class BaseDIWrapper(SafetyFilterWrapper):
         self.env = None
         
     def set_environment(self, env):
+        self.env = env
         self.controller.set_environment(env)
         
     def get_safe_control(self, state, u_nominal):
-        return self.controller.solve_control_problem(state, {'u_ref': u_nominal})
+        if hasattr(self.controller, '_update_obstacles'):
+            self.controller._update_obstacles()
+        u_safe = self.controller.solve_control_problem(state, {'u_ref': u_nominal})
+        return np.array(u_safe).reshape(-1, 1)
 
 class PCBFWrapper(BaseDIWrapper):
     def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0, alpha=5.0):
-        controller = PCBF_DI(robot, robot_spec, dt, backup_horizon, alpha, backup_controller)
+        controller = PCBF_DI_Local(robot_spec, dt, backup_horizon, alpha, backup_controller)
         super().__init__(controller)
 
 class PLCBFWrapper(BaseDIWrapper):
     def __init__(self, robot, robot_spec, backup_controller, dt=0.05, backup_horizon=2.0, alpha=5.0):
-        controller = PLCBF_DI(robot, robot_spec, dt, backup_horizon, alpha, backup_controller)
+        controller = PLCBF_DI_Local(robot_spec, dt, backup_horizon, alpha, backup_controller)
         super().__init__(controller)
-
-
-
-

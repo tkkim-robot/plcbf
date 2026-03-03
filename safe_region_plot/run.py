@@ -8,6 +8,9 @@ from .backup import StopBackupController, TurnBackupController
 from .filters import BackupCBFWrapper, MPSWrapper, GatekeeperWrapper, PCBFWrapper, PLCBFWrapper
 from .analysis import compute_viability_kernel, evaluate_filter
 
+# Keep SVG text editable in vector editors (avoid path outlining).
+plt.rcParams['svg.fonttype'] = 'none'
+
 def main():
     parser = argparse.ArgumentParser(description="Safe Region Plotting Tool")
     parser.add_argument("--vx", type=float, default=2.0, help="Initial X velocity")
@@ -21,12 +24,23 @@ def main():
     parser.add_argument("--force", action="store_true", help="Ignore existing results and re-run all")
     parser.add_argument("--plot_only", action="store_true", help="Only generate plot from existing .npz files (skips trajectory viz)")
     parser.add_argument("--plot_hj_only", action="store_true", help="Only plot HJ reachability boundary and exit")
+    parser.add_argument("--safe-region-only", action="store_true", help="Plot only safe-region row (no filter-boundary row)")
     parser.add_argument("--method", type=str, default=None, help="Filter to run only specific method (e.g. PCBF)")
     parser.add_argument("--policy", type=str, default=None, help="Filter to run only specific policy (e.g. stop)")
     parser.add_argument('--mu', type=float, default=1.0, help='Friction coefficient (for saturation).')
     parser.add_argument('--sidewind', type=float, default=0.0, help='Sidewind acceleration component.')
+    parser.add_argument('--save-svg', action='store_true', help='Also save each figure as SVG')
     
     args = parser.parse_args()
+
+    # Global font sizing tuned for publication-quality readability.
+    font_sizes = {
+        'suptitle': 30,
+        'title': 20,
+        'axis_label': 18,
+        'tick': 18,
+        'legend': 16,
+    }
     
     if args.test:
         args.res = 10
@@ -126,7 +140,10 @@ def main():
         print("Plotting HJ Reachability Boundary only...")
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.set_aspect('equal')
-        ax.set_title(f"HJ Reachability Boundary (Initial Velocity: [{args.vx}, {args.vy}])")
+        ax.set_title(
+            f"HJ Reachability Boundary (Initial Velocity: [{args.vx}, {args.vy}])",
+            fontsize=font_sizes['title'],
+        )
         
         hj_slice = get_hj_slice(args.vx, args.vy)
         hj_x = np.array(grid_hj.coordinate_vectors[0])
@@ -145,16 +162,21 @@ def main():
             Line2D([0], [0], color='black', linestyle='--', label='HJ (Viability Kernel)'),
             mpatches.Patch(color='red', alpha=0.3, label='Obstacle + Margin')
         ]
-        ax.legend(handles=legend_elements, loc='upper right')
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=font_sizes['legend'])
         
-        ax.set_xlabel("X [m]")
-        ax.set_ylabel("Y [m]")
+        ax.set_xlabel("X [m]", fontsize=font_sizes['axis_label'])
+        ax.set_ylabel("Y [m]", fontsize=font_sizes['axis_label'])
+        ax.tick_params(axis='both', labelsize=font_sizes['tick'])
         ax.set_xlim([-4.0, 2.0])
         ax.set_ylim([-2.5, 2.5])
         
         save_name = "safe_region_hj_only.png"
         save_path = os.path.join(args.save_path, save_name)
         plt.savefig(save_path, bbox_inches='tight')
+        if args.save_svg:
+            save_path_svg = os.path.join(args.save_path, "safe_region_hj_only.svg")
+            plt.savefig(save_path_svg, bbox_inches='tight')
+            print(f"Saved plot: {save_path_svg}")
         print(f"Saved plot: {save_path}")
         return
 
@@ -224,8 +246,11 @@ def main():
         for method in methods:
             # File Handling
             if method == 'PLCBF':
-                # Force shared file for PLCBF
+                # Prefer current shared PLCBF file name, but fall back to legacy MPCBF name.
                 method_file = os.path.join(args.save_path, f"result_PLCBF_shared_res{args.res}.npz")
+                legacy_method_file = os.path.join(args.save_path, f"result_MPCBF_shared_res{args.res}.npz")
+                if not os.path.exists(method_file) and os.path.exists(legacy_method_file):
+                    method_file = legacy_method_file
             else:
                 method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
             
@@ -307,167 +332,288 @@ def main():
         
         # Plotting
         if args.subfigures:
-            # 5 methods -> 5 columns? Or 2 rows, 3 cols (one empty)?
-            # User wants: "put these two new figure next to gatekeeeper"
-            # Current: BCBF, MPS, GK. New: PCBF, PLCBF. Total 5.
-            # Layout: 2 rows (Boundary, Safe Set). 5 Columns.
-            fig, axes = plt.subplots(2, 5, figsize=(25, 10))
-            fig.suptitle(f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])", fontsize=20)
-            
-            hj_slice = get_hj_slice(args.vx, args.vy)
-            hj_x = np.array(grid_hj.coordinate_vectors[0])
-            hj_y = np.array(grid_hj.coordinate_vectors[1])
+            if args.safe_region_only:
+                fig, axes = plt.subplots(1, len(methods), figsize=(25, 5.5))
+                if len(methods) == 1:
+                    axes = [axes]
+                fig.suptitle(
+                    f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])",
+                    fontsize=font_sizes['suptitle'],
+                )
 
-            for row, title_base in enumerate(["Filter Boundary", "Safe Region"]):
+                hj_slice = get_hj_slice(args.vx, args.vy)
+                hj_x = np.array(grid_hj.coordinate_vectors[0])
+                hj_y = np.array(grid_hj.coordinate_vectors[1])
+
                 for col, method in enumerate(methods):
-                    ax = axes[row, col]
+                    ax = axes[col]
                     ax.set_aspect('equal')
-                    ax.set_title(f"{method} {title_base}", fontsize=14)
-                    
-            # Unsafe Set
+                    ax.set_title(f"{method} Safe Region", fontsize=font_sizes['title'])
                     ax.add_patch(plt.Circle(obstacle_pos, obstacle_radius + robot_radius, color='red', alpha=0.3))
-                    # HJ Oracle
                     ax.contour(hj_x, hj_y, hj_slice.T, levels=[0], colors='black', linestyles='--')
-                    
-                    data = results[method]
-                    
-                    # Create masks
-                    # safe_mask: 1 where Safe, 0 where Unsafe
-                    safe_mask = (data['safe_set'] > 0.5).astype(float)
-                    
-                    if row == 0: # Filter Boundary
-                         # Boundary Data: 1=Intervening(Active), 0=Nominal(Inactive)
-                         # We want to fill the "Inactive" region (Nominal Accepted) BUT ONLY if it is Safe.
-                         # If it is Unsafe, it should NOT be filled (or filled with red/nothing).
-                         # Logic: Fill if (Boundary==0 AND Safe==1)
-                         
-                         boundary_grid = data['boundary']
-                         
-                         # Plot the transition line (Active <-> Inactive)
-                         if np.any(boundary_grid) and not np.all(boundary_grid):
-                            ax.contour(eval_x, eval_y, boundary_grid.T, levels=[0.5], 
-                                       colors=colors[method], linestyles='--')
-                         
-                         # Fill: Inactive AND Safe
-                         # We construct a field that is 1 where we want to fill, 0 otherwise
-                         fill_region = (boundary_grid < 0.5) & (safe_mask > 0.5)
-                         
-                         if np.any(fill_region):
-                             # quick hack: contourf needs values. 
-                             # We can just plot the safe_mask, but cut out the active region?
-                             # Or just contourf the boolean combined mask
-                             # 1.0 where we want fill, 0.0 otherwise. Levels [0.5, 1.5]
-                             ax.contourf(eval_x, eval_y, fill_region.astype(float).T, levels=[0.5, 1.5], 
-                                         colors=[colors[method]], alpha=fill_alphas[method])
-                        
-                    else: # Safe Region
-                         # Just plot where Safe=1
-                         if np.any(data['safe_set']) and not np.all(data['safe_set']):
-                            ax.contour(eval_x, eval_y, data['safe_set'].T, levels=[0.5], 
-                                       colors=colors[method], linestyles='--')
-                            ax.contourf(eval_x, eval_y, data['safe_set'].T, levels=[0.5, 1.5], 
-                                        colors=[colors[method]], alpha=fill_alphas[method])
-                    
-                    # Force Limits at the END
-                    ax.set_xlim([-4.0, 2.0])
-                    ax.set_ylim([-2.5, 2.5])
-                         
-                    # --- TRAJECTORY VISUALIZATION ---
-                    # User requested dense grid 1m x 1m
-                    points_to_debug = []
-                    # x: -4, -3, -2, -1, 0, 1, 2
-                    for x_pt in np.arange(-4.0, 2.1, 1.0):
-                        # y: -2, -1, 0, 1, 2
-                        for y_pt in np.arange(-2.0, 2.1, 1.0):
-                            points_to_debug.append([x_pt, y_pt])
-                
-                    class MockEnv:
-                        def __init__(self, obstacles):
-                            self.obstacles = obstacles
-                            
-                        def check_obstacle_collision(self, position, robot_radius):
-                            for obs in self.obstacles:
-                                # Fix broadcasting: Ensure both valid vectors are flattened
-                                pos_flat = np.array(position).flatten()
-                                obs_flat = np.array([obs['x'], obs['y']]).flatten()
-                                dist = np.linalg.norm(pos_flat - obs_flat)
-                                if dist < (obs['radius'] + robot_radius):
-                                    return True, "Collision"
-                            return False, "Safe"
-                    obst_dict = {
-                        'x': obstacle_pos[0], 'y': obstacle_pos[1], 
-                        'radius': obstacle_radius,
-                        'spec': {'radius': obstacle_radius}
-                    }
-                    env_mock_traj = MockEnv([obst_dict])
-                    for pt in points_to_debug:
-                        # Setup
-                        state = np.array([pt[0], pt[1], args.vx, args.vy]).reshape(-1, 1)
-                        u_nom = np.zeros((2, 1))
-                        traj_x = [state[:2].flatten()]
-                        is_safe_traj = True
-                        
-                        # Re-init filter for this trajectory
-                        wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'PLCBF': PLCBFWrapper}[method]
-                        if method == "BackupCBF":
-                            fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
-                        elif method == "PLCBF":
-                             # PLCBF MUST use the fixed heterogeneous alpha dict regardless of the current plot policy
-                             plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
-                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
-                        elif method == "PCBF":
-                             fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
-                        else:
-                            fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
-                        
-                        # IMPORTANT: Set environment for filter!
-                        if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock_traj)
-                        if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock_traj)
-                        if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock_traj)
-                        if hasattr(fw, 'set_environment'): fw.set_environment(env_mock_traj)
 
-                        # Simulate
-                        n_steps_vis = int(args.t_max / dt)
-                        curr_state = state.copy()
-                        for k in range(n_steps_vis):
-                                # Check collision
+                    data = results[method]
+                    if np.any(data['safe_set']) and not np.all(data['safe_set']):
+                        ax.contour(eval_x, eval_y, data['safe_set'].T, levels=[0.5],
+                                   colors=colors[method], linestyles='--')
+                        ax.contourf(eval_x, eval_y, data['safe_set'].T, levels=[0.5, 1.5],
+                                    colors=[colors[method]], alpha=fill_alphas[method])
+
+                    # Closed-loop trajectory overlay on a dense start-state grid.
+                    if not args.plot_only:
+                        points_to_debug = []
+                        for x_pt in np.arange(-4.0, 2.1, 1.0):
+                            for y_pt in np.arange(-2.0, 2.1, 1.0):
+                                points_to_debug.append([x_pt, y_pt])
+
+                        class MockEnv:
+                            def __init__(self, obstacles):
+                                self.obstacles = obstacles
+
+                            def check_obstacle_collision(self, position, robot_radius):
+                                for obs in self.obstacles:
+                                    pos_flat = np.array(position).flatten()
+                                    obs_flat = np.array([obs['x'], obs['y']]).flatten()
+                                    dist = np.linalg.norm(pos_flat - obs_flat)
+                                    if dist < (obs['radius'] + robot_radius):
+                                        return True, "Collision"
+                                return False, "Safe"
+
+                        obst_dict = {
+                            'x': obstacle_pos[0], 'y': obstacle_pos[1],
+                            'radius': obstacle_radius,
+                            'spec': {'radius': obstacle_radius}
+                        }
+                        env_mock_traj = MockEnv([obst_dict])
+                        for pt in points_to_debug:
+                            state = np.array([pt[0], pt[1], args.vx, args.vy]).reshape(-1, 1)
+                            u_nom = np.zeros((2, 1))
+                            traj_x = [state[:2].flatten()]
+                            is_safe_traj = True
+
+                            wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'PLCBF': PLCBFWrapper}[method]
+                            if method == "BackupCBF":
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
+                            elif method == "PLCBF":
+                                plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
+                            elif method == "PCBF":
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
+                            else:
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
+
+                            if hasattr(fw, 'cbf'):
+                                fw.cbf.set_environment(env_mock_traj)
+                            if hasattr(fw, 'mps'):
+                                fw.mps.set_environment(env_mock_traj)
+                            if hasattr(fw, 'gk'):
+                                fw.gk.set_environment(env_mock_traj)
+                            if hasattr(fw, 'set_environment'):
+                                fw.set_environment(env_mock_traj)
+
+                            n_steps_vis = int(args.t_max / dt)
+                            curr_state = state.copy()
+                            for _ in range(n_steps_vis):
                                 if env_mock_traj.check_obstacle_collision(curr_state[:2], robot_radius)[0]:
                                     is_safe_traj = False
                                     break
                                 try:
                                     u = fw.get_safe_control(curr_state, u_nom)
-                                    if u is None: u = u_nom # Visual fail
-                                    
-                                    # Integrate (Use robot.step to match analysis/gym exactly)
-                                    # robot.step expects column vectors (4,1) and (2,1) or similar
-                                    # output is column vector
+                                    if u is None:
+                                        u = u_nom
                                     state_col = curr_state.reshape(-1, 1)
                                     u_col = u.reshape(-1, 1)
                                     next_state = robot.step(state_col, u_col)
                                     curr_state = next_state.flatten()
-                                    
                                     traj_x.append(curr_state[:2])
-                                    
-                                except:
+                                except Exception:
                                     is_safe_traj = False
                                     break
-                        
-                        traj_x = np.array(traj_x)
-                        color = 'green' if is_safe_traj else 'orange'
-                        ax.plot(traj_x[:, 0], traj_x[:, 1], color=color, linewidth=2, alpha=0.8)
-                        ax.scatter([pt[0]], [pt[1]], color=color, s=30, zorder=5)
-                                
-                        if not is_safe_traj:
-                            ax.plot(traj_x[-1, 0], traj_x[-1, 1], 'x', color='red', markersize=8, markeredgewidth=2)
 
-                    
-                    ax.set_xlabel("X [m]")
-                    ax.set_ylabel("Y [m]")
+                            traj_x = np.array(traj_x)
+                            color = 'green' if is_safe_traj else 'orange'
+                            ax.plot(traj_x[:, 0], traj_x[:, 1], color=color, linewidth=2, alpha=0.8)
+                            ax.scatter([pt[0]], [pt[1]], color=color, s=30, zorder=5)
+                            if not is_safe_traj:
+                                ax.plot(traj_x[-1, 0], traj_x[-1, 1], 'x', color='red', markersize=8, markeredgewidth=2)
+
+                    ax.set_xlabel("X [m]", fontsize=font_sizes['axis_label'])
+                    ax.set_ylabel("Y [m]", fontsize=font_sizes['axis_label'])
+                    ax.tick_params(axis='both', labelsize=font_sizes['tick'])
                     ax.set_xlim([-4.0, 2.0])
                     ax.set_ylim([-2.5, 2.5])
+
+            else:
+            # 5 methods -> 5 columns? Or 2 rows, 3 cols (one empty)?
+            # User wants: "put these two new figure next to gatekeeeper"
+            # Current: BCBF, MPS, GK. New: PCBF, PLCBF. Total 5.
+            # Layout: 2 rows (Boundary, Safe Set). 5 Columns.
+                fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+                fig.suptitle(
+                    f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])",
+                    fontsize=font_sizes['suptitle'],
+                )
+                
+                hj_slice = get_hj_slice(args.vx, args.vy)
+                hj_x = np.array(grid_hj.coordinate_vectors[0])
+                hj_y = np.array(grid_hj.coordinate_vectors[1])
+
+                for row, title_base in enumerate(["Filter Boundary", "Safe Region"]):
+                    for col, method in enumerate(methods):
+                        ax = axes[row, col]
+                        ax.set_aspect('equal')
+                        ax.set_title(f"{method} {title_base}", fontsize=font_sizes['title'])
+                    
+                # Unsafe Set
+                        ax.add_patch(plt.Circle(obstacle_pos, obstacle_radius + robot_radius, color='red', alpha=0.3))
+                        # HJ Oracle
+                        ax.contour(hj_x, hj_y, hj_slice.T, levels=[0], colors='black', linestyles='--')
+                    
+                        data = results[method]
+                    
+                        # Create masks
+                        # safe_mask: 1 where Safe, 0 where Unsafe
+                        safe_mask = (data['safe_set'] > 0.5).astype(float)
+                    
+                        if row == 0: # Filter Boundary
+                             # Boundary Data: 1=Intervening(Active), 0=Nominal(Inactive)
+                             # We want to fill the "Inactive" region (Nominal Accepted) BUT ONLY if it is Safe.
+                             # If it is Unsafe, it should NOT be filled (or filled with red/nothing).
+                             # Logic: Fill if (Boundary==0 AND Safe==1)
+                             
+                             boundary_grid = data['boundary']
+                             
+                             # Plot the transition line (Active <-> Inactive)
+                             if np.any(boundary_grid) and not np.all(boundary_grid):
+                                ax.contour(eval_x, eval_y, boundary_grid.T, levels=[0.5], 
+                                           colors=colors[method], linestyles='--')
+                             
+                             # Fill: Inactive AND Safe
+                             # We construct a field that is 1 where we want to fill, 0 otherwise
+                             fill_region = (boundary_grid < 0.5) & (safe_mask > 0.5)
+                             
+                             if np.any(fill_region):
+                                 # quick hack: contourf needs values. 
+                                 # We can just plot the safe_mask, but cut out the active region?
+                                 # Or just contourf the boolean combined mask
+                                 # 1.0 where we want fill, 0.0 otherwise. Levels [0.5, 1.5]
+                                 ax.contourf(eval_x, eval_y, fill_region.astype(float).T, levels=[0.5, 1.5], 
+                                             colors=[colors[method]], alpha=fill_alphas[method])
+                        
+                        else: # Safe Region
+                             # Just plot where Safe=1
+                             if np.any(data['safe_set']) and not np.all(data['safe_set']):
+                                ax.contour(eval_x, eval_y, data['safe_set'].T, levels=[0.5], 
+                                           colors=colors[method], linestyles='--')
+                                ax.contourf(eval_x, eval_y, data['safe_set'].T, levels=[0.5, 1.5], 
+                                            colors=[colors[method]], alpha=fill_alphas[method])
+                    
+                        # Force Limits at the END
+                        ax.set_xlim([-4.0, 2.0])
+                        ax.set_ylim([-2.5, 2.5])
+                         
+                        # Skip expensive trajectory simulation when plotting from cached arrays only.
+                        if not args.plot_only:
+                            # --- TRAJECTORY VISUALIZATION ---
+                            # User requested dense grid 1m x 1m
+                            points_to_debug = []
+                            # x: -4, -3, -2, -1, 0, 1, 2
+                            for x_pt in np.arange(-4.0, 2.1, 1.0):
+                                # y: -2, -1, 0, 1, 2
+                                for y_pt in np.arange(-2.0, 2.1, 1.0):
+                                    points_to_debug.append([x_pt, y_pt])
+                    
+                        class MockEnv:
+                            def __init__(self, obstacles):
+                                self.obstacles = obstacles
+                                
+                            def check_obstacle_collision(self, position, robot_radius):
+                                for obs in self.obstacles:
+                                    # Fix broadcasting: Ensure both valid vectors are flattened
+                                    pos_flat = np.array(position).flatten()
+                                    obs_flat = np.array([obs['x'], obs['y']]).flatten()
+                                    dist = np.linalg.norm(pos_flat - obs_flat)
+                                    if dist < (obs['radius'] + robot_radius):
+                                        return True, "Collision"
+                                return False, "Safe"
+                        obst_dict = {
+                            'x': obstacle_pos[0], 'y': obstacle_pos[1], 
+                            'radius': obstacle_radius,
+                            'spec': {'radius': obstacle_radius}
+                        }
+                        env_mock_traj = MockEnv([obst_dict])
+                        for pt in points_to_debug:
+                            # Setup
+                            state = np.array([pt[0], pt[1], args.vx, args.vy]).reshape(-1, 1)
+                            u_nom = np.zeros((2, 1))
+                            traj_x = [state[:2].flatten()]
+                            is_safe_traj = True
+                            
+                            # Re-init filter for this trajectory
+                            wrapper_cls = {'BackupCBF': BackupCBFWrapper, 'MPS': MPSWrapper, 'Gatekeeper': GatekeeperWrapper, 'PCBF': PCBFWrapper, 'PLCBF': PLCBFWrapper}[method]
+                            if method == "BackupCBF":
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max)
+                            elif method == "PLCBF":
+                                 # PLCBF MUST use the fixed heterogeneous alpha dict regardless of the current plot policy
+                                 plcbf_alphas = {'stop': 1.0, 'turn_up': 0.5, 'turn_down': 0.5}
+                                 fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=plcbf_alphas)
+                            elif method == "PCBF":
+                                 fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, alpha=pcbf_alpha)
+                            else:
+                                fw = wrapper_cls(robot, robot_spec, backup_controller, dt=dt, backup_horizon=args.t_max, horizon_discount=dt)
+                            
+                            # IMPORTANT: Set environment for filter!
+                            if hasattr(fw, 'cbf'): fw.cbf.set_environment(env_mock_traj)
+                            if hasattr(fw, 'mps'): fw.mps.set_environment(env_mock_traj)
+                            if hasattr(fw, 'gk'): fw.gk.set_environment(env_mock_traj)
+                            if hasattr(fw, 'set_environment'): fw.set_environment(env_mock_traj)
+
+                            # Simulate
+                            n_steps_vis = int(args.t_max / dt)
+                            curr_state = state.copy()
+                            for k in range(n_steps_vis):
+                                    # Check collision
+                                    if env_mock_traj.check_obstacle_collision(curr_state[:2], robot_radius)[0]:
+                                        is_safe_traj = False
+                                        break
+                                    try:
+                                        u = fw.get_safe_control(curr_state, u_nom)
+                                        if u is None: u = u_nom # Visual fail
+                                        
+                                        # Integrate (Use robot.step to match analysis/gym exactly)
+                                        # robot.step expects column vectors (4,1) and (2,1) or similar
+                                        # output is column vector
+                                        state_col = curr_state.reshape(-1, 1)
+                                        u_col = u.reshape(-1, 1)
+                                        next_state = robot.step(state_col, u_col)
+                                        curr_state = next_state.flatten()
+                                        
+                                        traj_x.append(curr_state[:2])
+                                        
+                                    except:
+                                        is_safe_traj = False
+                                        break
+                            
+                            traj_x = np.array(traj_x)
+                            color = 'green' if is_safe_traj else 'orange'
+                            ax.plot(traj_x[:, 0], traj_x[:, 1], color=color, linewidth=2, alpha=0.8)
+                            ax.scatter([pt[0]], [pt[1]], color=color, s=30, zorder=5)
+                                    
+                            if not is_safe_traj:
+                                ax.plot(traj_x[-1, 0], traj_x[-1, 1], 'x', color='red', markersize=8, markeredgewidth=2)
+
+                    
+                        ax.set_xlabel("X [m]", fontsize=font_sizes['axis_label'])
+                        ax.set_ylabel("Y [m]", fontsize=font_sizes['axis_label'])
+                        ax.tick_params(axis='both', labelsize=font_sizes['tick'])
+                        ax.set_xlim([-4.0, 2.0])
+                        ax.set_ylim([-2.5, 2.5])
         else:
             fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-            fig.suptitle(f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])", fontsize=16)
+            fig.suptitle(
+                f"Policy: {policy_name.capitalize()} (Initial Velocity: [{args.vx}, {args.vy}])",
+                fontsize=font_sizes['suptitle'],
+            )
             
             hj_slice = get_hj_slice(args.vx, args.vy)
             hj_x = np.array(grid_hj.coordinate_vectors[0])
@@ -496,8 +642,9 @@ def main():
                             ax.contourf(eval_x, eval_y, data['safe_set'].T, levels=[0.5, 1.5], 
                                         colors=[colors[method]], alpha=fill_alphas[method])
 
-                ax.set_xlabel("X [m]")
-                ax.set_ylabel("Y [m]")
+                ax.set_xlabel("X [m]", fontsize=font_sizes['axis_label'])
+                ax.set_ylabel("Y [m]", fontsize=font_sizes['axis_label'])
+                ax.tick_params(axis='both', labelsize=font_sizes['tick'])
                 ax.set_xlim([-4.0, 2.0])
                 ax.set_ylim([-2.5, 2.5])
 
@@ -509,18 +656,39 @@ def main():
             mpatches.Patch(color='red', alpha=0.3, label='Obstacle + Margin')
         ]
         for method in methods:
-            legend_elements.append(Line2D([0], [0], color=colors[method], linestyle='--', label=f'{method} Boundary'))
+            if not args.safe_region_only:
+                legend_elements.append(Line2D([0], [0], color=colors[method], linestyle='--', label=f'{method} Boundary'))
             legend_elements.append(mpatches.Patch(color=colors[method], alpha=fill_alphas[method], label=f'{method} Safe Set'))
         
         if args.subfigures:
-            fig.legend(handles=legend_elements, loc='lower center', ncol=4, bbox_to_anchor=(0.5, -0.05))
+            fig.legend(
+                handles=legend_elements,
+                loc='lower center',
+                ncol=4,
+                bbox_to_anchor=(0.5, -0.05),
+                fontsize=font_sizes['legend'],
+            )
         else:
-            axes[1].legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.4, 1.0))
+            axes[1].legend(
+                handles=legend_elements,
+                loc='upper right',
+                bbox_to_anchor=(1.4, 1.0),
+                fontsize=font_sizes['legend'],
+            )
         
         plt.tight_layout()
-        save_name = f"safe_region_{policy_name}_grid.png" if args.subfigures else f"safe_region_{policy_name}.png"
-        plt.savefig(os.path.join(args.save_path, save_name), bbox_inches='tight')
-        print(f"Saved plot: {os.path.join(args.save_path, save_name)}")
+        if args.subfigures:
+            save_name = f"safe_region_{policy_name}_grid_safe_only.png" if args.safe_region_only else f"safe_region_{policy_name}_grid.png"
+        else:
+            save_name = f"safe_region_{policy_name}.png"
+        save_path = os.path.join(args.save_path, save_name)
+        plt.savefig(save_path, bbox_inches='tight')
+        print(f"Saved plot: {save_path}")
+        if args.save_svg:
+            svg_name = save_name.replace(".png", ".svg")
+            save_path_svg = os.path.join(args.save_path, svg_name)
+            plt.savefig(save_path_svg, bbox_inches='tight')
+            print(f"Saved plot: {save_path_svg}")
 
 
 
