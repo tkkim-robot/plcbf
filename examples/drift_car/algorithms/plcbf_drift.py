@@ -302,7 +302,15 @@ class PLCBF(PCBF):
                 - 'input_space': Feasible control area - maximum control authority
         """
         # Initialize parent PCBF (but don't use its single policy)
-        super().__init__(robot, robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax)
+        super().__init__(
+            robot=robot,
+            robot_spec=robot_spec,
+            dt=dt,
+            backup_horizon=backup_horizon,
+            cbf_alpha=cbf_alpha,
+            safety_margin=safety_margin,
+            ax=ax,
+        )
         
         # Validate and store selection operator
         if max_operator not in MAX_OPERATOR_TYPES:

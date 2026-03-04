@@ -269,11 +269,13 @@ class TestConfig:
     puddles: list  # List of PuddleConfig
     expected_collision: bool = False  # Whether collision is expected
     save_animation: bool = False  # Whether to save animation as video
+    save_svg: bool = False  # Whether to save SVG frames alongside video frames
     backup_type: str = 'lane_change'  # Backup controller type: 'lane_change' or 'stop'
     num_obstacles: int = 1  # Number of obstacles to use
     algo_type: str = 'gatekeeper'  # Algorithm type: 'gatekeeper', 'mps', or 'pcbf'
     max_operator: str = 'input_space'  # PLCBF selection operator: 'c', 'v', or 'input_space'
     no_render: bool = False  # Disable rendering/plotting for compute-time evaluation
+    pcbf_disable_infeasible_fallback: bool = False 
 
 
 # =============================================================================
@@ -401,7 +403,8 @@ def setup_controllers(
         print(f"  Using LANE CHANGE backup controller (direction={direction}, target y={backup_target:.2f})")
     
     # Shielding algorithm - choose based on config
-    if config.algo_type == 'plcbf':
+    algo_type = config.algo_type
+    if algo_type == 'plcbf':
         # PLCBF uses multiple policies internally (left/right lane change + stop)
         shielding = PLCBF(
             robot=car,
@@ -419,7 +422,7 @@ def setup_controllers(
         actual_right = min(right_lane_y, -6.5)
         print(f"  Using PLCBF algorithm (multi-policy CBF-QP, operator={config.max_operator})")
         print(f"    Policies: lane_change_left (y={left_lane_y:.1f}), lane_change_right (y={right_lane_y:.1f}), stop, nominal")
-    elif config.algo_type == 'pcbf':
+    elif algo_type == 'pcbf':
         shielding = PCBF(
             robot=car,
             robot_spec=car.robot_spec,
@@ -427,10 +430,15 @@ def setup_controllers(
             backup_horizon=sim.backup_horizon_time,
             cbf_alpha=sim.pcbf_alpha,
             safety_margin=1.0,
+            use_cbf_slack=not config.pcbf_disable_infeasible_fallback,
+            enable_policy_infeasible_fallback=not config.pcbf_disable_infeasible_fallback,
             ax=ax
         )
-        print(f"  Using PCBF algorithm (CBF-QP with backup rollout)")
-    elif config.algo_type == 'backupcbf':
+        if config.pcbf_disable_infeasible_fallback:
+            print(f"  Using PCBF algorithm (strict infeasible mode: slack OFF, fallback OFF)")
+        else:
+            print(f"  Using PCBF algorithm (CBF-QP with backup rollout)")
+    elif algo_type == 'backupcbf':
         shielding = BackupCBF(
             robot=car,
             robot_spec=car.robot_spec,
@@ -439,7 +447,7 @@ def setup_controllers(
             ax=ax
         )
         print(f"  Using BackupCBF algorithm (single backup policy CBF-QP)")
-    elif config.algo_type == 'mps':
+    elif algo_type == 'mps':
         shielding = MPS(
             robot=car,
             robot_spec=car.robot_spec,
@@ -549,6 +557,7 @@ def run_simulation(
     ax: Optional[plt.Axes],
     fig: Optional[plt.Figure],
     animation_saver: Optional[AnimationSaver] = None,
+    svg_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the simulation loop and return results."""
     sim = config.simulation
@@ -569,6 +578,17 @@ def run_simulation(
 
     print(f"\nRunning simulation for {sim.tf}s...")
 
+    def maybe_save_svg_frame():
+        if animation_saver is None or svg_dir is None or fig is None:
+            return
+        if animation_saver.save_per_frame <= 0:
+            return
+        if animation_saver.frame_idx % animation_saver.save_per_frame != 0:
+            return
+        frame_num = animation_saver.frame_idx // animation_saver.save_per_frame
+        svg_path = os.path.join(svg_dir, f"frame_{frame_num:05d}.svg")
+        fig.savefig(svg_path, format="svg")
+
     def draw_terminal_marker_and_hold(marker_pos):
         """Draw terminal marker and hold final frame for ~1 second."""
         if ax is None or fig is None:
@@ -587,6 +607,7 @@ def run_simulation(
             hold_frames = max(1, int(getattr(animation_saver, 'fps', 30)))
             for _ in range(hold_frames):
                 animation_saver.save_frame(fig, force=True)
+                maybe_save_svg_frame()
     
     for step in range(num_steps):
         state = car.get_state()
@@ -701,6 +722,7 @@ def run_simulation(
         # Save animation frame
         if animation_saver is not None:
             animation_saver.save_frame(fig)
+            maybe_save_svg_frame()
         
         # Status output
         if step % 50 == 0:
@@ -772,15 +794,21 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     
     # Setup animation saver if enabled
     animation_saver = None
+    svg_dir = None
     if config.save_animation and config.no_render:
         print("\n  `--save` requires rendering. Disabling save because `--no-render` is set.")
         config.save_animation = False
+        config.save_svg = False
     if config.save_animation:
         # Create unique output directory for this test
         safe_name = config.name.lower().replace(' ', '_')
         output_dir = f"output/animations/{safe_name}"
         animation_saver = AnimationSaver(output_dir=output_dir, save_per_frame=1, fps=30)
         print(f"\n  Animation saving enabled -> {output_dir}/")
+        if config.save_svg:
+            svg_dir = os.path.join(output_dir, f"{safe_name}_svg_frames")
+            os.makedirs(svg_dir, exist_ok=True)
+            print(f"  SVG frame saving enabled -> {svg_dir}/")
     
     # Print configuration
     print(f"\nConfiguration:")
@@ -794,7 +822,7 @@ def run_test(config: TestConfig) -> Dict[str, Any]:
     # Run simulation
     results = run_simulation(
         config, car, env, mpcc, shielding, simulator,
-        ref_horizon_line, mpc_pred_line, ax, fig, animation_saver
+        ref_horizon_line, mpc_pred_line, ax, fig, animation_saver, svg_dir
     )
     
     # Export video if animation was saved
@@ -975,11 +1003,15 @@ def main():
                         help='Number of obstacles: 1 (default) or 2 (blocks lane change)')
     parser.add_argument('--save', action='store_true',
                         help='Save animation as video')
+    parser.add_argument('--save-svg', action='store_true',
+                        help='Save SVG frames alongside animation frames (requires --save)')
     parser.add_argument('--no-render', action='store_true',
                         help='Disable plotting/animation rendering (for compute-time measurement)')
     parser.add_argument('--max-operator', type=str, default='input_space',
                         choices=MAX_OPERATOR_TYPES,
                         help=f"Selection operator (default: input_space, choices: {MAX_OPERATOR_TYPES})")
+    parser.add_argument('--pcbf-disable-infeasible-fallback', action='store_true',
+                        help='PCBF only: disable CBF slack and policy fallback so infeasible QPs remain infeasible')
     
     args = parser.parse_args()
     
@@ -1065,11 +1097,13 @@ def main():
         for name, create_config in test_configs.items():
             config = create_config()
             config.save_animation = args.save
+            config.save_svg = args.save_svg
             config.algo_type = args.algo
             config.backup_type = args.backup
             config.num_obstacles = args.obs
             config.max_operator = getattr(args, 'max_operator', 'c')
             config.no_render = args.no_render
+            config.pcbf_disable_infeasible_fallback = args.pcbf_disable_infeasible_fallback
             # Update expected collision based on configuration
             config.expected_collision = get_expected_collision(name, args.backup, args.obs, args.algo)
             # Update name to include algo, backup type and obstacle count
@@ -1093,11 +1127,13 @@ def main():
     else:
         config = test_configs[args.test]()
         config.save_animation = args.save
+        config.save_svg = args.save_svg
         config.algo_type = args.algo
         config.backup_type = args.backup
         config.num_obstacles = args.obs
         config.max_operator = getattr(args, 'max_operator', 'c')
         config.no_render = args.no_render
+        config.pcbf_disable_infeasible_fallback = args.pcbf_disable_infeasible_fallback
         # Update expected collision based on configuration
         config.expected_collision = get_expected_collision(args.test, args.backup, args.obs, args.algo)
         # Update name to include algo, backup type and obstacle count

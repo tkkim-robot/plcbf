@@ -222,6 +222,7 @@ class PCBF(PCBFBase):
         safety_margin: float = 0.0,
         use_cbf_slack: bool = True,
         cbf_slack_weight: float = 5e5,
+        enable_policy_infeasible_fallback: bool = True,
         ax=None,
     ):
         # Store robot instance (drift car specific)
@@ -250,6 +251,7 @@ class PCBF(PCBFBase):
         # Optional CBF relaxation: PLCBF can keep this on, while benchmark PCBF can disable it.
         self.use_cbf_slack = bool(use_cbf_slack)
         self.cbf_slack_weight = float(cbf_slack_weight)
+        self.enable_policy_infeasible_fallback = bool(enable_policy_infeasible_fallback)
         
         # JIT cache
         self._jit_value_and_grad = None
@@ -507,7 +509,7 @@ class PCBF(PCBFBase):
             u_safe = self._solve_cbf_qp(u_nom, V, grad_V, f, G)
         except ValueError as err:
             # Fair fallback: use the backup policy only when its safety value is positive.
-            if V > 0.0:
+            if self.enable_policy_infeasible_fallback and V > 0.0:
                 self.status = 'policy_fallback'
                 u_safe = self._compute_backup_policy_control(robot_state)
             else:

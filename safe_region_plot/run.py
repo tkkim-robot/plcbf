@@ -246,11 +246,8 @@ def main():
         for method in methods:
             # File Handling
             if method == 'PLCBF':
-                # Prefer current shared PLCBF file name, but fall back to legacy MPCBF name.
+                # Shared cache file for PLCBF.
                 method_file = os.path.join(args.save_path, f"result_PLCBF_shared_res{args.res}.npz")
-                legacy_method_file = os.path.join(args.save_path, f"result_MPCBF_shared_res{args.res}.npz")
-                if not os.path.exists(method_file) and os.path.exists(legacy_method_file):
-                    method_file = legacy_method_file
             else:
                 method_file = os.path.join(args.save_path, f"result_{policy_name}_{method}_res{args.res}.npz")
             
