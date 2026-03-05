@@ -83,6 +83,12 @@ uv run python examples/warehouse/test_warehouse_quad.py \
 | `--no_render` | Headless run |
 | `--save` | Save animation |
 
+## Base Abstractions
+
+The base abstractions are in `plcbf/plcbf.py`. To build custom test cases, first define your robot's dynamics in `safe_control/robots` and the test environment in `safe_control/envs`. Then, create a new test script in `examples/` that imports the base abstractions and your custom dynamics and environment.
+
+More robot dynamics (not supported yet) can be found in [safe_control/robots](https://github.com/tkkim-robot/safe_control/tree/main/robots). 
+
 
 ## Citation
 
