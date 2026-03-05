@@ -222,7 +222,7 @@ class VehicleConfig:
 class SimulationConfig:
     """Simulation configuration parameters."""
     dt: float = 0.05
-    tf: float = 14.0
+    tf: float = 12.0
     nominal_horizon_time: float = 1.5    # MPCC prediction horizon [s]
     backup_horizon_time: float = 3.0     # Backup trajectory horizon [s]
     event_offset: float = 0.1            # Gatekeeper re-evaluation interval [s]
@@ -989,7 +989,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Test safety shielding algorithms (Gatekeeper/MPS/BackupCBF/PCBF/PLCBF)')
-    parser.add_argument('--test', type=str, default='high_friction',
+    parser.add_argument('--test', type=str, default='puddle_surprise',
                         choices=['high_friction', 'low_friction', 'puddle_surprise', 'straight_safe', 'far_left_safe', 'all'],
                         help='Which test to run')
     parser.add_argument('--algo', type=str, default='pcbf',

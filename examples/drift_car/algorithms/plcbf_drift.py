@@ -733,7 +733,7 @@ class PLCBF(PCBF):
         # Filter for safe policies (V > 0)
         safe_policies = [k for k in backup_policies if V_dict[k] > 0.0]
         
-        if len(safe_policies) == 0:
+        if len(safe_policies) == 0 and self.debug:
              print("WARNING: All policies unsafe (V <= 0)!")
              for k in backup_policies:
                  print(f"  {k}: V={V_dict[k]:.4f}")
