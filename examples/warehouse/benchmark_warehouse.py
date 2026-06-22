@@ -173,7 +173,7 @@ def run_one_quad(algo, level, safety_margin, alpha, max_steps, warmup_steps):
 
 def run_one_di(algo, level, safety_margin, alpha, max_steps, warmup_steps):
     import examples.warehouse.test_warehouse_di as tid
-    from examples.warehouse.controllers.policies_di_jax import WaypointPolicyParams
+    from examples.warehouse.controllers.policies_di_jax import RetracePolicyParams
 
     # Provide alpha expected by setup_test
     tid.args = argparse.Namespace(alpha=alpha)
@@ -216,16 +216,15 @@ def run_one_di(algo, level, safety_margin, alpha, max_steps, warmup_steps):
                         shielding.backup_controller.prepare_rollout(current_state)
 
                     active_idx = int(getattr(shielding.backup_controller, 'active_retrace_idx', 0))
-                    wps_jax = jnp.array(nom_ctrl.waypoints)
-                    new_params = WaypointPolicyParams(
-                        waypoints=wps_jax,
-                        v_max=robot_spec['v_max'],
-                        Kp=15.0,
-                        dist_threshold=1.0,
+                    new_params = RetracePolicyParams(
+                        waypoints=jnp.array(nom_ctrl.waypoints),
+                        v_max=robot_spec['backup_speed'],
+                        Kp=robot_spec['backup_Kp'],
+                        dist_threshold=robot_spec['nominal_dist_threshold'],
                         a_max=robot_spec['a_max'],
-                        current_wp_idx=active_idx
+                        current_wp_idx=active_idx,
                     )
-                    shielding.set_policy('waypoint', new_params)
+                    shielding.set_policy('retrace_waypoint', new_params)
 
             def _solve():
                 return shielding.solve_control_problem(current_state, control_ref)

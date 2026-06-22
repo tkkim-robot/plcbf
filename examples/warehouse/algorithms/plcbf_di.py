@@ -129,6 +129,7 @@ class PLCBF_DI(PCBF_DI):
         safety_margin: float = 0.0,
         num_angle_policies: int = 10,
         max_operator: str = 'input_space',
+        line_width_scale: float = 1.0,
         ax=None
     ):
         self.num_angle_policies = num_angle_policies
@@ -138,11 +139,13 @@ class PLCBF_DI(PCBF_DI):
             
         super().__init__(robot_spec, dt, backup_horizon, cbf_alpha, safety_margin, ax=None) # Handle ax manually
         self.ax = ax
-        # Use fixed 2.0s horizon for PLCBF evaluation of dynamic obstacles
-        self.eval_horizon_steps = int(2.0 / self.dt)
+        self.eval_horizon_steps = int(self.backup_horizon / self.dt)
+        self.line_width_scale = max(1e-6, float(line_width_scale))
         
         # Policy Helpers
         self.policy_configs = {} # name -> (type, params)
+        self.angle_names = []
+        self.angle_params_batch = None
         self._setup_policies()
         
         # Cache for nominal trajectory
@@ -150,6 +153,8 @@ class PLCBF_DI(PCBF_DI):
         
         # Visualization handles
         self.policy_lines = {}
+        self._last_results = None
+        self._last_best_name = None
         if self.ax is not None:
             self._setup_visualization()
             
@@ -158,45 +163,88 @@ class PLCBF_DI(PCBF_DI):
         # Since params differ, loop is safer/easier.
         self._jit_val_grad_fn = None
         self._jit_val_grad_obs = None
+        self._jit_angle_val_grad = None
+        self._jit_angle_grad_obs = None
         self.curr_step = 0
         self.debug = False
             
     def _setup_policies(self):
+        v_ref = float(self.robot_spec.get('v_ref', self.robot_spec.get('v_max', 5.0)))
+        v_ref = min(v_ref, float(self.robot_spec.get('v_max', v_ref)))
+        Kp_v_nom = float(self.robot_spec.get('nominal_Kp_v', 6.0))
+        K_lat_nom = float(self.robot_spec.get('nominal_K_lat', 1.0))
+        v_lat_max_nom = float(self.robot_spec.get('nominal_v_lat_max', self.robot_spec.get('v_ref', 4.0)))
+        dist_threshold_nom = float(self.robot_spec.get('nominal_dist_threshold', 1.0))
+        Kp_v_angle = float(self.robot_spec.get('angle_Kp_v', Kp_v_nom))
+        Kp_v_stop = float(self.robot_spec.get('stop_Kp_v', 3.0))
+
         # 1. Angle Policies
+        angle_params = []
         for i in range(self.num_angle_policies):
             angle = i * (2 * np.pi / self.num_angle_policies)
             name = f'angle_{i}'
-            # Use v_max as target speed? Or v_ref?
-            v_ref = float(self.robot_spec.get('v_ref', 5.0))
-            v_ref = min(v_ref, 3.8)
-            self.policy_configs[name] = ('angle', AnglePolicyParams(
-                target_angle=angle, target_speed=v_ref, Kp_v=15.0, a_max=self.dynamics_params.a_max
-            ))
+            params = AnglePolicyParams(
+                target_angle=angle,
+                target_speed=v_ref,
+                Kp_v=Kp_v_angle,
+                a_max=self.dynamics_params.a_max
+            )
+            self.policy_configs[name] = ('angle', params)
+            self.angle_names.append(name)
+            angle_params.append(params)
+
+        if angle_params:
+            self.angle_params_batch = jax.tree_util.tree_map(
+                lambda *xs: jnp.stack(xs), *angle_params
+            )
         
         # 2. Stop Policy (standard backup)
         self.policy_configs['stop'] = ('stop', StopPolicyParams(
-            Kp_v=4.0, a_max=self.dynamics_params.a_max, stop_threshold=0.05
+            Kp_v=Kp_v_stop, a_max=self.dynamics_params.a_max, stop_threshold=0.05
         ))
             
         # 3. Nominal Policy (Default Params, will be updated per step)
         self.policy_configs['nominal'] = ('waypoint', WaypointPolicyParams(
-            waypoints=jnp.zeros((1, 2)), v_max=v_ref, Kp=15.0, dist_threshold=1.0, 
+            waypoints=jnp.zeros((1, 2)),
+            v_max=float(self.robot_spec.get('v_max', v_ref)),
+            Kp=Kp_v_nom,
+            K_lat=K_lat_nom,
+            v_lat_max=v_lat_max_nom,
+            dist_threshold=dist_threshold_nom,
             a_max=self.dynamics_params.a_max, current_wp_idx=0
         ))
         
     def _setup_visualization(self):
         if self.ax is None:
             return
-            
-        # Create lines for all policies
+        if self.policy_lines:
+            return
+
         import matplotlib.cm as cm
         cmap = cm.get_cmap('hsv', self.num_angle_policies + 1)
+        lw_base = 1.0 * self.line_width_scale
         
         for i in range(self.num_angle_policies):
             name = f'angle_{i}'
-            self.policy_lines[name], = self.ax.plot([], [], color=cmap(i), alpha=0.3, linewidth=1)
+            self.policy_lines[name], = self.ax.plot([], [], color=cmap(i), alpha=0.3, linewidth=lw_base)
             
-        self.policy_lines['nominal'], = self.ax.plot([], [], color='k', linestyle='--', alpha=0.5, linewidth=1)
+        self.policy_lines['nominal'], = self.ax.plot([], [], color='k', linestyle='--', alpha=0.5, linewidth=lw_base)
+
+    def _setup_multi_visualization(self):
+        self._setup_visualization()
+
+    def update_visualization(self):
+        if self.ax is None or self._last_results is None:
+            return
+        for name, (V, g, traj) in self._last_results.items():
+            if name in self.policy_lines:
+                self.policy_lines[name].set_data(traj[:, 0], traj[:, 1])
+                if name == self._last_best_name:
+                    self.policy_lines[name].set_linewidth(3.0 * self.line_width_scale)
+                    self.policy_lines[name].set_alpha(1.0)
+                else:
+                    self.policy_lines[name].set_linewidth(1.0 * self.line_width_scale)
+                    self.policy_lines[name].set_alpha(0.3)
         
     def set_nominal_traj(self, traj):
         self.nominal_trajectory = traj
@@ -220,10 +268,13 @@ class PLCBF_DI(PCBF_DI):
         else:
             obs_array = jnp.zeros((0, 5))
 
-        # For PLCBF, use V only for dynamic obstacles; static handled by HO-CBF
-        stat_obs_array_eval = jnp.zeros((0, 3))
-        
-            
+        if self.static_obstacles:
+            stat_obs_array_eval = jnp.array([
+                (o['x'], o['y'], o['radius']) for o in self.static_obstacles
+            ])
+        else:
+            stat_obs_array_eval = jnp.zeros((0, 3))
+
         robot_radius = self.robot_spec.get('radius', 1.0) + self.safety_margin
         robot_radius_base = self.robot_spec.get('radius', 1.0)
         
@@ -233,22 +284,58 @@ class PLCBF_DI(PCBF_DI):
         
         state_jax = jnp.array(state)
         
-        # Evaluate Defined Policies
         policy_params_used = {}
         time_derivatives = {}
-        for name, (ptype, params) in self.policy_configs.items():
-            # Update Nominal Params dynamically
+
+        # Batch evaluate angle policies first; this is the expensive PLCBF part.
+        if self.angle_params_batch is not None and len(self.angle_names) > 0:
+            batch_val_grad_fn, batch_grad_obs_fn = self._get_jit_angle_batch()
+            (V_batch, traj_batch), grad_batch = batch_val_grad_fn(
+                state_jax, self.dynamics_params, self.angle_params_batch,
+                obs_array, stat_obs_array_eval, robot_radius, robot_radius_base
+            )
+            if obs_array.shape[0] > 0:
+                grad_obs_batch = batch_grad_obs_fn(
+                    state_jax, self.dynamics_params, self.angle_params_batch,
+                    obs_array, stat_obs_array_eval, robot_radius, robot_radius_base
+                )
+                obs_vel = obs_array[:, 3:5]
+                time_deriv_batch = jnp.sum(grad_obs_batch[:, :, 0:2] * obs_vel[None, :, :], axis=(1, 2))
+            else:
+                time_deriv_batch = jnp.zeros((len(self.angle_names),))
+
+            for i, name in enumerate(self.angle_names):
+                params = self.policy_configs[name][1]
+                policy_params_used[name] = ('angle', params)
+                results[name] = (
+                    float(V_batch[i]),
+                    np.array(grad_batch[i]),
+                    np.array(traj_batch[i])
+                )
+                time_derivatives[name] = float(time_deriv_batch[i])
+
+        # Evaluate stop and nominal policies individually.
+        for name in ['stop', 'nominal']:
+            if name not in self.policy_configs:
+                continue
+            ptype, params = self.policy_configs[name]
             if name == 'nominal' and control_ref is not None and 'waypoints' in control_ref:
+                Kp_v_nom = float(self.robot_spec.get('nominal_Kp_v', 6.0))
+                K_lat_nom = float(self.robot_spec.get('nominal_K_lat', 1.0))
+                v_lat_max_nom = float(self.robot_spec.get('nominal_v_lat_max', self.robot_spec.get('v_ref', 4.0)))
+                dist_threshold_nom = float(self.robot_spec.get('nominal_dist_threshold', 1.0))
                 params = WaypointPolicyParams(
                     waypoints=jnp.array(control_ref['waypoints']),
-                    v_max=float(self.robot_spec.get('v_max', 8.0)),
-                    Kp=15.0, # Sync with user tuning
-                    dist_threshold=1.0,
+                    v_max=float(self.robot_spec.get('v_max', 5.0)),
+                    Kp=Kp_v_nom,
+                    K_lat=K_lat_nom,
+                    v_lat_max=v_lat_max_nom,
+                    dist_threshold=dist_threshold_nom,
                     a_max=self.dynamics_params.a_max,
                     current_wp_idx=control_ref.get('wp_idx', 0)
                 )
             policy_params_used[name] = (ptype, params)
-            
+
             V_jax, grad_jax = val_grad_fn(
                 state_jax, self.dynamics_params, params, obs_array, stat_obs_array_eval, ptype,
                 self.eval_horizon_steps, robot_radius, robot_radius_base, self.dt
@@ -275,7 +362,6 @@ class PLCBF_DI(PCBF_DI):
         best_name = None
         best_score = -np.inf
         best_V = -np.inf
-        best_alignment = -1.0
         
         # Control bounds for area calculation
         u_min = jnp.array([-self.dynamics_params.ax_max, -self.dynamics_params.ay_max])
@@ -312,49 +398,26 @@ class PLCBF_DI(PCBF_DI):
                          jnp.array(Lg_V), cbf_rhs, u_min, u_max
                      ))
              
-             # Alignment for tie-breaking
-             alignment = -1.0
-             if "angle" in name and np.linalg.norm(u_nom) > 0.1:
-                 try:
-                     idx = int(name.split('_')[1])
-                     policy_angle = idx * (2 * np.pi / self.num_angle_policies)
-                     nom_angle = np.arctan2(u_nom[1], u_nom[0])
-                     alignment = np.cos(policy_angle - nom_angle)
-                 except:
-                     pass
-             
              if best_name is None:
-                 best_name, best_score, best_V, best_alignment = name, score, V, alignment
+                 best_name, best_score, best_V = name, score, V
                  continue
                  
-             # Prioritize safety: Among safe policies (V > 0), pick max score.
-             # If both safe or both unsafe, pick max score.
-             # Actually, if any are safe, we ONLY look at safe ones.
              if V > 0 and best_V > 0:
-                 if score > best_score + 1e-3:
-                     best_name, best_score, best_V, best_alignment = name, score, V, alignment
-                 elif abs(score - best_score) <= 1e-3:
-                     if V > best_V + 1e-3:
-                         best_name, best_score, best_V, best_alignment = name, score, V, alignment
-                     elif abs(V - best_V) <= 1e-3 and alignment > best_alignment:
-                         best_name, best_score, best_V, best_alignment = name, score, V, alignment
+                 if score > best_score + 1e-6:
+                     best_name, best_score, best_V = name, score, V
              elif V > 0 and best_V <= 0:
-                  best_name, best_score, best_V, best_alignment = name, score, V, alignment
+                  best_name, best_score, best_V = name, score, V
              elif V <= 0 and best_V <= 0:
-                 if score > best_score + 1e-3:
-                     best_name, best_score, best_V, best_alignment = name, score, V, alignment
+                 if V > best_V + 1e-6:
+                     best_name, best_score, best_V = name, score, V
+                 elif abs(V - best_V) <= 1e-6 and score > best_score + 1e-6:
+                     best_name, best_score, best_V = name, score, V
              
-        # 4. Visualization Update
-        if self.ax:
-            for name, (V, g, traj) in results.items():
-                if name in self.policy_lines:
-                    self.policy_lines[name].set_data(traj[:,0], traj[:,1])
-                    if name == best_name:
-                        self.policy_lines[name].set_linewidth(3)
-                        self.policy_lines[name].set_alpha(1.0)
-                    else:
-                        self.policy_lines[name].set_linewidth(1)
-                        self.policy_lines[name].set_alpha(0.3)
+        if best_name is None:
+            best_name = 'nominal'
+
+        self._last_results = results
+        self._last_best_name = best_name
 
         # 5. QP objective stays centered at nominal control
         u_qp_nom = u_nom
@@ -413,28 +476,7 @@ class PLCBF_DI(PCBF_DI):
             use_fallback = True
              
         if use_fallback:
-            # Try static-only safety QP before policy fallback
-            try:
-                u_scaled2 = cp.Variable(2)
-                u2 = cp.multiply(u_scaled2, u_scale)
-                cost2 = cp.sum_squares(u_scaled2 - u_nom_scaled)
-                constraints2 = [
-                    u_scaled2[0] <= 1.0,
-                    u_scaled2[0] >= -1.0,
-                    u_scaled2[1] <= 1.0,
-                    u_scaled2[1] >= -1.0
-                ]
-                self._add_cbf_constraints(u2, constraints2, state, V_best, grad_best, include_dynamic=False)
-                prob2 = cp.Problem(cp.Minimize(cost2), constraints2)
-                prob2.solve(solver=cp.OSQP, verbose=False, eps_abs=1e-5, eps_rel=1e-5, max_iter=20000)
-                if prob2.status in ['optimal', 'optimal_inaccurate'] and u_scaled2.value is not None:
-                    res = u_scaled2.value * u_scale
-                    use_fallback = False
-            except Exception:
-                pass
-
-        if use_fallback:
-            # Fallback to Best Policy Control
+            # Match Quad3D fallback: execute the selected safest rollout policy.
             if best_name in policy_params_used:
                 ptype, pparams = policy_params_used[best_name]
                 if ptype == 'angle':
@@ -448,12 +490,22 @@ class PLCBF_DI(PCBF_DI):
             else:
                 res = u_qp_nom
                 
-        u_safe = res
+        u_safe = np.clip(np.array(res, dtype=float).flatten(), -u_scale, u_scale)
 
         self.curr_step += 1
         return u_safe
 
-    def _add_cbf_constraints(self, u, constraints, state, V, grad_V, slack=0.0, include_dynamic=True, include_static=True):
+    def _add_cbf_constraints(
+        self,
+        u,
+        constraints,
+        state,
+        V,
+        grad_V,
+        slack=0.0,
+        include_dynamic=True,
+        include_static=True,
+    ):
         """
         Add CBF constraints for PLCBF_DI.
         
@@ -468,7 +520,7 @@ class PLCBF_DI(PCBF_DI):
         if include_dynamic:
             time_term = getattr(self, "_last_time_derivative", 0.0)
             constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V - time_term - slack)
-        
+
         # Static obstacles: HO-CBF (second-order)
         if include_static:
             gamma1, gamma2 = 3.0, 3.0
@@ -489,6 +541,36 @@ class PLCBF_DI(PCBF_DI):
                 rhs = -(term_v + (gamma1 + gamma2)*h_dot + gamma1*gamma2*h)
                 
                 constraints.append(lhs @ u >= rhs - slack)
+
+    def _get_jit_angle_batch(self):
+        """Get batched JIT functions for angle-policy values and obstacle gradients."""
+        if self._jit_angle_val_grad is None:
+            h = self.eval_horizon_steps
+            dt_val = self.dt
+
+            def val_fn(x0, dyn_p, pol_p, dyn_obs, stat_obs, r_rad, rr_base):
+                V, traj = _compute_value_pure_di(
+                    x0, dyn_p, pol_p, dyn_obs, stat_obs, 'angle', h, r_rad, rr_base, dt_val
+                )
+                return V, traj
+
+            val_grad = jax.value_and_grad(val_fn, has_aux=True)
+            self._jit_angle_val_grad = jax.jit(
+                jax.vmap(val_grad, in_axes=(None, None, 0, None, None, None, None))
+            )
+
+            def val_only(x0, dyn_p, pol_p, dyn_obs, stat_obs, r_rad, rr_base):
+                V, _ = _compute_value_pure_di(
+                    x0, dyn_p, pol_p, dyn_obs, stat_obs, 'angle', h, r_rad, rr_base, dt_val
+                )
+                return V
+
+            grad_obs = jax.grad(val_only, argnums=3)
+            self._jit_angle_grad_obs = jax.jit(
+                jax.vmap(grad_obs, in_axes=(None, None, 0, None, None, None, None))
+            )
+
+        return self._jit_angle_val_grad, self._jit_angle_grad_obs
 
     def _get_jit_val_grad_obs(self):
         """Get or create JIT-compiled gradient function w.r.t. dynamic obstacles."""

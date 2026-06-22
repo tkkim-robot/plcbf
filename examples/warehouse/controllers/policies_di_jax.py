@@ -8,7 +8,6 @@ JAX-compatible backup policies for Double Integrator PCBF/PLCBF.
 
 from typing import NamedTuple
 import jax.numpy as jnp
-import jax
 
 class AnglePolicyParams(NamedTuple):
     """Parameters for AnglePolicy."""
@@ -22,6 +21,23 @@ class StopPolicyParams(NamedTuple):
     Kp_v: float            # Proportional gain for stopping
     a_max: float           # Maximum acceleration (norm)
     stop_threshold: float  # Velocity threshold to consider stopped
+
+
+class RetracePolicyParams(NamedTuple):
+    """Parameters for retracing the nominal waypoint path backwards."""
+    waypoints: jnp.ndarray  # Array of [x, y] waypoints
+    v_max: float            # Maximum speed
+    Kp: float               # Velocity error gain
+    dist_threshold: float   # Distance to switch retrace waypoints
+    a_max: float            # Max acceleration
+    current_wp_idx: int     # Starting retrace waypoint index
+
+
+def _clip_accel(acc: jnp.ndarray, a_max: float) -> jnp.ndarray:
+    """Clip 2D acceleration by Euclidean norm."""
+    a_norm = jnp.sqrt(jnp.sum(acc**2) + 1e-8)
+    scale = jnp.where(a_norm > a_max, a_max / a_norm, 1.0)
+    return acc * scale
 
 class AnglePolicyJAX:
     """
@@ -61,20 +77,15 @@ class AnglePolicyJAX:
         ax = params.Kp_v * ex
         ay = params.Kp_v * ey
         
-        # Clip to a_max (ball constraint)
-        a_norm = jnp.sqrt(ax**2 + ay**2 + 1e-8)
-        scale = jnp.where(a_norm > params.a_max, params.a_max / a_norm, 1.0)
-        
-        ax = ax * scale
-        ay = ay * scale
-        
-        return jnp.array([ax, ay])
+        return _clip_accel(jnp.array([ax, ay]), params.a_max)
 
 class WaypointPolicyParams(NamedTuple):
     """Parameters for WaypointPolicy."""
     waypoints: jnp.ndarray  # Array of [x, y] waypoints
     v_max: float           # Maximum speed
     Kp: float              # Velocity error gain
+    K_lat: float           # Lateral path correction gain
+    v_lat_max: float       # Lateral correction velocity limit
     dist_threshold: float  # Distance to switch waypoints
     a_max: float           # Max acceleration
     current_wp_idx: int    # Starting waypoint index
@@ -105,11 +116,7 @@ class StopPolicyJAX:
         ax = -params.Kp_v * vx
         ay = -params.Kp_v * vy
         
-        # Clip
-        a_norm = jnp.sqrt(ax**2 + ay**2 + 1e-8)
-        scale = jnp.where(a_norm > params.a_max, params.a_max / a_norm, 1.0)
-        
-        return jnp.array([ax * scale, ay * scale])
+        return _clip_accel(jnp.array([ax, ay]), params.a_max)
 
 class WaypointPolicyJAX:
     """
@@ -121,27 +128,48 @@ class WaypointPolicyJAX:
         pos = state[0:2]
         vel = state[2:4]
         
-        # Simplified: Just target the current waypoint index.
-        # Rolling out waypoint switching in JAX usually requires putting wp_idx into the state,
-        # which would require changing DIDynamicsParams.
-        # For a short backup rollout, targeting the "nominal" target waypoint is often sufficient.
         target = params.waypoints[params.current_wp_idx]
+        prev_idx = jnp.maximum(params.current_wp_idx - 1, 0)
+        prev = params.waypoints[prev_idx]
+        seg = target - prev
+        seg_norm = jnp.sqrt(jnp.sum(seg**2) + 1e-8)
+        target_dist = jnp.sqrt(jnp.sum((target - pos)**2) + 1e-8)
+        seg_dir = jnp.where(seg_norm > 1e-6, seg / seg_norm, (target - pos) / (target_dist + 1e-6))
+        perp_dir = jnp.array([-seg_dir[1], seg_dir[0]])
+
+        dist_along = jnp.dot(target - pos, seg_dir)
+        braking_speed = jnp.sqrt(2.0 * params.a_max * jnp.abs(dist_along))
+        v_long = jnp.minimum(params.v_max, braking_speed)
+        v_long_dir = jnp.where(dist_along >= 0.0, 1.0, -1.0)
+
+        lat_err = jnp.dot(pos - prev, perp_dir)
+        v_lat = -params.K_lat * lat_err
+        v_lat = jnp.clip(v_lat, -params.v_lat_max, params.v_lat_max)
+
+        v_des = v_long_dir * v_long * seg_dir + v_lat * perp_dir
+        v_des_norm = jnp.sqrt(jnp.sum(v_des**2) + 1e-8)
+        v_des = jnp.where(v_des_norm > params.v_max, v_des * (params.v_max / v_des_norm), v_des)
         
+        return _clip_accel(params.Kp * (v_des - vel), params.a_max)
+
+
+class RetracePolicyJAX:
+    """
+    Follows a retrace waypoint target. Rollout-time waypoint switching is handled
+    in the DI PCBF rollout so the index can be carried through JAX scan.
+    """
+
+    @staticmethod
+    def compute(state: jnp.ndarray, params: RetracePolicyParams) -> jnp.ndarray:
+        pos = state[0:2]
+        vel = state[2:4]
+        idx = jnp.clip(params.current_wp_idx, 0, params.waypoints.shape[0] - 1)
+        target = params.waypoints[idx]
+
         dist = jnp.sqrt(jnp.sum((target - pos)**2) + 1e-8)
-        
-        # Direction
         v_des_dir = (target - pos) / (dist + 1e-6)
-        
-        # Braking distance logic (similar to nominal.py)
-        # Use params.a_max for braking capability
-        braking_speed = jnp.sqrt(2 * params.a_max * dist)
+        braking_speed = jnp.sqrt(2.0 * params.a_max * jnp.maximum(dist, 0.0))
         speed = jnp.minimum(params.v_max, braking_speed)
         v_des = v_des_dir * speed
-        
-        acc = params.Kp * (v_des - vel)
-        
-        # Clip
-        a_norm = jnp.sqrt(jnp.sum(acc**2) + 1e-8)
-        scale = jnp.where(a_norm > params.a_max, params.a_max / a_norm, 1.0)
-        
-        return acc * scale
+
+        return _clip_accel(params.Kp * (v_des - vel), params.a_max)

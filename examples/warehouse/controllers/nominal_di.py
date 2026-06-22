@@ -4,14 +4,32 @@ import numpy as np
 
 
 class WaypointFollower:
-    """Simple P-Controller for nominal path following."""
-    def __init__(self, waypoints, v_max=5.0, Kp=4.0, debug=False):
+    """Segment-aware P-controller for nominal path following."""
+    def __init__(
+        self,
+        waypoints,
+        v_max=5.0,
+        Kp=4.0,
+        K_lat=1.0,
+        v_lat_max=None,
+        a_max=4.0,
+        debug=False
+    ):
         self.waypoints = waypoints
         self.v_max = v_max
         self.Kp = Kp
+        self.K_lat = K_lat
+        self.v_lat_max = v_max if v_lat_max is None else v_lat_max
+        self.a_max = a_max
         self.wp_idx = 1  # Start at waypoint 1 (skip starting position at waypoint 0)
         self.dist_threshold = 1.0  # Larger threshold for corners
         self.debug = debug
+
+    def _clip_accel(self, acc):
+        a_norm = np.linalg.norm(acc)
+        if a_norm > self.a_max:
+            acc = acc * (self.a_max / (a_norm + 1e-8))
+        return acc
         
     def get_control(self, state, update_state=True):
         # state: [x, y, vx, vy]
@@ -34,21 +52,46 @@ class WaypointFollower:
                 target = self.waypoints[self.wp_idx]
                 dist = np.linalg.norm(target - pos)
 
-        # P-Control on Velocity with SQRT Braking Profile
-        err_pos = target - pos
-        v_des_dir = err_pos / (dist + 1e-6)
-        
-        # Braking distance: v^2 = 2*a*d. v = sqrt(2*a*d)
-        braking_speed = np.sqrt(2 * 4.0 * dist)
-        
-        # Ramp down speed
-        speed = min(self.v_max, braking_speed)
-            
-        v_des = v_des_dir * speed
-        
-        # Acceleration control
-        acc = self.Kp * (v_des - vel)
-        return acc
+        prev_idx = max(self.wp_idx - 1, 0)
+        prev = self.waypoints[prev_idx]
+        seg = target - prev
+        seg_norm = np.linalg.norm(seg)
+        if seg_norm > 1e-6:
+            seg_dir = seg / seg_norm
+        else:
+            seg_dir = (target - pos) / (dist + 1e-6)
+        perp_dir = np.array([-seg_dir[1], seg_dir[0]])
+
+        dist_along = np.dot(target - pos, seg_dir)
+        if update_state and dist_along < 0.0 and self.wp_idx < len(self.waypoints) - 1:
+            self.wp_idx += 1
+            target = self.waypoints[self.wp_idx]
+            dist = np.linalg.norm(target - pos)
+            prev_idx = max(self.wp_idx - 1, 0)
+            prev = self.waypoints[prev_idx]
+            seg = target - prev
+            seg_norm = np.linalg.norm(seg)
+            if seg_norm > 1e-6:
+                seg_dir = seg / seg_norm
+            else:
+                seg_dir = (target - pos) / (dist + 1e-6)
+            perp_dir = np.array([-seg_dir[1], seg_dir[0]])
+            dist_along = np.dot(target - pos, seg_dir)
+
+        braking_speed = np.sqrt(2.0 * self.a_max * abs(dist_along))
+        v_long = min(self.v_max, braking_speed)
+        v_long_dir = 1.0 if dist_along >= 0.0 else -1.0
+
+        lat_err = np.dot(pos - prev, perp_dir)
+        v_lat = -self.K_lat * lat_err
+        v_lat = np.clip(v_lat, -self.v_lat_max, self.v_lat_max)
+
+        v_des = v_long_dir * v_long * seg_dir + v_lat * perp_dir
+        v_norm = np.linalg.norm(v_des)
+        if v_norm > self.v_max:
+            v_des = v_des * (self.v_max / (v_norm + 1e-8))
+
+        return self._clip_accel(self.Kp * (v_des - vel))
 
 
 class GhostPredictor:
@@ -292,57 +335,17 @@ class RetraceBackupController:
         # Persistence across physical steps
         self.active_retrace_idx = 0
         self.last_nominal_idx = -1
-        self._last_dist_to_nom = None
         
         # Local for rollout simulation
         self.retrace_idx = 0
         
     def prepare_rollout(self, state):
         """Pick a retrace point that is persistent across physical steps."""
-        pos = state.flatten()[:2]
-        
         # Detect if nominal progress has advanced
         if self.nom.wp_idx > self.last_nominal_idx:
             self.last_nominal_idx = self.nom.wp_idx
             # Latest waypoint passed is the target retrace WP
             self.active_retrace_idx = max(0, self.nom.wp_idx - 1)
-            self._last_dist_to_nom = None # Reset retreat detection
-            
-        # Retreat Detection: only advance retrace mission if moving away from nominal target
-        nom_target = self.nom.waypoints[min(len(self.nom.waypoints)-1, self.nom.wp_idx)]
-        dist_to_nom = np.linalg.norm(nom_target - pos)
-        
-        is_retreating = False
-        if self._last_dist_to_nom is not None:
-             if dist_to_nom > self._last_dist_to_nom + 0.005: 
-                  is_retreating = True
-        
-        self._last_dist_to_nom = dist_to_nom
-
-        # Proximity update: only allowed to go FURTHER back if we are actually retreating
-        target_pos = self.nom.waypoints[self.active_retrace_idx]
-        dist = np.linalg.norm(target_pos - pos)
-        
-        # Robust Skip Detection: Scan backward history
-        if self.active_retrace_idx > 0:
-            for k in range(self.active_retrace_idx - 1, -1, -1):
-                 target_k = self.nom.waypoints[k]
-                 dist_k = np.linalg.norm(target_k - pos)
-                 
-                 # If we are found at an earlier waypoint (with loose tolerance)
-                 if is_retreating and dist_k < 2.0 and dist_k < dist:
-                      self.active_retrace_idx = k
-                      self.nom.wp_idx = self.active_retrace_idx + 1
-                      dist = dist_k
-                      break
-        
-        if is_retreating and dist < 1.0 and self.active_retrace_idx > 0:
-             self.active_retrace_idx -= 1
-             # Sync nominal controller: Resume from here once safe!
-             self.nom.wp_idx = self.active_retrace_idx + 1
-             self.last_nominal_idx = self.nom.wp_idx
-             # Reset distance tracker for the new target
-             self._last_dist_to_nom = None 
              
         # Initialize local rollout index from the persistent state
         self.retrace_idx = self.active_retrace_idx
@@ -363,28 +366,18 @@ class RetraceBackupController:
             pos = state[:2]
             vel = state[2:4]
             
-        # Target position from retrace index
         target_pos = self.nom.waypoints[self.retrace_idx]
-        
-        # Rollout Transition: always allow sequential visitation in simulations
         dist = np.linalg.norm(target_pos - pos)
         if dist < 1.0 and self.retrace_idx > 0:
-             # Progress backwards
-             self.retrace_idx = max(0, self.retrace_idx - 1)
-             target_pos = self.nom.waypoints[self.retrace_idx]
-             dist = np.linalg.norm(target_pos - pos)
-             
-        # P-Control to target
+            self.retrace_idx = max(0, self.retrace_idx - 1)
+            target_pos = self.nom.waypoints[self.retrace_idx]
+            dist = np.linalg.norm(target_pos - pos)
+
         err_pos = target_pos - pos
-        
-        # Only ramp down if we are at the very first waypoint (the ultimate start)
-        if self.retrace_idx == 0 and dist < 1.0:
-             current_speed_target = (self.target_speed / 1.0) * dist
-        else:
-             current_speed_target = self.target_speed
-             
         v_des_dir = err_pos / (dist + 1e-6)
-        v_des = v_des_dir * current_speed_target
+        braking_speed = np.sqrt(2.0 * self.a_max * max(dist, 0.0))
+        v_des_speed = min(self.target_speed, braking_speed)
+        v_des = v_des_dir * v_des_speed
         
         acc = self.Kp * (v_des - vel)
         

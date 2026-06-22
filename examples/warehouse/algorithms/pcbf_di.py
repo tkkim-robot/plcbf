@@ -16,8 +16,8 @@ import cvxpy as cp
 
 from examples.warehouse.dynamics.dynamics_di_jax import DoubleIntegratorDynamicsJAX, DIDynamicsParams
 from examples.warehouse.controllers.policies_di_jax import (
-    AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX,
-    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams
+    AnglePolicyJAX, StopPolicyJAX, WaypointPolicyJAX, RetracePolicyJAX,
+    AnglePolicyParams, StopPolicyParams, WaypointPolicyParams, RetracePolicyParams
 )
 from examples.drift_car.algorithms.pcbf_drift import smooth_min
 from plcbf.pcbf import PCBFBase
@@ -65,8 +65,44 @@ def _rollout_trajectory_di(
             return StopPolicyJAX.compute(state, policy_params)
         elif policy_type == 'waypoint':
             return WaypointPolicyJAX.compute(state, policy_params)
+        elif policy_type == 'retrace_waypoint':
+            return RetracePolicyJAX.compute(state, policy_params)
         else:
             return jnp.zeros(2) # Fallback
+
+    if policy_type == 'retrace_waypoint':
+        params: RetracePolicyParams = policy_params
+
+        def retrace_step(carry, _):
+            x, idx = carry
+            pos = x[0:2]
+            vel = x[2:4]
+
+            idx = jnp.clip(idx, 0, params.waypoints.shape[0] - 1)
+            target = params.waypoints[idx]
+            dist = jnp.sqrt(jnp.sum((target - pos) ** 2) + 1e-8)
+
+            idx_next = jax.lax.cond(
+                jnp.logical_and(dist < params.dist_threshold, idx > 0),
+                lambda i: i - 1,
+                lambda i: i,
+                idx
+            )
+
+            v_des_dir = (target - pos) / (dist + 1e-6)
+            braking_speed = jnp.sqrt(2.0 * params.a_max * jnp.maximum(dist, 0.0))
+            speed = jnp.minimum(params.v_max, braking_speed)
+            v_des = v_des_dir * speed
+
+            acc = params.Kp * (v_des - vel)
+            acc_norm = jnp.sqrt(jnp.sum(acc**2) + 1e-8)
+            scale = jnp.where(acc_norm > params.a_max, params.a_max / acc_norm, 1.0)
+            x_next = step_fn(x, acc * scale)
+            return (x_next, idx_next), x_next
+
+        carry0 = (x0, jnp.array(params.current_wp_idx))
+        _, trajectory = lax.scan(retrace_step, carry0, None, length=horizon)
+        return jnp.vstack([x0[None, :], trajectory])
 
     def body_fn(carry, _):
         x = carry
@@ -118,7 +154,7 @@ def _compute_value_pure_di(
         def h_single_stat(obs):
             # obs: [x, y, r]
             dist = jnp.sqrt((x - obs[0])**2 + (y - obs[1])**2 + 1e-8)
-            return dist - (obs[2] + robot_radius_base)
+            return dist - (obs[2] + robot_radius)
             
         h_dyn = 100.0
         if dynamic_obstacles_array.shape[0] > 0:
@@ -276,7 +312,7 @@ class PCBF_DI(PCBFBase):
             
             # Use slack variable (if passed as Variable or float)
             constraints.append(L_g_V @ u >= -self.cbf_alpha * V - L_f_V - slack)
-        
+
         # 2. Static obstacles: HO-CBF (second-order)
         # (Slack also applied here?)
         gamma1, gamma2 = 2.0, 2.0
