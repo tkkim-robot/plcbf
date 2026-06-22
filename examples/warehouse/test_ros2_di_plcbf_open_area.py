@@ -5,7 +5,7 @@ This script is intentionally standalone: it runs without ROS2 installed, saves a
 review animation, and leaves commented ROS2 placeholders in-place for a later
 hardware bridge.
 
-Student handoff summary
+Note
 -----------------------
 The runnable simulation below has the same control structure that the hardware
 node should keep:
