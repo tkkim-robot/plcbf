@@ -18,15 +18,12 @@ Compute-time workflow:
 from __future__ import annotations
 
 import argparse
-import csv
-from concurrent.futures import ProcessPoolExecutor
 import json
 import os
 import sys
 import time
 import warnings
-from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -40,10 +37,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
 
 from safe_control.envs.warehouse_env import WarehouseEnv
 import examples.warehouse.test_warehouse_quad as test_quad
-from examples.warehouse.controllers.policies_quad3d_jax import (
-    RetracePolicyParams,
-    StopPolicyJAX,
-)
+from examples.warehouse.controllers.policies_quad3d_jax import RetracePolicyParams
 
 
 @dataclass(frozen=True)
@@ -68,42 +62,6 @@ class TrialResult:
     solve_time_sum_sec: float
     timed_steps: int
     total_steps: int
-    algorithm: str = ""
-    seed: int = 0
-    run_idx: int = 0
-    obstacle_geometry: List[Tuple[float, float, float, float, float]] = field(
-        default_factory=list
-    )
-    p_or_library_size: int = 0
-    certificate_lost: bool = False
-    qp_infeasible: bool = False
-    runtime_error: bool = False
-    survived_horizon: bool = False
-    task_completed: bool = False
-    completed_or_survived: bool = False
-    filter_failure: bool = False
-    union_failure: bool = False
-    certificate_loss_steps: int = 0
-    qp_infeasible_steps: int = 0
-    fallback_steps: int = 0
-    mean_compute_ms: float = float("nan")
-    median_compute_ms: float = float("nan")
-    p95_compute_ms: float = float("nan")
-    max_compute_ms: float = float("nan")
-    mean_intervention_l2: float = float("nan")
-    max_intervention_l2: float = float("nan")
-    nominal_tracking_fraction: float = 0.0
-    policy_switch_count: int = 0
-    selected_policy_histogram: Dict[str, int] = field(default_factory=dict)
-    num_candidate_qps_solved: int = 0
-    num_steps_with_no_safe_policy: int = 0
-    mean_feasible_backup_candidates: float = float("nan")
-    terminal_failure_count: int = 0
-    mean_rollout_safe_candidates: float = float("nan")
-    mean_qp_feasible_candidates: float = float("nan")
-    num_feasible_backup_candidates_per_step: List[int] = field(default_factory=list)
-    num_rollout_safe_candidates_per_step: List[int] = field(default_factory=list)
-    num_qp_feasible_candidates_per_step: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -114,31 +72,12 @@ class SummaryRow:
     collisions: int
     infeasibles: int
     fail_count: int
-    union_failures: int
-    certificate_losses: int
-    qp_infeasibles: int
-    runtime_errors: int
-    goal_reaches: int
-    task_completions: int
-    horizon_survivals: int
-    successful_outcomes: int
-    filter_failures: int
     collision_rate_pct: float
     infeasible_rate_pct: float
     fail_rate_pct: float
-    union_failure_rate_pct: float
-    certificate_loss_rate_pct: float
-    qp_infeasible_rate_pct: float
-    runtime_error_rate_pct: float
-    goal_reach_rate_pct: float
-    task_completion_rate_pct: float
-    horizon_survival_rate_pct: float
-    successful_outcome_rate_pct: float
-    filter_failure_rate_pct: float
     avg_nominal_tracking_pct: float
     avg_compute_ms: float
     total_timed_steps: int
-    library_size: int = 0
 
 
 ALGO_SPECS: List[AlgoSpec] = [
@@ -150,31 +89,9 @@ ALGO_SPECS: List[AlgoSpec] = [
     AlgoSpec("mip_mpc", "MIP MPC"),
 ]
 
-# Additive comparison rows.  They are registered for explicit selection but
-# are not added to the historical default run, so invoking the benchmark with
-# no new flags preserves the existing algorithms and output exactly.
-ADDITIONAL_ALGO_SPECS: List[AlgoSpec] = [
-    AlgoSpec("multi_backup_cbf_mi", "MB-CBF-MI"),
-    AlgoSpec("library_pcbf_mi", "Lib-PCBF-MI"),
-]
-ALL_ALGO_SPECS: List[AlgoSpec] = ALGO_SPECS + ADDITIONAL_ALGO_SPECS
-
 
 def _fmt_count_rate(count: int, total: int) -> str:
     return f"{count}/{total} ({100.0 * count / max(total, 1):.1f}%)"
-
-
-def _json_safe(value):
-    """Convert NumPy/non-finite values to strict JSON-compatible values."""
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    return value
 
 
 def _solve_with_timing(fn):
@@ -187,80 +104,6 @@ def _solve_with_timing(fn):
         err = exc
     dt = time.perf_counter() - t0
     return out, dt, err
-
-
-ADDITIONAL_COMPARISON_ALGOS = frozenset(
-    {"multi_backup_cbf_mi", "library_pcbf_mi"}
-)
-
-
-def _comparison_control_enabled(algo: str, comparison_mode: bool) -> bool:
-    """Scope the shared continuation rule to explicit comparison runs."""
-
-    return bool(
-        algo in ADDITIONAL_COMPARISON_ALGOS
-        or (comparison_mode and algo == "plcbf")
-    )
-
-
-def _common_stop_control(shielding, state: np.ndarray) -> np.ndarray:
-    """Return the exact stop entry shared by all three library controllers."""
-
-    policy_configs = getattr(shielding, "policy_configs", {})
-    if "stop" not in policy_configs:
-        raise RuntimeError("comparison controller has no shared stop policy")
-    policy_type, params = policy_configs["stop"]
-    if policy_type != "stop":
-        raise RuntimeError("comparison controller's stop entry changed type")
-    control = np.asarray(
-        StopPolicyJAX.compute(jnp.asarray(state), params), dtype=float
-    ).reshape(-1)
-    lower = float(params.ctrl.u_min)
-    upper = float(params.ctrl.u_max)
-    if control.shape != (4,) or not np.all(np.isfinite(control)):
-        raise RuntimeError("shared stop policy returned an invalid input")
-    return np.clip(control, lower, upper)
-
-
-def _step_failure_events(step_metrics: dict, shielding) -> Tuple[bool, bool, bool]:
-    """Split certificate loss, selected-QP failure, and fallback use.
-
-    The additive methods expose separate no-certificate/no-feasible-QP
-    counters.  Prefer those over their legacy aggregate ``infeasible`` flag so
-    an empty certified set is not double-counted as QP infeasibility.
-    """
-
-    no_certificate = step_metrics.get("num_steps_with_no_certified_rollout")
-    if no_certificate is None:
-        no_certificate = step_metrics.get("num_steps_with_no_safe_policy")
-    if no_certificate is None:
-        certificate_lost = bool(
-            step_metrics.get(
-                "certificate_lost",
-                getattr(shielding, "certificate_lost", False),
-            )
-        )
-    else:
-        certificate_lost = int(no_certificate or 0) > 0
-
-    no_feasible_qp = step_metrics.get("num_steps_with_no_feasible_qp")
-    if no_feasible_qp is None:
-        qp_infeasible = bool(step_metrics.get("qp_infeasible", False))
-    else:
-        qp_infeasible = int(no_feasible_qp or 0) > 0
-    # Under the reported definition, an empty certified set is certificate
-    # loss, not QP infeasibility—even if the controller's damage-mitigation QP
-    # also happens to fail on that same step.
-    if certificate_lost:
-        qp_infeasible = False
-
-    fallback_used = bool(
-        step_metrics.get("fallback_used", False)
-        or step_metrics.get("emergency_action_used", False)
-        or certificate_lost
-        or qp_infeasible
-    )
-    return certificate_lost, qp_infeasible, fallback_used
 
 
 def _sample_velocity(rng: np.random.Generator, speed_min: float, speed_max: float) -> Tuple[float, float]:
@@ -418,7 +261,6 @@ def run_trial(
     tracking_tol: float,
     plcbf_num_angle_policies: int,
     mip_num_angle_policies: int,
-    comparison_mode: bool = False,
 ) -> TrialResult:
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = test_quad.setup_test(
         algo=algo,
@@ -435,8 +277,6 @@ def run_trial(
 
     collision = False
     infeasible = False
-    qp_infeasible = False
-    runtime_error = False
     reached_goal = False
 
     nominal_track_steps = 0
@@ -445,31 +285,7 @@ def run_trial(
     solve_time_sum = 0.0
     timed_steps = 0
 
-    solve_times_sec: List[float] = []
-    intervention_l2_values: List[float] = []
-    selected_policy_histogram: Counter = Counter()
-    policy_switch_count = 0
-    num_candidate_qps_solved = 0
-    num_steps_with_no_safe_policy = 0
-    feasible_backup_counts: List[float] = []
-    terminal_failure_count = 0
-    rollout_safe_counts: List[float] = []
-    qp_feasible_counts: List[float] = []
-    certificate_lost = False
-    certificate_loss_steps = 0
-    qp_infeasible_steps = 0
-    fallback_steps = 0
-
-    warmup_steps = (
-        jit_warmup_steps
-        if algo in {
-            "pcbf", "plcbf", "multi_backup_cbf_mi", "library_pcbf_mi"
-        }
-        else 0
-    )
-    comparison_control_enabled = _comparison_control_enabled(
-        algo, comparison_mode
-    )
+    warmup_steps = jit_warmup_steps if algo in {"pcbf", "plcbf"} else 0
 
     for step in range(max_steps):
         env.step()
@@ -479,18 +295,12 @@ def run_trial(
         u_nom = None
         u_safe = None
 
-        if algo in {
-            "pcbf", "plcbf", "mip_mpc",
-            "multi_backup_cbf_mi", "library_pcbf_mi",
-        }:
+        if algo in {"pcbf", "plcbf", "mip_mpc"}:
             shielding.update_obstacles(ghosts, statics)
             u_nom = np.array(nom_ctrl.get_control(current_state)).flatten()
             control_ref = {"u_ref": u_nom}
 
-            if algo in {
-                "plcbf", "mip_mpc",
-                "multi_backup_cbf_mi", "library_pcbf_mi",
-            }:
+            if algo in {"plcbf", "mip_mpc"}:
                 control_ref["waypoints"] = nom_ctrl.waypoints
                 control_ref["wp_idx"] = nom_ctrl.wp_idx
             elif algo == "pcbf":
@@ -538,107 +348,21 @@ def run_trial(
         else:
             raise ValueError(f"Unknown algorithm: {algo}")
 
-        step_metrics = {}
-        if hasattr(shielding, "get_last_step_metrics"):
-            try:
-                step_metrics = dict(shielding.get_last_step_metrics())
-            except Exception:
-                step_metrics = {}
-
-        selected_policy = step_metrics.get("selected_policy")
-        if selected_policy is not None:
-            selected_policy_histogram[str(selected_policy)] += 1
-        policy_switch_count += int(bool(step_metrics.get("policy_switched", False)))
-        num_candidate_qps_solved += int(
-            step_metrics.get("num_candidate_qps_solved", 0) or 0
-        )
-        no_safe_this_step = int(
-            step_metrics.get("num_steps_with_no_safe_policy", 0) or 0
-        )
-        num_steps_with_no_safe_policy += no_safe_this_step
-        if "num_feasible_backup_candidates" in step_metrics:
-            feasible_backup_counts.append(
-                float(step_metrics["num_feasible_backup_candidates"])
-            )
-        if "terminal_failure_count" in step_metrics:
-            terminal_failure_count += int(step_metrics["terminal_failure_count"] or 0)
-        if "num_safe_candidates" in step_metrics:
-            rollout_safe_counts.append(float(step_metrics["num_safe_candidates"]))
-        if "num_rollout_safe_candidates" in step_metrics:
-            rollout_safe_counts.append(
-                float(step_metrics["num_rollout_safe_candidates"])
-            )
-        if "num_qp_feasible_candidates" in step_metrics:
-            qp_feasible_counts.append(
-                float(step_metrics["num_qp_feasible_candidates"])
-            )
-
-        step_certificate_lost = False
-        step_qp_infeasible = False
-        step_fallback_used = False
-        if solve_err is None and comparison_control_enabled:
-            (
-                step_certificate_lost,
-                step_qp_infeasible,
-                step_fallback_used,
-            ) = _step_failure_events(step_metrics, shielding)
-            certificate_lost = certificate_lost or step_certificate_lost
-            qp_infeasible = qp_infeasible or step_qp_infeasible
-            certificate_loss_steps += int(step_certificate_lost)
-            qp_infeasible_steps += int(step_qp_infeasible)
-            fallback_steps += int(step_fallback_used)
-            if step_certificate_lost or step_qp_infeasible:
-                # Apply one identical continuation action for all three rows.
-                # PL-CBF's internal least-negative/fallback output is retained
-                # as an algorithm diagnostic but is not allowed to change the
-                # post-failure physical trajectory relative to the MI rows.
-                u_safe = _common_stop_control(shielding, current_state)
+        if solve_err is not None:
+            infeasible = True
+            break
 
         if step >= warmup_steps:
-            solve_times_sec.append(float(solve_dt))
             solve_time_sum += float(solve_dt)
             timed_steps += 1
 
-        if solve_err is not None:
-            runtime_error = True
-            infeasible = True
-            if comparison_control_enabled:
-                try:
-                    u_safe = _common_stop_control(shielding, current_state)
-                    fallback_steps += 1
-                except Exception:
-                    break
-            else:
-                # Preserve the historical termination behavior for algorithms
-                # outside the explicit three-method comparison.
-                break
-
         u_safe = np.array(u_safe).flatten()
         if u_safe.shape[0] != 4 or not np.all(np.isfinite(u_safe)):
-            runtime_error = True
             infeasible = True
-            if comparison_control_enabled:
-                try:
-                    u_safe = _common_stop_control(shielding, current_state)
-                    fallback_steps += 1
-                except Exception:
-                    break
-            else:
-                break
-
-        if u_nom is not None:
-            intervention_l2_values.append(
-                float(np.linalg.norm(u_safe - np.asarray(u_nom).reshape(-1)))
-            )
+            break
 
         current_state = robot.step(current_state.reshape(-1, 1), u_safe.reshape(-1, 1)).flatten()
         env.robot_pos = current_state[:2]
-
-        # Count every applied physical control step, including the step that
-        # causes a collision or reaches the goal.
-        if u_nom is not None and np.linalg.norm(u_safe - u_nom) < tracking_tol:
-            nominal_track_steps += 1
-        total_steps += 1
 
         # Collision check: static
         for obs in statics:
@@ -662,37 +386,12 @@ def run_trial(
             reached_goal = True
             break
 
-    survived_horizon = bool(
-        total_steps == max_steps and not collision and not runtime_error
-    )
-    # A completed task means reaching the goal.  Horizon survival is reported
-    # separately because it is a safety outcome, not task completion.
-    task_completed = bool(reached_goal)
-    completed_or_survived = bool(task_completed or survived_horizon)
-    filter_failure = bool(collision or certificate_lost or qp_infeasible)
-    union_failure = bool(filter_failure or runtime_error or not completed_or_survived)
-    # Compatibility field retained for older readers.  New analysis should use
-    # the explicit certificate/QP/runtime fields above.
-    infeasible = bool(infeasible or runtime_error)
+        if u_nom is not None:
+            if np.linalg.norm(u_safe - u_nom) < tracking_tol:
+                nominal_track_steps += 1
+            total_steps += 1
+
     nominal_tracking_pct = 100.0 * nominal_track_steps / max(total_steps, 1)
-
-    solve_times_array = np.asarray(solve_times_sec, dtype=float)
-    if solve_times_array.size:
-        mean_compute_ms = 1000.0 * float(np.mean(solve_times_array))
-        median_compute_ms = 1000.0 * float(np.median(solve_times_array))
-        p95_compute_ms = 1000.0 * float(np.percentile(solve_times_array, 95))
-        max_compute_ms = 1000.0 * float(np.max(solve_times_array))
-    else:
-        mean_compute_ms = median_compute_ms = p95_compute_ms = max_compute_ms = float("nan")
-
-    intervention_array = np.asarray(intervention_l2_values, dtype=float)
-    mean_intervention_l2 = (
-        float(np.mean(intervention_array)) if intervention_array.size else float("nan")
-    )
-    max_intervention_l2 = (
-        float(np.max(intervention_array)) if intervention_array.size else float("nan")
-    )
-    library_size = len(getattr(shielding, "policy_configs", {}))
 
     return TrialResult(
         collision=collision,
@@ -702,55 +401,6 @@ def run_trial(
         solve_time_sum_sec=solve_time_sum,
         timed_steps=timed_steps,
         total_steps=total_steps,
-        algorithm=algo,
-        seed=scenario.seed,
-        run_idx=scenario.run_idx,
-        obstacle_geometry=[tuple(item) for item in scenario.ghosts],
-        p_or_library_size=library_size,
-        certificate_lost=certificate_lost,
-        qp_infeasible=qp_infeasible,
-        runtime_error=runtime_error,
-        survived_horizon=survived_horizon,
-        task_completed=task_completed,
-        completed_or_survived=completed_or_survived,
-        filter_failure=filter_failure,
-        union_failure=union_failure,
-        certificate_loss_steps=certificate_loss_steps,
-        qp_infeasible_steps=qp_infeasible_steps,
-        fallback_steps=fallback_steps,
-        mean_compute_ms=mean_compute_ms,
-        median_compute_ms=median_compute_ms,
-        p95_compute_ms=p95_compute_ms,
-        max_compute_ms=max_compute_ms,
-        mean_intervention_l2=mean_intervention_l2,
-        max_intervention_l2=max_intervention_l2,
-        nominal_tracking_fraction=nominal_tracking_pct / 100.0,
-        policy_switch_count=policy_switch_count,
-        selected_policy_histogram=dict(selected_policy_histogram),
-        num_candidate_qps_solved=num_candidate_qps_solved,
-        num_steps_with_no_safe_policy=num_steps_with_no_safe_policy,
-        mean_feasible_backup_candidates=(
-            float(np.mean(feasible_backup_counts))
-            if feasible_backup_counts else float("nan")
-        ),
-        terminal_failure_count=terminal_failure_count,
-        mean_rollout_safe_candidates=(
-            float(np.mean(rollout_safe_counts))
-            if rollout_safe_counts else float("nan")
-        ),
-        mean_qp_feasible_candidates=(
-            float(np.mean(qp_feasible_counts))
-            if qp_feasible_counts else float("nan")
-        ),
-        num_feasible_backup_candidates_per_step=[
-            int(value) for value in feasible_backup_counts
-        ],
-        num_rollout_safe_candidates_per_step=[
-            int(value) for value in rollout_safe_counts
-        ],
-        num_qp_feasible_candidates_per_step=[
-            int(value) for value in qp_feasible_counts
-        ],
     )
 
 
@@ -759,15 +409,6 @@ def summarize_trials(algo_spec: AlgoSpec, trials: List[TrialResult]) -> SummaryR
     collisions = sum(int(t.collision) for t in trials)
     infeasibles = sum(int(t.infeasible) for t in trials)
     fail_count = sum(int(t.collision or t.infeasible) for t in trials)
-    union_failures = sum(int(t.union_failure) for t in trials)
-    certificate_losses = sum(int(t.certificate_lost) for t in trials)
-    qp_infeasibles = sum(int(t.qp_infeasible) for t in trials)
-    runtime_errors = sum(int(t.runtime_error) for t in trials)
-    goal_reaches = sum(int(t.reached_goal) for t in trials)
-    task_completions = sum(int(t.task_completed) for t in trials)
-    horizon_survivals = sum(int(t.survived_horizon) for t in trials)
-    successful_outcomes = sum(int(t.completed_or_survived) for t in trials)
-    filter_failures = sum(int(t.filter_failure) for t in trials)
 
     nominal_vals = [t.nominal_tracking_pct for t in trials]
     avg_nominal = float(np.mean(nominal_vals)) if nominal_vals else 0.0
@@ -783,31 +424,12 @@ def summarize_trials(algo_spec: AlgoSpec, trials: List[TrialResult]) -> SummaryR
         collisions=collisions,
         infeasibles=infeasibles,
         fail_count=fail_count,
-        union_failures=union_failures,
-        certificate_losses=certificate_losses,
-        qp_infeasibles=qp_infeasibles,
-        runtime_errors=runtime_errors,
-        goal_reaches=goal_reaches,
-        task_completions=task_completions,
-        horizon_survivals=horizon_survivals,
-        successful_outcomes=successful_outcomes,
-        filter_failures=filter_failures,
         collision_rate_pct=100.0 * collisions / max(n, 1),
         infeasible_rate_pct=100.0 * infeasibles / max(n, 1),
         fail_rate_pct=100.0 * fail_count / max(n, 1),
-        union_failure_rate_pct=100.0 * union_failures / max(n, 1),
-        certificate_loss_rate_pct=100.0 * certificate_losses / max(n, 1),
-        qp_infeasible_rate_pct=100.0 * qp_infeasibles / max(n, 1),
-        runtime_error_rate_pct=100.0 * runtime_errors / max(n, 1),
-        goal_reach_rate_pct=100.0 * goal_reaches / max(n, 1),
-        task_completion_rate_pct=100.0 * task_completions / max(n, 1),
-        horizon_survival_rate_pct=100.0 * horizon_survivals / max(n, 1),
-        successful_outcome_rate_pct=100.0 * successful_outcomes / max(n, 1),
-        filter_failure_rate_pct=100.0 * filter_failures / max(n, 1),
         avg_nominal_tracking_pct=avg_nominal,
         avg_compute_ms=avg_compute_ms,
         total_timed_steps=total_timed_steps,
-        library_size=max((t.p_or_library_size for t in trials), default=0),
     )
 
 
@@ -819,108 +441,42 @@ def run_algorithm_trials(
     verbose: bool,
 ) -> Tuple[List[TrialResult], SummaryRow]:
     trials: List[TrialResult] = []
-    comparison_mode = bool(
-        set(getattr(args, "algorithms", None) or ())
-        & ADDITIONAL_COMPARISON_ALGOS
-    )
 
     t_algo0 = time.perf_counter()
-    payloads = [
-        (
-            algo_spec.key,
-            scenario,
-            args.level,
-            args.safety_margin,
-            args.alpha,
-            args.max_steps,
-            args.jit_warmup_steps,
-            args.tracking_tol,
-            args.plcbf_num_angle_policies,
-            args.mip_num_angle_policies,
-            comparison_mode,
+    for idx, scenario in enumerate(scenarios):
+        result = run_trial(
+            algo=algo_spec.key,
+            scenario=scenario,
+            level=args.level,
+            safety_margin=args.safety_margin,
+            alpha=args.alpha,
+            max_steps=args.max_steps,
+            jit_warmup_steps=args.jit_warmup_steps,
+            tracking_tol=args.tracking_tol,
+            plcbf_num_angle_policies=args.plcbf_num_angle_policies,
+            mip_num_angle_policies=args.mip_num_angle_policies,
         )
-        for scenario in scenarios
-    ]
-    worker_count = max(1, int(getattr(args, "num_workers", 1)))
-    if worker_count > 1:
-        # Trials are independent and executor.map preserves their seeded order.
-        # This changes only wall-clock scheduling; each worker runs the exact
-        # same run_trial path and produces its own per-step timing samples.
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            result_iterator = executor.map(_run_trial_payload, payloads)
-            indexed_results = enumerate(result_iterator)
-            for idx, result in indexed_results:
-                trials.append(result)
-                if verbose and ((idx + 1) % max(1, args.progress_every) == 0):
-                    print(
-                        f"  {algo_spec.key:22s} trial {idx + 1:3d}/{len(scenarios)} | "
-                        f"collision={int(result.collision)} "
-                        f"certificate={int(result.certificate_lost)} "
-                        f"qp={int(result.qp_infeasible)} "
-                        f"track={result.nominal_tracking_pct:.1f}%"
-                    )
-    else:
-        indexed_results = (
-            (idx, _run_trial_payload(payload)) for idx, payload in enumerate(payloads)
-        )
-        for idx, result in indexed_results:
-            trials.append(result)
-            if verbose and ((idx + 1) % max(1, args.progress_every) == 0):
-                print(
-                    f"  {algo_spec.key:22s} trial {idx + 1:3d}/{len(scenarios)} | "
-                    f"collision={int(result.collision)} "
-                    f"certificate={int(result.certificate_lost)} "
-                    f"qp={int(result.qp_infeasible)} "
-                    f"track={result.nominal_tracking_pct:.1f}%"
-                )
+        trials.append(result)
 
-    # The loop above intentionally replaces the historical serial loop only
-    # when --num-workers is requested.  Summary semantics are unchanged.
+        if verbose and ((idx + 1) % max(1, args.progress_every) == 0):
+            print(
+                f"  {algo_spec.key:10s} trial {idx + 1:3d}/{len(scenarios)} | "
+                f"collision={int(result.collision)} infeasible={int(result.infeasible)} "
+                f"track={result.nominal_tracking_pct:.1f}%"
+            )
 
     elapsed = time.perf_counter() - t_algo0
     summary = summarize_trials(algo_spec, trials)
     print(
         f"[Done] {algo_spec.label:<28} "
         f"collision={_fmt_count_rate(summary.collisions, summary.n_trials)} "
-        f"certificate={_fmt_count_rate(summary.certificate_losses, summary.n_trials)} "
-        f"qp={_fmt_count_rate(summary.qp_infeasibles, summary.n_trials)} "
-        f"union={_fmt_count_rate(summary.union_failures, summary.n_trials)} "
+        f"infeasible={_fmt_count_rate(summary.infeasibles, summary.n_trials)} "
         f"nominal={summary.avg_nominal_tracking_pct:.1f}% "
         f"avg_compute={summary.avg_compute_ms:.3f} ms "
         f"elapsed={elapsed/60.0:.1f} min"
     )
 
     return trials, summary
-
-
-def _run_trial_payload(payload) -> TrialResult:
-    """Pickle-friendly adapter for optional process-level trial parallelism."""
-    (
-        algo,
-        scenario,
-        level,
-        safety_margin,
-        alpha,
-        max_steps,
-        jit_warmup_steps,
-        tracking_tol,
-        plcbf_num_angle_policies,
-        mip_num_angle_policies,
-        comparison_mode,
-    ) = payload
-    return run_trial(
-        algo=algo,
-        scenario=scenario,
-        level=level,
-        safety_margin=safety_margin,
-        alpha=alpha,
-        max_steps=max_steps,
-        jit_warmup_steps=jit_warmup_steps,
-        tracking_tol=tracking_tol,
-        plcbf_num_angle_policies=plcbf_num_angle_policies,
-        mip_num_angle_policies=mip_num_angle_policies,
-        comparison_mode=comparison_mode,
-    )
 
 
 def refresh_timing_one_by_one(
@@ -930,10 +486,6 @@ def refresh_timing_one_by_one(
 ) -> Dict[str, float]:
     """Recompute average solve time per algorithm by running algorithms one-by-one."""
     refreshed: Dict[str, float] = {}
-    comparison_mode = bool(
-        set(getattr(args, "algorithms", None) or ())
-        & ADDITIONAL_COMPARISON_ALGOS
-    )
 
     print("\n=== Timing Refresh (one algorithm at a time) ===")
     timing_scenarios = scenarios[: max(1, min(args.timing_refresh_trials, len(scenarios)))]
@@ -955,7 +507,6 @@ def refresh_timing_one_by_one(
                 tracking_tol=args.tracking_tol,
                 plcbf_num_angle_policies=args.plcbf_num_angle_policies,
                 mip_num_angle_policies=args.mip_num_angle_policies,
-                comparison_mode=comparison_mode,
             )
             total_solve_sec += trial.solve_time_sum_sec
             total_timed_steps += trial.timed_steps
@@ -1164,37 +715,8 @@ def format_markdown(
     )
     lines.append(f"- Safety margin: {args.safety_margin:.2f}")
     lines.append(f"- PLCBF angle policies: {args.plcbf_num_angle_policies}")
-    detailed_comparison = any(
-        summary.key in {"multi_backup_cbf_mi", "library_pcbf_mi"}
-        for summary in summaries
-    )
-    if detailed_comparison:
-        lines.append(
-            "- Runtime PL-CBF library: P angle policies + stop + nominal "
-            f"= P+2 = {args.plcbf_num_angle_policies + 2} policies"
-        )
-        lines.append(
-            "- All three comparison controllers apply the exact shared stop action "
-            "after certificate loss or QP failure; episodes stop only on "
-            "collision, goal, unrecoverable runtime error, or the fixed horizon"
-        )
-        lines.append(
-            "- Certificate loss: no policy has a positive rollout certificate; "
-            "QP infeasible: a certified set exists but no required QP returns an "
-            "accepted bounded input"
-        )
-        lines.append(
-            "- Task completion: goal reached; horizon survival is reported separately"
-        )
-        lines.append(
-            "- Union failure: collision OR certificate loss OR QP infeasibility "
-            "OR runtime error OR neither goal completion nor horizon survival"
-        )
     lines.append(f"- MIP angle policies: {args.mip_num_angle_policies}")
-    lines.append(
-        "- Timing warmup skip (PCBF/PLCBF/MB-CBF-MI/Lib-PCBF-MI): "
-        f"{args.jit_warmup_steps} steps"
-    )
+    lines.append(f"- JIT warmup skip (PCBF/PLCBF): {args.jit_warmup_steps} steps")
     lines.append(
         "- Compute-time column uses solve-control time only "
         "(plotting/logging excluded; refreshed one-by-one after full table "
@@ -1203,45 +725,22 @@ def format_markdown(
         else "- Compute-time column uses solve-control time only (plotting/logging excluded)"
     )
     lines.append("")
-    if detailed_comparison:
-        lines.append(
-            "| Algorithm | P | Library size | Collision | Certificate loss | "
-            "QP infeasible | Goal | Horizon survival | Goal or survival | "
-            "Union failure | Avg Compute Time (ms) |"
-        )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for s in summaries:
-            lines.append(
-                "| "
-                f"{s.label} | "
-                f"{args.plcbf_num_angle_policies} | "
-                f"{s.library_size or args.plcbf_num_angle_policies + 2} | "
-                f"{_fmt_count_rate(s.collisions, s.n_trials)} | "
-                f"{_fmt_count_rate(s.certificate_losses, s.n_trials)} | "
-                f"{_fmt_count_rate(s.qp_infeasibles, s.n_trials)} | "
-                f"{_fmt_count_rate(s.task_completions, s.n_trials)} | "
-                f"{_fmt_count_rate(s.horizon_survivals, s.n_trials)} | "
-                f"{_fmt_count_rate(s.successful_outcomes, s.n_trials)} | "
-                f"{_fmt_count_rate(s.union_failures, s.n_trials)} | "
-                f"{s.avg_compute_ms:.3f} |"
-            )
-    else:
-        lines.append(
-            "| Algorithm | Collision Rate | Infeasible Rate | Collision+Infeasible Rate | "
-            "Avg Nominal Tracking (%) | Avg Compute Time (ms) |"
-        )
-        lines.append("|---|---:|---:|---:|---:|---:|")
+    lines.append(
+        "| Algorithm | Collision Rate | Infeasible Rate | Collision+Infeasible Rate | "
+        "Avg Nominal Tracking (%) | Avg Compute Time (ms) |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|")
 
-        for s in summaries:
-            lines.append(
-                "| "
-                f"{s.label} | "
-                f"{_fmt_count_rate(s.collisions, s.n_trials)} | "
-                f"{_fmt_count_rate(s.infeasibles, s.n_trials)} | "
-                f"{_fmt_count_rate(s.fail_count, s.n_trials)} | "
-                f"{s.avg_nominal_tracking_pct:.1f} | "
-                f"{s.avg_compute_ms:.3f} |"
-            )
+    for s in summaries:
+        lines.append(
+            "| "
+            f"{s.label} | "
+            f"{_fmt_count_rate(s.collisions, s.n_trials)} | "
+            f"{_fmt_count_rate(s.infeasibles, s.n_trials)} | "
+            f"{_fmt_count_rate(s.fail_count, s.n_trials)} | "
+            f"{s.avg_nominal_tracking_pct:.1f} | "
+            f"{s.avg_compute_ms:.3f} |"
+        )
 
     lines.append("")
     return "\n".join(lines)
@@ -1275,30 +774,9 @@ def main():
 
 
     parser.add_argument("--skip-mip", action="store_true")
-    parser.add_argument(
-        "--algorithms",
-        nargs="+",
-        choices=[spec.key for spec in ALL_ALGO_SPECS],
-        default=None,
-        help=(
-            "Run only the selected rows. The two additive baselines are "
-            "multi_backup_cbf_mi and library_pcbf_mi; omitting this flag "
-            "preserves the historical benchmark set."
-        ),
-    )
     parser.add_argument("--skip-timing-refresh", action="store_true")
     parser.add_argument("--timing-refresh-trials", type=int, default=1)
     parser.add_argument("--progress-every", type=int, default=10)
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=1,
-        help=(
-            "Independent seeded trials to run concurrently. Default 1 "
-            "preserves historical serial execution; timings under concurrency "
-            "are tentative."
-        ),
-    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--sensing-range", type=float, default=test_quad.DEFAULT_SENSING_RANGE_M)
     parser.add_argument("--save-animations", action="store_true")
@@ -1344,7 +822,7 @@ def main():
         type=str,
         nargs="+",
         default=None,
-        choices=[s.key for s in ALL_ALGO_SPECS],
+        choices=[s.key for s in ALGO_SPECS],
     )
     parser.add_argument(
         "--animation-safety-margin",
@@ -1372,33 +850,12 @@ def main():
         type=str,
         default="examples/warehouse/benchmark_warehouse_randomized_quad_results.json",
     )
-    parser.add_argument(
-        "--output-csv",
-        type=str,
-        default=None,
-        help="Per-trial metrics CSV (selected-policy histograms are JSON encoded).",
-    )
 
     args = parser.parse_args()
 
     warnings.filterwarnings("ignore", message="Solution may be inaccurate.*", module="cvxpy")
 
-    selected_specs = ALL_ALGO_SPECS if args.algorithms else ALGO_SPECS
-    requested = set(args.algorithms or [])
-    algo_specs = [
-        spec
-        for spec in selected_specs
-        if (not requested or spec.key in requested)
-        and not (args.skip_mip and spec.key == "mip_mpc")
-    ]
-    if args.output_csv is None and any(
-        spec.key in {item.key for item in ADDITIONAL_ALGO_SPECS}
-        for spec in algo_specs
-    ):
-        args.output_csv = (
-            "examples/warehouse/"
-            "benchmark_warehouse_randomized_quad_additional_results.csv"
-        )
+    algo_specs = [s for s in ALGO_SPECS if not (args.skip_mip and s.key == "mip_mpc")]
 
     print("Generating randomized dynamic-obstacle scenarios...")
     scenarios = generate_random_scenarios(
@@ -1473,69 +930,14 @@ def main():
     json_payload = {
         "config": vars(args),
         "scenario_seed": args.seed,
-        "failure_semantics": {
-            "certificate_loss": "no policy has a positive rollout certificate",
-            "qp_infeasible": (
-                "a certified policy exists but no required QP returns an accepted "
-                "bounded input"
-            ),
-            "filter_failure": "collision OR certificate_loss OR qp_infeasible",
-            "task_completed": "goal reached",
-            "survived_horizon": (
-                "fixed horizon reached without collision or runtime error"
-            ),
-            "completed_or_survived": "task_completed OR survived_horizon",
-            "union_failure": (
-                "filter_failure OR runtime_error OR NOT completed_or_survived"
-            ),
-            "post_filter_event_action": "exact shared stop library entry",
-        },
-        "policy_library": {
-            "angle_policy_count": args.plcbf_num_angle_policies,
-            "extra_entries": ["stop", "nominal"],
-            "library_size": args.plcbf_num_angle_policies + 2,
-        },
         "summaries": [asdict(s) for s in summaries],
         "timing_refreshed": timing_refreshed,
     }
-    additional_keys = {spec.key for spec in ADDITIONAL_ALGO_SPECS}
-    if any(spec.key in additional_keys for spec in algo_specs):
-        json_payload["trials"] = {
-            key: [asdict(trial) for trial in trials]
-            for key, trials in all_trial_results.items()
-        }
-    output_json.write_text(
-        json.dumps(_json_safe(json_payload), indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-
-    trial_rows = []
-    output_csv = None
-    if args.output_csv is not None:
-        output_csv = Path(args.output_csv)
-        if not output_csv.is_absolute():
-            output_csv = Path(PROJECT_ROOT) / output_csv
-        output_csv.parent.mkdir(parents=True, exist_ok=True)
-        for trials in all_trial_results.values():
-            for trial in trials:
-                row = asdict(trial)
-                for key, value in list(row.items()):
-                    if isinstance(value, (dict, list, tuple)):
-                        row[key] = json.dumps(_json_safe(value), sort_keys=True)
-                    elif isinstance(value, float) and not np.isfinite(value):
-                        row[key] = ""
-                trial_rows.append(row)
-        if trial_rows:
-            with output_csv.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=list(trial_rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(trial_rows)
+    output_json.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
 
     print("\n" + markdown)
     print(f"Saved markdown report: {output_md}")
     print(f"Saved json report: {output_json}")
-    if output_csv is not None and trial_rows:
-        print(f"Saved per-trial CSV: {output_csv}")
 
 
 if __name__ == "__main__":

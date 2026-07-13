@@ -62,47 +62,50 @@ uv run python examples/warehouse/test_warehouse_quad.py \
 
 ### Additional multi-policy comparison baselines
 
-Two additive paper-comparison methods are available without changing the
-historical default benchmark rows:
+The two paper-comparison methods have separate, baseline-only benchmark entry
+points. The historical PL-CBF controllers and benchmark execution paths remain
+byte-identical to commit `34795fae8ab04846e312cdb399872e9a6deda7b5` and are
+not run by these commands:
 
-- `multi_backup_cbf_mi`: **MB-CBF-MI**, a benchmark-adapted multi-Backup-CBF
-  heuristic that first rejects candidates whose complete sampled rollout or
-  terminal proxy fails, then selects the feasible candidate-QP result with
-  minimum realized intervention. Its sampled stop-tail/hover proxy is not a
-  proof of terminal-set invariance, so Chen et al.'s theorem is not inherited.
-- `library_pcbf_mi`: **Lib-PCBF-MI**, the PL-CBF certificate library with one
-  QP per certified policy and minimum realized-intervention selection.
+- `multi_backup_cbf_mi`: **MB-CBF-MI†**, a benchmark-adapted multi-Backup-CBF
+  heuristic that admits only candidates whose complete sampled rollout and
+  terminal proxy pass, then selects the feasible candidate-QP result with the
+  least realized intervention.
+- `library_pcbf_mi`: **Lib-PCBF-MI**, the same policy certificates and
+  per-policy QPs as the policy library, selected by least realized
+  intervention.
 
-Run the apples-to-apples 50-trial drift-car comparison with the paper seed:
+Run the 50 paired drift-car trials with the paper seed:
 
 ```bash
-uv run python examples/drift_car/benchmark_black_ice.py \
+uv run python examples/drift_car/benchmark_additional_baselines.py \
   --num-runs 50 --seed 7 \
-  --variant-key plcbf \
   --variant-key multi_backup_cbf_mi \
   --variant-key library_pcbf_mi \
-  --num-workers 1
+  --num-workers 8
 ```
 
-Run the apples-to-apples 100-trial Quad3D comparison at `P=64` with the
-paper seed. The actual runtime library is 64 angle policies + `stop` +
-`nominal`, hence `|Pi|=P+2=66`:
+Run the 100 paired Quad3D trials at `P=64`. The warehouse runtime library is
+64 angle policies + `stop` + `nominal`, so `|Pi|=P+2=66`:
 
 ```bash
-uv run python examples/warehouse/benchmark_warehouse_randomized_quad.py \
-  --algorithms plcbf multi_backup_cbf_mi library_pcbf_mi \
+uv run python examples/warehouse/benchmark_additional_baselines_quad.py \
+  --algorithms multi_backup_cbf_mi library_pcbf_mi \
   --num-trials 100 --seed 11 \
-  --plcbf-num-angle-policies 64 \
-  --num-workers 1 --skip-timing-refresh
+  --num-angle-policies 64 --num-workers 8
 ```
 
-Both benchmark drivers separately report physical collision, certificate
-loss, QP infeasibility, goal completion, horizon survival, runtime error, and
-a defined union failure. After certificate loss or QP failure, all three rows
-apply the exact shared stop action and continue under the same physical rule.
-Detailed per-trial JSON/CSV data records the seeded obstacle geometry.
-Candidate QPs inside MB-CBF-MI are evaluated sequentially; parallel workers
-preserve scenarios but make compute-time measurements tentative.
+The main failure column preserves the historical definition: physical
+collision or unrecoverable infeasibility/runtime failure. Certificate loss and
+candidate-QP failure are separate diagnostics. When either diagnostic occurs,
+the benchmark applies the selected baseline's returned finite, bounded control
+unchanged and continues. Solve exceptions, invalid controls, and simulator
+errors terminate the trial as unrecoverable.
+
+For publication timing, rerun each command separately with one worker and a
+small trial count. Both drivers exclude warm-up calls from timing. † MB-CBF-MI
+uses a sampled terminal proxy rather than a proven control-invariant terminal
+set, so it does not inherit the formal guarantee of Chen et al.
 
 ## Useful Options
 
@@ -111,7 +114,7 @@ preserve scenarios but make compute-time measurements tentative.
 | Option | Description |
 |---|---|
 | `--test` | `puddle_surprise`, `high_friction`, `low_friction`, `straight_safe`, `far_left_safe`, `all` |
-| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf`, `multi_backup_cbf_mi`, `library_pcbf_mi` |
+| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf` |
 | `--backup` | `lane_change`, `lane_change_left`, `lane_change_right`, `stop` |
 | `--obs` | Number of obstacles (`1` or `2`) |
 | `--no-render` | Headless run |
@@ -121,7 +124,7 @@ preserve scenarios but make compute-time measurements tentative.
 
 | Option | Description |
 |---|---|
-| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf`, `multi_backup_cbf_mi`, `library_pcbf_mi` |
+| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf` |
 | `--level` | `7` (default), `1` to `6` |
 | `--plcbf_num_angle_policies` | `64` (default): Number of PLCBF angle fallback policies |
 | `--no_render` | Headless run |

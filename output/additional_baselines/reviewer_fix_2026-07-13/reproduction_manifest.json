@@ -1,5 +1,8 @@
 {
   "schema_version": 1,
+  "artifact_role": "common_stop_audit",
+  "not_for_publication": true,
+  "superseded_by": "../publication_baseline_only_2026-07-13",
   "generated_at": "2026-07-13T06:18:32-04:00",
   "branch": "multi-backup-baselines",
   "code_commit": "a9c34d7a27c5bffbef91999ad56fe58e8db54677",

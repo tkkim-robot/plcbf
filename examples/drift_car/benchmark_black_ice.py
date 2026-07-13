@@ -1,7 +1,7 @@
 """
 Benchmark for drift-car black-ice puddle-surprise scenario.
 
-Compares the existing 13 variants plus two shared-library baselines:
+Compares 13 variants:
 1) PLCBF (multi-policy)
 2) BackupCBF with 3 fixed backup policies (stop/left/right)
 3) MPS with 3 fixed backup policies (stop/left/right)
@@ -9,22 +9,19 @@ Compares the existing 13 variants plus two shared-library baselines:
 5) PCBF with 3 fixed backup policies (stop/left/right)
 
 Metrics:
-- Collision and infeasibility (reported separately)
-- Nominal tracking, intervention, policy selection, and runtime statistics
+- Collision/Infeasible rate
+- Average nominal tracking percentage
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import contextlib
-from concurrent.futures import ProcessPoolExecutor
-import json
+import io
 import os
 import sys
-import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -45,37 +42,8 @@ from safe_control.shielding.mps import MPS
 
 from examples.drift_car.algorithms.plcbf_drift import PLCBF
 from examples.drift_car.algorithms.pcbf_drift import PCBF
-from examples.drift_car.algorithms.library_pcbf_mi_drift import (
-    LibraryPCBFMinInterventionDrift,
-)
-from examples.drift_car.algorithms.multi_backup_cbf_mi_drift import (
-    MultiBackupCBFMinInterventionDrift,
-)
 
 QUIET_SINK = open(os.devnull, "w", encoding="utf-8")
-ADDITIONAL_ALGOS = ("multi_backup_cbf_mi", "library_pcbf_mi")
-COMPARISON_ALGOS = ("plcbf",) + ADDITIONAL_ALGOS
-FILTER_FAILURE_DEFINITION = "collision OR certificate_lost OR qp_infeasible"
-UNION_FAILURE_DEFINITION = (
-    "filter_failure OR runtime_error OR NOT completed_or_survived; task_completed "
-    "means reaching the track goal and horizon survival is reported separately"
-)
-LEGACY_INFEASIBLE_DEFINITION = (
-    "compatibility field equal to qp_infeasible OR runtime_error; use the explicit "
-    "fields for analysis"
-)
-
-
-def _json_safe(value):
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
-    return value
 
 
 @dataclass(frozen=True)
@@ -102,7 +70,7 @@ class SimConfig:
 class AlgoVariant:
     key: str
     label: str
-    algo: str  # registry key used by setup_shielding/solve_safe_control
+    algo: str  # plcbf, backup_cbf, mps, gatekeeper, pcbf
     backup_policy: Optional[str]  # None for plcbf, else stop/lane_change_left/lane_change_right
 
 
@@ -117,50 +85,10 @@ class Scenario:
 
 @dataclass
 class EpisodeResult:
-    algorithm: str
-    seed: int
-    run_idx: int
-    obstacle_geometry: List[Tuple[float, str]]
-    P_or_library_size: int
     collision: bool
     infeasible: bool
-    certificate_lost: bool
-    qp_infeasible: bool
-    runtime_error: bool
-    reached_goal: bool
-    survived_horizon: bool
-    task_completed: bool
-    completed_or_survived: bool
-    filter_failure: bool
-    union_failure: bool
+    nominal_tracking_pct: float
     total_steps: int
-    timed_steps: int
-    mean_compute_ms: float
-    median_compute_ms: float
-    p95_compute_ms: float
-    max_compute_ms: float
-    nominal_tracking_fraction: float
-    mean_intervention_l2: float
-    max_intervention_l2: float
-    policy_switch_count: int
-    selected_policy_histogram: Dict[str, int] = field(default_factory=dict)
-    num_candidate_qps_solved: int = 0
-    num_steps_with_no_safe_policy: int = 0
-    num_feasible_backup_candidates_per_step: List[int] = field(default_factory=list)
-    num_certified_backup_candidates_per_step: List[int] = field(default_factory=list)
-    terminal_failure_count: int = 0
-    num_rollout_safe_candidates_per_step: List[int] = field(default_factory=list)
-    num_qp_feasible_candidates_per_step: List[int] = field(default_factory=list)
-    certificate_loss_steps: int = 0
-    qp_infeasible_steps: int = 0
-    fallback_steps: int = 0
-    candidate_qp_failure_count: int = 0
-
-    @property
-    def nominal_tracking_pct(self) -> float:
-        """Compatibility accessor used by older analysis scripts."""
-
-        return 100.0 * self.nominal_tracking_fraction
 
 
 def build_vehicle_spec() -> Dict[str, float]:
@@ -193,28 +121,10 @@ def build_vehicle_spec() -> Dict[str, float]:
     }
 
 
-def make_variants(include_additional: bool = False) -> List[AlgoVariant]:
+def make_variants() -> List[AlgoVariant]:
     variants: List[AlgoVariant] = [
         AlgoVariant("plcbf", "PLCBF", "plcbf", None),
     ]
-
-    if include_additional:
-        variants.extend(
-            [
-                AlgoVariant(
-                    "multi_backup_cbf_mi",
-                    "MB-CBF-MI",
-                    "multi_backup_cbf_mi",
-                    None,
-                ),
-                AlgoVariant(
-                    "library_pcbf_mi",
-                    "Lib-PCBF-MI",
-                    "library_pcbf_mi",
-                    None,
-                ),
-            ]
-        )
 
     families = [
         ("backup_cbf", "Backup CBF"),
@@ -257,14 +167,10 @@ def generate_scenarios(num_runs: int, seed: int) -> List[Scenario]:
                 x_second = float(np.clip(x_first + 1.0, 75.0, 85.0))
             obstacles = ((x_first, "middle"), (x_second, lane_second))
 
-        # Preserve the historical RNG stream (the old field consumed one draw
-        # but was never used to initialize a trial).  Trial records now store
-        # the actual master scenario seed plus run index, which is replayable.
-        _unused_historical_trial_token = int(rng.integers(0, 2**31 - 1))
         scenarios.append(
             Scenario(
                 run_idx=run_idx,
-                seed=int(seed),
+                seed=int(rng.integers(0, 2**31 - 1)),
                 num_obstacles=num_obs,
                 obstacles=obstacles,
             )
@@ -365,31 +271,6 @@ def create_backup_controller(
     raise ValueError(f"Unknown backup policy: {backup_policy}")
 
 
-def create_reference_plcbf(
-    car: DriftingCar,
-    env: DriftingEnv,
-    lanes: Dict[str, float],
-    cfg: SimConfig,
-) -> PLCBF:
-    """Construct the one runtime library shared by all multi-policy methods."""
-
-    controller = PLCBF(
-        robot=car,
-        robot_spec=car.robot_spec,
-        dt=cfg.dt,
-        backup_horizon=cfg.backup_horizon_time,
-        cbf_alpha=6.0,
-        left_lane_y=lanes["left"],
-        right_lane_y=lanes["right"],
-        safety_margin=1.15,
-        max_operator="input_space",
-        debug=False,
-        ax=None,
-    )
-    controller.set_environment(env)
-    return controller
-
-
 def setup_shielding(
     variant: AlgoVariant,
     car: DriftingCar,
@@ -398,36 +279,19 @@ def setup_shielding(
     cfg: SimConfig,
 ):
     if variant.algo == "plcbf":
-        return create_reference_plcbf(car, env, lanes, cfg)
-
-    if variant.algo in ("multi_backup_cbf_mi", "library_pcbf_mi"):
-        # This object is the runtime equality oracle.  The new implementations
-        # fail at initialization if names/order/gains/targets/limits/horizon or
-        # nominal representation differ from it.
-        reference_plcbf = create_reference_plcbf(car, env, lanes, cfg)
-        if variant.algo == "multi_backup_cbf_mi":
-            shielding = MultiBackupCBFMinInterventionDrift(
-                robot=car,
-                robot_spec=car.robot_spec,
-                dt=cfg.dt,
-                backup_horizon=cfg.backup_horizon_time,
-                ax=None,
-                reference_plcbf=reference_plcbf,
-            )
-        else:
-            shielding = LibraryPCBFMinInterventionDrift(
-                robot=car,
-                robot_spec=car.robot_spec,
-                dt=cfg.dt,
-                backup_horizon=cfg.backup_horizon_time,
-                cbf_alpha=6.0,
-                left_lane_y=lanes["left"],
-                right_lane_y=lanes["right"],
-                safety_margin=1.15,
-                debug=False,
-                ax=None,
-                reference_plcbf=reference_plcbf,
-            )
+        shielding = PLCBF(
+            robot=car,
+            robot_spec=car.robot_spec,
+            dt=cfg.dt,
+            backup_horizon=cfg.backup_horizon_time,
+            cbf_alpha=6.0,
+            left_lane_y=lanes["left"],
+            right_lane_y=lanes["right"],
+            safety_margin=1.15,
+            max_operator="input_space",
+            debug=False,
+            ax=None,
+        )
         shielding.set_environment(env)
         return shielding
 
@@ -505,7 +369,7 @@ def solve_safe_control(
     pred_controls: Optional[np.ndarray],
     friction: float,
 ):
-    if variant.algo in ("plcbf", "multi_backup_cbf_mi", "library_pcbf_mi"):
+    if variant.algo == "plcbf":
         return shielding.solve_control_problem(
             state,
             control_ref={"u_ref": u_nom},
@@ -529,78 +393,7 @@ def call_quiet(quiet: bool, fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
-def classify_comparison_status(variant: AlgoVariant, shielding, status: dict):
-    """Return disjoint certificate/QP/runtime events for one filter step.
-
-    PL-CBF and MB-CBF-MI expose the split directly.  Lib-PCBF-MI predates the
-    split in its status object, so its already-computed candidate list
-    disambiguates an empty certified set from a certified set whose QPs all
-    failed.  This helper changes logging/continuation only.
-    """
-
-    if variant.algo not in COMPARISON_ALGOS:
-        return False, False, False, False
-
-    status_text = str(status.get("status", ""))
-    fallback_applied = bool(status.get("fallback_applied", False))
-    if variant.algo == "plcbf":
-        certificate_lost = bool(status.get("certificate_lost", False))
-        return (
-            certificate_lost,
-            bool(status.get("qp_infeasible", False)) and not certificate_lost,
-            status_text.startswith(("error", "value_error")),
-            fallback_applied,
-        )
-    if variant.algo == "multi_backup_cbf_mi":
-        certificate_lost = bool(status.get("certificate_lost", False))
-        return (
-            certificate_lost,
-            bool(status.get("qp_infeasible", status.get("infeasible", False)))
-            and not certificate_lost,
-            bool(status.get("runtime_error", False))
-            or status_text.startswith(("error", "value_error")),
-            fallback_applied,
-        )
-
-    if status_text.startswith("value_error"):
-        return False, False, True, True
-    if not (status.get("certificate_lost") or status.get("infeasible")):
-        return False, False, False, False
-
-    certified_candidates = getattr(shielding, "last_candidate_results", [])
-    if certified_candidates:
-        return False, True, False, True
-    return True, False, False, True
-
-
-def common_comparison_fallback(
-    shielding,
-    state: np.ndarray,
-    u_nom: np.ndarray,
-) -> np.ndarray:
-    """Use the exact stop entry shared by the three drift policy libraries."""
-
-    if hasattr(shielding, "_emergency_control"):
-        control = shielding._emergency_control(state)
-    elif hasattr(shielding, "_compute_policy_control"):
-        control = shielding._compute_policy_control("stop", state, u_nom)
-    else:
-        raise RuntimeError("comparison controller has no shared stop fallback")
-    control = np.asarray(control, dtype=float).reshape(-1)
-    lower = np.asarray(getattr(shielding, "u_min"), dtype=float).reshape(-1)
-    upper = np.asarray(getattr(shielding, "u_max"), dtype=float).reshape(-1)
-    if control.shape != (2,) or not np.all(np.isfinite(control)):
-        raise RuntimeError("shared stop fallback returned an invalid input")
-    return np.clip(control, lower, upper)
-
-
-def run_episode(
-    variant: AlgoVariant,
-    scenario: Scenario,
-    cfg: SimConfig,
-    verbose: bool = False,
-    comparison_mode: bool = False,
-) -> EpisodeResult:
+def run_episode(variant: AlgoVariant, scenario: Scenario, cfg: SimConfig, verbose: bool = False) -> EpisodeResult:
     env, lanes = setup_env_and_lanes(cfg)
     add_black_ice_and_obstacles(env, lanes, cfg, scenario)
 
@@ -617,21 +410,6 @@ def run_episode(
     nominal_like_steps = 0
     collision = False
     infeasible = False
-    certificate_lost = False
-    qp_infeasible = False
-    runtime_error = False
-    certificate_loss_steps = 0
-    qp_infeasible_steps = 0
-    fallback_steps = 0
-    observed_candidate_qp_failure_count = 0
-    reached_goal = False
-    compute_times_s: List[float] = []
-    intervention_samples: List[float] = []
-    selected_policy_histogram: Dict[str, int] = {}
-    policy_switch_count = 0
-    previous_policy: Optional[str] = None
-    solve_calls = 0
-    timing_warmup_steps = 5 if variant.algo in COMPARISON_ALGOS else 0
 
     u_scale = np.array(
         [
@@ -656,7 +434,6 @@ def run_episode(
             u_nom = call_quiet(quiet, mpcc.solve_control_problem, state)
             pred_states, pred_controls = call_quiet(quiet, mpcc.get_full_predictions)
         except Exception:
-            runtime_error = True
             infeasible = True
             break
 
@@ -665,11 +442,7 @@ def run_episode(
             if pred_states is not None and pred_controls is not None:
                 shielding.set_nominal_trajectory(pred_states, pred_controls)
 
-        forced_runtime_error = False
-        forced_fallback = False
         try:
-            solve_calls += 1
-            solve_started = time.perf_counter()
             u_safe = call_quiet(
                 quiet,
                 solve_safe_control,
@@ -681,101 +454,19 @@ def run_episode(
                 pred_controls=pred_controls,
                 friction=car.get_friction(),
             )
-            solve_elapsed = time.perf_counter() - solve_started
-            if solve_calls > timing_warmup_steps:
-                compute_times_s.append(solve_elapsed)
         except Exception:
-            if "solve_started" in locals() and solve_calls > timing_warmup_steps:
-                compute_times_s.append(time.perf_counter() - solve_started)
-            if variant.algo in ADDITIONAL_ALGOS or (
-                comparison_mode and variant.algo == "plcbf"
-            ):
-                exception_status = (
-                    shielding.get_status()
-                    if hasattr(shielding, "get_status")
-                    else {}
-                )
-                exception_was_qp = bool(
-                    exception_status.get("qp_infeasible", False)
-                )
-                forced_runtime_error = not exception_was_qp
-                try:
-                    u_safe = common_comparison_fallback(shielding, state, u_nom)
-                    forced_fallback = True
-                except Exception:
-                    runtime_error = True
-                    infeasible = True
-                    break
-            else:
-                runtime_error = True
-                infeasible = True
-                break
+            infeasible = True
+            break
 
         u_nom_vec = np.array(u_nom).flatten()
         u_safe_vec = np.array(u_safe).flatten()
         if (not np.all(np.isfinite(u_safe_vec))) or (u_safe_vec.shape[0] != 2):
-            runtime_error = True
-            infeasible = True
-            break
-
-        status = shielding.get_status() if hasattr(shielding, "get_status") else {}
-        (
-            step_certificate_lost,
-            step_qp_infeasible,
-            step_runtime_error,
-            step_fallback,
-        ) = (
-            classify_comparison_status(variant, shielding, status)
-            if comparison_mode or variant.algo in ADDITIONAL_ALGOS
-            else (False, False, False, False)
-        )
-        step_runtime_error = bool(step_runtime_error or forced_runtime_error)
-        step_fallback = bool(
-            step_fallback
-            or forced_fallback
-            or step_certificate_lost
-            or step_qp_infeasible
-        )
-        if step_certificate_lost or step_qp_infeasible:
-            # Use the exact same stop action after either filter event.  This
-            # prevents PL-CBF's least-negative continuation from receiving a
-            # different physical post-certificate-loss trajectory than the two
-            # minimum-intervention rows.
-            u_safe_vec = common_comparison_fallback(shielding, state, u_nom_vec)
-            u_safe = u_safe_vec.reshape(-1, 1)
-        certificate_lost = certificate_lost or step_certificate_lost
-        qp_infeasible = qp_infeasible or step_qp_infeasible
-        runtime_error = runtime_error or step_runtime_error
-        certificate_loss_steps += int(step_certificate_lost)
-        qp_infeasible_steps += int(step_qp_infeasible)
-        fallback_steps += int(step_fallback)
-        if variant.algo in ADDITIONAL_ALGOS:
-            observed_candidate_qp_failure_count += sum(
-                bool(candidate.qp_solved and not candidate.feasible)
-                for candidate in getattr(shielding, "last_candidate_results", [])
-            )
-
-        # Certificate loss and candidate-QP infeasibility are filter events,
-        # not physical terminal conditions.  Both additional baselines already
-        # return the same bounded stopping/damage-mitigation action, so apply it
-        # and continue under the identical collision/goal/horizon semantics.
-        if step_runtime_error:
             infeasible = True
             break
 
         diff = np.linalg.norm((u_safe_vec - u_nom_vec) / np.maximum(u_scale, 1e-8))
-        intervention_samples.append(float(np.linalg.norm(u_safe_vec - u_nom_vec)))
         if diff < cfg.nominal_track_eps:
             nominal_like_steps += 1
-        selected_policy = status.get("best_policy")
-        if selected_policy is not None:
-            selected_policy = str(selected_policy)
-            selected_policy_histogram[selected_policy] = (
-                selected_policy_histogram.get(selected_policy, 0) + 1
-            )
-            if previous_policy is not None and previous_policy != selected_policy:
-                policy_switch_count += 1
-            previous_policy = selected_policy
         total_steps += 1
 
         sim_res = simulator.step(np.array(u_safe).reshape(-1, 1))
@@ -785,102 +476,20 @@ def run_episode(
 
         # Track finished
         if car.get_position()[0] > env.track_length - 10.0:
-            reached_goal = True
             break
 
-    survived_horizon = bool(
-        total_steps == n_steps and not collision and not runtime_error
-    )
-    # Goal completion and fixed-horizon survival are distinct outcomes.
-    task_completed = bool(reached_goal)
-    completed_or_survived = bool(task_completed or survived_horizon)
-    filter_failure = bool(collision or certificate_lost or qp_infeasible)
-    union_failure = bool(filter_failure or runtime_error or not completed_or_survived)
-    # Compatibility field retained for older result readers.  The new explicit
-    # fields distinguish candidate-QP infeasibility from runtime termination.
-    infeasible = bool(infeasible or qp_infeasible)
-    nominal_fraction = nominal_like_steps / max(total_steps, 1)
-    timing_ms = 1000.0 * np.asarray(compute_times_s, dtype=float)
-    controller_metrics = shielding.get_metrics() if hasattr(shielding, "get_metrics") else {}
-    if controller_metrics.get("selected_policy_histogram"):
-        selected_policy_histogram = dict(controller_metrics["selected_policy_histogram"])
-        policy_switch_count = int(controller_metrics.get("policy_switch_count", policy_switch_count))
-    mean_intervention = float(
-        controller_metrics.get(
-            "mean_intervention_l2",
-            np.mean(intervention_samples) if intervention_samples else 0.0,
-        )
-    )
-    max_intervention = float(
-        controller_metrics.get(
-            "max_intervention_l2",
-            np.max(intervention_samples) if intervention_samples else 0.0,
-        )
-    )
+    nominal_pct = 100.0 * nominal_like_steps / max(total_steps, 1)
     if verbose:
         print(
             f"run={scenario.run_idx:02d} variant={variant.key} "
             f"obs={scenario.num_obstacles} collision={collision} infeasible={infeasible} "
-            f"certificate_lost={certificate_lost} qp_infeasible={qp_infeasible} "
-            f"task_completed={task_completed} nominal={100.0 * nominal_fraction:.1f}% "
-            f"steps={total_steps}"
+            f"nominal={nominal_pct:.1f}% steps={total_steps}"
         )
     return EpisodeResult(
-        algorithm=variant.key,
-        seed=scenario.seed,
-        run_idx=scenario.run_idx,
-        obstacle_geometry=list(scenario.obstacles),
-        P_or_library_size=4 if variant.algo in (
-            "plcbf", "multi_backup_cbf_mi", "library_pcbf_mi"
-        ) else 1,
         collision=collision,
         infeasible=infeasible,
-        certificate_lost=certificate_lost,
-        qp_infeasible=qp_infeasible,
-        runtime_error=runtime_error,
-        reached_goal=reached_goal,
-        survived_horizon=survived_horizon,
-        task_completed=task_completed,
-        completed_or_survived=completed_or_survived,
-        filter_failure=filter_failure,
-        union_failure=union_failure,
+        nominal_tracking_pct=nominal_pct,
         total_steps=total_steps,
-        timed_steps=len(timing_ms),
-        mean_compute_ms=float(np.mean(timing_ms)) if len(timing_ms) else float("nan"),
-        median_compute_ms=float(np.median(timing_ms)) if len(timing_ms) else float("nan"),
-        p95_compute_ms=float(np.percentile(timing_ms, 95)) if len(timing_ms) else float("nan"),
-        max_compute_ms=float(np.max(timing_ms)) if len(timing_ms) else float("nan"),
-        nominal_tracking_fraction=nominal_fraction,
-        mean_intervention_l2=mean_intervention,
-        max_intervention_l2=max_intervention,
-        policy_switch_count=policy_switch_count,
-        selected_policy_histogram=selected_policy_histogram,
-        num_candidate_qps_solved=int(controller_metrics.get("num_candidate_qps_solved", 0)),
-        num_steps_with_no_safe_policy=int(
-            controller_metrics.get("num_steps_with_no_safe_policy", 0)
-        ),
-        num_feasible_backup_candidates_per_step=list(
-            controller_metrics.get("num_feasible_backup_candidates_per_step", [])
-        ),
-        num_certified_backup_candidates_per_step=list(
-            controller_metrics.get("num_certified_backup_candidates_per_step", [])
-        ),
-        terminal_failure_count=int(controller_metrics.get("terminal_failure_count", 0)),
-        num_rollout_safe_candidates_per_step=list(
-            controller_metrics.get("num_rollout_safe_candidates_per_step", [])
-        ),
-        num_qp_feasible_candidates_per_step=list(
-            controller_metrics.get("num_qp_feasible_candidates_per_step", [])
-        ),
-        certificate_loss_steps=certificate_loss_steps,
-        qp_infeasible_steps=qp_infeasible_steps,
-        fallback_steps=fallback_steps,
-        candidate_qp_failure_count=int(
-            max(
-                observed_candidate_qp_failure_count,
-                controller_metrics.get("candidate_qp_failure_count", 0),
-            )
-        ),
     )
 
 
@@ -889,60 +498,22 @@ def aggregate_results(
     scenarios: List[Scenario],
     cfg: SimConfig,
     verbose: bool = False,
-    num_workers: int = 1,
 ):
     all_results: Dict[str, List[EpisodeResult]] = {v.key: [] for v in variants}
-    comparison_mode = any(v.algo in ADDITIONAL_ALGOS for v in variants)
 
     for variant in variants:
         if verbose:
             print(f"\n=== Running {variant.label} ===")
-        payloads = [
-            (variant, scenario, cfg, False, comparison_mode)
-            for scenario in scenarios
-        ]
-        if num_workers > 1:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                iterator = executor.map(_run_episode_payload, payloads)
-                for index, ep in enumerate(iterator):
-                    all_results[variant.key].append(ep)
-                    if verbose:
-                        print(
-                            f"  {variant.key:22s} run {index + 1:2d}/{len(scenarios)} "
-                            f"collision={int(ep.collision)} infeasible={int(ep.infeasible)}"
-                        )
-        else:
-            for payload in payloads:
-                all_results[variant.key].append(_run_episode_payload(payload))
+        for scenario in scenarios:
+            ep = run_episode(variant, scenario, cfg, verbose=verbose)
+            all_results[variant.key].append(ep)
 
     summary_rows = []
     for variant in variants:
         rows = all_results[variant.key]
         n = len(rows)
-        fail_count = sum(1 for r in rows if r.union_failure)
-        collision_count = sum(1 for r in rows if r.collision)
-        infeasible_count = sum(1 for r in rows if r.infeasible)
-        certificate_lost_count = sum(1 for r in rows if r.certificate_lost)
-        qp_infeasible_count = sum(1 for r in rows if r.qp_infeasible)
-        runtime_error_count = sum(1 for r in rows if r.runtime_error)
-        task_completed_count = sum(1 for r in rows if r.task_completed)
-        survived_horizon_count = sum(1 for r in rows if r.survived_horizon)
-        successful_outcome_count = sum(1 for r in rows if r.completed_or_survived)
-        filter_failure_count = sum(1 for r in rows if r.filter_failure)
+        fail_count = sum(1 for r in rows if (r.collision or r.infeasible))
         nominal_avg = float(np.mean([r.nominal_tracking_pct for r in rows])) if rows else 0.0
-        timed_rows = [
-            r for r in rows
-            if r.timed_steps > 0 and np.isfinite(r.mean_compute_ms)
-        ]
-        total_timed_steps = sum(r.timed_steps for r in timed_rows)
-        mean_compute_ms = (
-            float(
-                sum(r.mean_compute_ms * r.timed_steps for r in timed_rows)
-                / total_timed_steps
-            )
-            if total_timed_steps
-            else float("nan")
-        )
         summary_rows.append(
             {
                 "key": variant.key,
@@ -950,49 +521,13 @@ def aggregate_results(
                 "n": n,
                 "fail_count": fail_count,
                 "fail_rate": 100.0 * fail_count / max(n, 1),
-                "collision_count": collision_count,
-                "collision_rate": 100.0 * collision_count / max(n, 1),
-                "infeasible_count": infeasible_count,
-                "infeasible_rate": 100.0 * infeasible_count / max(n, 1),
-                "certificate_lost_count": certificate_lost_count,
-                "certificate_lost_rate": 100.0 * certificate_lost_count / max(n, 1),
-                "qp_infeasible_count": qp_infeasible_count,
-                "qp_infeasible_rate": 100.0 * qp_infeasible_count / max(n, 1),
-                "runtime_error_count": runtime_error_count,
-                "task_completed_count": task_completed_count,
-                "task_completed_rate": 100.0 * task_completed_count / max(n, 1),
-                "survived_horizon_count": survived_horizon_count,
-                "survived_horizon_rate": 100.0 * survived_horizon_count / max(n, 1),
-                "successful_outcome_count": successful_outcome_count,
-                "successful_outcome_rate": 100.0 * successful_outcome_count / max(n, 1),
-                "filter_failure_count": filter_failure_count,
-                "filter_failure_rate": 100.0 * filter_failure_count / max(n, 1),
                 "nominal_avg": nominal_avg,
-                "mean_compute_ms": mean_compute_ms,
             }
         )
     return summary_rows, all_results
 
 
-def _run_episode_payload(payload):
-    """Pickle-friendly adapter for optional independent-trial parallelism."""
-    variant, scenario, cfg, verbose, comparison_mode = payload
-    return run_episode(
-        variant,
-        scenario,
-        cfg,
-        verbose=verbose,
-        comparison_mode=comparison_mode,
-    )
-
-
-def format_markdown_table(
-    summary_rows: List[dict],
-    num_runs: int,
-    seed: int,
-    cfg: SimConfig,
-    detailed: bool = False,
-) -> str:
+def format_markdown_table(summary_rows: List[dict], num_runs: int, seed: int, cfg: SimConfig) -> str:
     lines: List[str] = []
     lines.append("# Drift Car Black-Ice Benchmark Results")
     lines.append("")
@@ -1002,57 +537,12 @@ def format_markdown_table(
         f"- Puddle: x={cfg.puddle_x:.1f}, radius={cfg.puddle_radius:.1f}, friction={cfg.puddle_friction:.2f}"
     )
     lines.append("- Obstacles per run: random 1 or 2, placed near and beyond puddle center (x in ~[72, 85])")
-    if detailed:
-        lines.append(f"- Filter failure: `{FILTER_FAILURE_DEFINITION}`")
-        lines.append(f"- Union failure: `{UNION_FAILURE_DEFINITION}`")
-        lines.append(
-            "- Certificate/QP events apply the bounded shared-library stopping fallback; "
-            "the episode then continues to collision, goal, or the fixed horizon."
-        )
     lines.append("")
-    if detailed:
-        lines.append(
-            "| Algorithm | Collision | Certificate loss | QP infeasible | Goal | Horizon survival | Goal or survival | Union failure | Mean Time [ms] |"
-        )
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for row in summary_rows:
-            collision_text = (
-                f"{row['collision_count']}/{row['n']} ({row['collision_rate']:.1f}%)"
-            )
-            certificate_text = (
-                f"{row['certificate_lost_count']}/{row['n']} "
-                f"({row['certificate_lost_rate']:.1f}%)"
-            )
-            qp_text = (
-                f"{row['qp_infeasible_count']}/{row['n']} "
-                f"({row['qp_infeasible_rate']:.1f}%)"
-            )
-            task_text = (
-                f"{row['task_completed_count']}/{row['n']} "
-                f"({row['task_completed_rate']:.1f}%)"
-            )
-            survival_text = (
-                f"{row['survived_horizon_count']}/{row['n']} "
-                f"({row['survived_horizon_rate']:.1f}%)"
-            )
-            outcome_text = (
-                f"{row['successful_outcome_count']}/{row['n']} "
-                f"({row['successful_outcome_rate']:.1f}%)"
-            )
-            union_text = f"{row['fail_count']}/{row['n']} ({row['fail_rate']:.1f}%)"
-            lines.append(
-                f"| {row['label']} | {collision_text} | {certificate_text} | {qp_text} | "
-                f"{task_text} | {survival_text} | {outcome_text} | {union_text} | "
-                f"{row['mean_compute_ms']:.2f} |"
-            )
-    else:
-        # Preserve the historical no-flag benchmark report byte-for-byte in
-        # structure; the additional metrics are enabled only for explicit keys.
-        lines.append("| Algorithm | Collision/Infeasible Rate | Avg Nominal Tracking (%) |")
-        lines.append("|---|---:|---:|")
-        for row in summary_rows:
-            fail_text = f"{row['fail_count']}/{row['n']} ({row['fail_rate']:.1f}%)"
-            lines.append(f"| {row['label']} | {fail_text} | {row['nominal_avg']:.1f} |")
+    lines.append("| Algorithm | Collision/Infeasible Rate | Avg Nominal Tracking (%) |")
+    lines.append("|---|---:|---:|")
+    for row in summary_rows:
+        fail_text = f"{row['fail_count']}/{row['n']} ({row['fail_rate']:.1f}%)"
+        lines.append(f"| {row['label']} | {fail_text} | {row['nominal_avg']:.1f} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -1067,43 +557,7 @@ def main():
         default="examples/drift_car/benchmark_black_ice_results.md",
         help="Path to output markdown report",
     )
-    parser.add_argument(
-        "--output-json",
-        type=str,
-        default=None,
-        help=(
-            "Path to detailed per-trial JSON metrics. Explicit additional-baseline "
-            "runs default to examples/drift_car/benchmark_black_ice_results.json."
-        ),
-    )
-    parser.add_argument(
-        "--output-csv",
-        type=str,
-        default=None,
-        help=(
-            "Path to per-trial CSV metrics. Explicit additional-baseline runs "
-            "default to examples/drift_car/benchmark_black_ice_results.csv."
-        ),
-    )
-    parser.add_argument(
-        "--variant-key",
-        action="append",
-        default=None,
-        help=(
-            "Run only this algorithm key; repeat to select multiple keys. "
-            "For the added rows use multi_backup_cbf_mi and library_pcbf_mi."
-        ),
-    )
     parser.add_argument("--verbose", action="store_true", help="Verbose per-run logging")
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=1,
-        help=(
-            "Independent seeded trials to run concurrently. Default 1 keeps "
-            "historical serial execution; concurrent timing is tentative."
-        ),
-    )
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -1113,32 +567,11 @@ def main():
     )
 
     cfg = SimConfig()
-    variants = make_variants(include_additional=bool(args.variant_key))
-    if args.variant_key:
-        requested = set(args.variant_key)
-        known = {variant.key for variant in variants}
-        unknown = requested - known
-        if unknown:
-            raise ValueError(
-                f"Unknown --variant-key values {sorted(unknown)}; valid keys: {sorted(known)}"
-            )
-        variants = [variant for variant in variants if variant.key in requested]
+    variants = make_variants()
     scenarios = generate_scenarios(args.num_runs, args.seed)
 
-    summary_rows, all_results = aggregate_results(
-        variants,
-        scenarios,
-        cfg,
-        verbose=args.verbose,
-        num_workers=max(1, int(args.num_workers)),
-    )
-    markdown = format_markdown_table(
-        summary_rows,
-        args.num_runs,
-        args.seed,
-        cfg,
-        detailed=bool(args.variant_key),
-    )
+    summary_rows, _ = aggregate_results(variants, scenarios, cfg, verbose=args.verbose)
+    markdown = format_markdown_table(summary_rows, args.num_runs, args.seed, cfg)
 
     output_path = Path(args.output_md)
     if not output_path.is_absolute():
@@ -1146,70 +579,8 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown, encoding="utf-8")
 
-    json_path_arg = args.output_json
-    if json_path_arg is None and args.variant_key:
-        json_path_arg = "examples/drift_car/benchmark_black_ice_results.json"
-    json_path = None
-    if json_path_arg is not None:
-        json_path = Path(json_path_arg)
-        if not json_path.is_absolute():
-            json_path = Path(PROJECT_ROOT) / json_path
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "num_runs": args.num_runs,
-            "scenario_seed": args.seed,
-            "timing_note": (
-                "Sequential candidates within each control step; end-to-end wall-clock "
-                "filter latency. Every comparison controller excludes its first five "
-                "warm-up calls. Independent "
-                f"trials used {max(1, int(args.num_workers))} worker(s)."
-            ),
-            "filter_failure_definition": FILTER_FAILURE_DEFINITION,
-            "union_failure_definition": UNION_FAILURE_DEFINITION,
-            "legacy_infeasible_definition": LEGACY_INFEASIBLE_DEFINITION,
-            "config": asdict(cfg),
-            "summary": summary_rows,
-            "trials": {
-                key: [asdict(result) for result in results]
-                for key, results in all_results.items()
-            },
-        }
-        json_path.write_text(
-            json.dumps(_json_safe(payload), indent=2, allow_nan=False),
-            encoding="utf-8",
-        )
-
-    csv_path_arg = args.output_csv
-    if csv_path_arg is None and args.variant_key:
-        csv_path_arg = "examples/drift_car/benchmark_black_ice_results.csv"
-    csv_path = None
-    if csv_path_arg is not None:
-        csv_path = Path(csv_path_arg)
-        if not csv_path.is_absolute():
-            csv_path = Path(PROJECT_ROOT) / csv_path
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        rows = []
-        for results in all_results.values():
-            for result in results:
-                row = asdict(result)
-                for key, value in list(row.items()):
-                    if isinstance(value, (dict, list, tuple)):
-                        row[key] = json.dumps(_json_safe(value), sort_keys=True)
-                    elif isinstance(value, float) and not np.isfinite(value):
-                        row[key] = ""
-                rows.append(row)
-        if rows:
-            with csv_path.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(rows)
-
     print(markdown)
     print(f"\nSaved markdown report to: {output_path}")
-    if json_path is not None:
-        print(f"Saved detailed JSON metrics to: {json_path}")
-    if csv_path is not None:
-        print(f"Saved per-trial CSV metrics to: {csv_path}")
 
 
 if __name__ == "__main__":

@@ -123,14 +123,6 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         self.policy_lines = {}
         self._last_results = None
         self._last_best_name = None
-        # Behavior-neutral diagnostics used by the randomized benchmark.  They
-        # do not participate in policy selection, QP construction, fallback
-        # selection, or the returned control.
-        self.last_certificate_lost = False
-        self.last_qp_infeasible = False
-        self.last_fallback_used = False
-        self.last_qp_status = 'not_solved'
-        self.last_max_certificate = float('-inf')
         self._jit_val_grad_fn = None
         self._jit_val_grad_obs = None
         self._jit_angle_val_grad = None
@@ -316,12 +308,6 @@ class PLCBF_Quad3D(PCBF_Quad3D):
                     self.policy_lines[name].set_alpha(0.3)
 
     def solve_control_problem(self, state, control_ref=None):
-        self.last_certificate_lost = False
-        self.last_qp_infeasible = False
-        self.last_fallback_used = False
-        self.last_qp_status = 'not_solved'
-        self.last_max_certificate = float('-inf')
-
         if control_ref and 'u_ref' in control_ref:
             u_nom = np.array(control_ref['u_ref']).flatten()
         else:
@@ -458,18 +444,6 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         V_best, grad_best, _ = results[best_name]
         self._last_results = results
         self._last_best_name = best_name
-        finite_values = [
-            float(value)
-            for value, _gradient, _trajectory in results.values()
-            if np.isfinite(value)
-        ]
-        self.last_max_certificate = (
-            max(finite_values) if finite_values else float('-inf')
-        )
-        self.last_certificate_lost = not any(
-            np.isfinite(value) and value > 0.0
-            for value, _gradient, _trajectory in results.values()
-        )
 
         self._last_time_derivative = time_derivatives.get(best_name, 0.0)
         if self.debug and self.curr_step % 50 == 0:
@@ -487,16 +461,12 @@ class PLCBF_Quad3D(PCBF_Quad3D):
         res = None
         try:
             prob.solve(solver=cp.OSQP, verbose=False)
-            self.last_qp_status = str(prob.status)
             if prob.status in ['optimal', 'optimal_inaccurate'] and u.value is not None:
                 res = u.value
         except Exception:
-            self.last_qp_status = 'solver_error'
             res = None
 
         if res is None:
-            self.last_qp_infeasible = True
-            self.last_fallback_used = True
             ptype, pparams = policy_params_used.get(best_name, ('waypoint', self.policy_configs['nominal'][1]))
             if ptype == 'angle':
                 res = np.array(AnglePolicyJAX.compute(jnp.array(state), pparams))
@@ -509,26 +479,6 @@ class PLCBF_Quad3D(PCBF_Quad3D):
 
         self.curr_step += 1
         return res
-
-    def get_last_step_metrics(self):
-        """Return certificate and selected-QP diagnostics for benchmarks."""
-
-        return {
-            'selected_policy': self._last_best_name,
-            'certificate_lost': bool(self.last_certificate_lost),
-            'qp_infeasible': bool(self.last_qp_infeasible),
-            'fallback_used': bool(self.last_fallback_used),
-            'solver_status': self.last_qp_status,
-            'max_certificate': (
-                float(self.last_max_certificate)
-                if np.isfinite(self.last_max_certificate)
-                else None
-            ),
-            'num_steps_with_no_certified_rollout': int(
-                self.last_certificate_lost
-            ),
-            'num_steps_with_no_feasible_qp': int(self.last_qp_infeasible),
-        }
 
     def _add_cbf_constraints(self, u, constraints, state, V, grad_V):
         if np.isfinite(V) and np.all(np.isfinite(grad_V)):

@@ -12,7 +12,8 @@ import pytest
 from safe_control.position_control.backup_cbf_qp import BackupCBF
 from safe_control.robots.drifting_car import DriftingCar
 
-from examples.drift_car import benchmark_black_ice as benchmark
+from examples.drift_car import benchmark_additional_baselines as benchmark
+from examples.drift_car import benchmark_black_ice as historical_benchmark
 from examples.drift_car.algorithms.library_pcbf_mi_drift import (
     LibraryPCBFMinInterventionDrift,
 )
@@ -118,15 +119,15 @@ def _candidate(
     )
 
 
-def test_default_registry_is_unchanged_and_new_keys_are_explicit():
-    historical = benchmark.make_variants()
+def test_baseline_registry_is_isolated_from_unchanged_historical_registry():
+    historical = historical_benchmark.make_variants()
     assert len(historical) == 13
     assert all(
         variant.key not in {"multi_backup_cbf_mi", "library_pcbf_mi"}
         for variant in historical
     )
-    additional = benchmark.make_variants(include_additional=True)
-    assert {variant.key for variant in additional} >= {
+    additional = benchmark.make_variants()
+    assert {variant.key for variant in additional} == {
         "multi_backup_cbf_mi",
         "library_pcbf_mi",
     }
@@ -672,16 +673,17 @@ def test_single_policy_library_qp_matches_plcbf_qp():
     np.testing.assert_allclose(result.u, expected, atol=2e-4, rtol=2e-4)
 
 
-def test_explicit_certificate_loss_increments_benchmark_failure(monkeypatch):
+def test_certificate_loss_does_not_increment_historical_failure(monkeypatch):
     variant = next(
         variant
-        for variant in benchmark.make_variants(include_additional=True)
+        for variant in benchmark.make_variants()
         if variant.key == "library_pcbf_mi"
     )
     scenario = benchmark.Scenario(0, 11, 1, ((80.0, "middle"),))
     failure = SimpleNamespace(
         collision=False,
-        infeasible=True,
+        infeasible=False,
+        historical_failure=False,
         certificate_lost=True,
         qp_infeasible=False,
         runtime_error=False,
@@ -698,20 +700,22 @@ def test_explicit_certificate_loss_increments_benchmark_failure(monkeypatch):
     summary, _ = benchmark.aggregate_results(
         [variant], [scenario], benchmark.SimConfig()
     )
-    assert summary[0]["fail_count"] == 1
-    assert summary[0]["infeasible_count"] == 1
+    assert summary[0]["fail_count"] == 0
+    assert summary[0]["infeasible_count"] == 0
     assert summary[0]["certificate_lost_count"] == 1
 
 
-def test_benchmark_does_not_double_count_qp_failure_without_certificate():
-    variant = benchmark.AlgoVariant("plcbf", "PLCBF", "plcbf", None)
+def test_benchmark_does_not_double_count_qp_failure_with_certificate_loss():
+    variant = benchmark.AlgoVariant(
+        "library_pcbf_mi", "Lib-PCBF-MI", "library_pcbf_mi"
+    )
     status = {
         "status": "qp_failed_after_certificate_loss",
         "certificate_lost": True,
         "qp_infeasible": True,
         "fallback_applied": True,
     }
-    assert benchmark.classify_comparison_status(variant, object(), status) == (
+    assert benchmark.classify_baseline_status(variant, object(), status) == (
         True,
         False,
         False,
@@ -720,11 +724,12 @@ def test_benchmark_does_not_double_count_qp_failure_without_certificate():
 
 
 @pytest.mark.parametrize("event_kind", ["certificate_lost", "qp_infeasible"])
-def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
+def test_benchmark_applies_exact_returned_control_after_diagnostic_event(
     monkeypatch, event_kind
 ):
     cfg = replace(benchmark.SimConfig(), tf=0.2, dt=0.05)
     n_steps = int(cfg.tf / cfg.dt)
+    returned_control = np.array([0.314159, -2718.0], dtype=float)
 
     class StubEnv:
         track_length = cfg.track_length
@@ -755,9 +760,11 @@ def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
         def __init__(self, car):
             self.car = car
             self.calls = 0
+            self.controls = []
 
         def step(self, control):
             assert np.all(np.isfinite(control))
+            self.controls.append(np.asarray(control).reshape(-1).copy())
             self.calls += 1
             self.car.state[0, 0] += 0.1
             return {"collision": False}
@@ -779,7 +786,7 @@ def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
 
         def solve_control_problem(self, *args, **kwargs):
             self.calls += 1
-            return np.zeros((2, 1), dtype=float)
+            return returned_control.reshape(-1, 1).copy()
 
         def get_status(self):
             is_certificate_loss = event_kind == "certificate_lost"
@@ -792,7 +799,7 @@ def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
                 "certificate_lost": is_certificate_loss,
                 "qp_infeasible": not is_certificate_loss,
                 "infeasible": not is_certificate_loss,
-                "fallback_applied": True,
+                "fallback_applied": False,
                 "best_policy": None,
             }
 
@@ -823,13 +830,16 @@ def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
 
     variant = next(
         item
-        for item in benchmark.make_variants(include_additional=True)
+        for item in benchmark.make_variants()
         if item.key == "multi_backup_cbf_mi"
     )
     scenario = benchmark.Scenario(0, 7, 1, ((80.0, "middle"),))
     result = benchmark.run_episode(variant, scenario, cfg)
     assert shield.calls == n_steps
     assert simulator.calls == n_steps
+    assert all(
+        np.array_equal(control, returned_control) for control in simulator.controls
+    )
     assert result.total_steps == n_steps
     assert result.certificate_lost is (event_kind == "certificate_lost")
     assert result.certificate_loss_steps == (
@@ -840,6 +850,9 @@ def test_benchmark_continues_after_filter_failure_with_bounded_fallback(
         n_steps if event_kind == "qp_infeasible" else 0
     )
     assert result.collision is False
+    assert result.infeasible is False
+    assert result.historical_failure is False
+    assert result.fallback_steps == 0
     assert result.survived_horizon is True
     assert result.task_completed is False
     assert result.completed_or_survived is True

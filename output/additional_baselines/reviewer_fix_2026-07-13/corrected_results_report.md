@@ -1,4 +1,9 @@
-# Corrected Additional-Baseline Results
+# Superseded Common-Stop Audit — Not for Publication
+
+> **Do not cite these tables.** This directory intentionally preserves the
+> common-stop experiment as an audit trail. Its benchmark-level action
+> override changed PL-CBF trajectories and its union-failure column did not
+> preserve the historical paper failure definition.
 
 Generated 2026-07-13 after addressing the reviewer findings on branch
 `multi-backup-baselines`.
