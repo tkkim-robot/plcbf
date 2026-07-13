@@ -20,8 +20,8 @@ from examples.drift_car.algorithms.multi_policy_baseline_common_drift import (
     MultiPolicyMetrics,
     NOMINAL_POLICY_REPRESENTATION,
     assert_runtime_library_equal,
+    project_bounded_control,
     select_minimum_intervention,
-    valid_bounded_control,
 )
 from examples.drift_car.algorithms.plcbf_drift import PLCBF, POLICY_ALPHA
 from examples.drift_car.controllers.drift_policies_jax import StoppingControllerJAX
@@ -106,12 +106,13 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
 
         try:
             self.cbf_alpha = self._policy_alpha(policy_name)
-            u = np.asarray(
+            raw_control = np.asarray(
                 self._solve_cbf_qp(u_nom, value, gradient, f, G),
                 dtype=float,
             ).reshape(-1)
             solver_status = str(self.status)
-            feasible = valid_bounded_control(u, self.u_min, self.u_max)
+            u = project_bounded_control(raw_control, self.u_min, self.u_max)
+            feasible = u is not None
             error = None if feasible else "QP returned an invalid or out-of-bounds input"
             objective = self._intervention_objective(u, u_nom) if feasible else float("inf")
         except Exception as exc:
@@ -180,14 +181,17 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
         self.last_candidate_results = []
 
         if not self.obstacles:
+            applied_nominal = np.clip(u_nom, self.u_min, self.u_max)
             self.status = "optimal"
             self.best_policy_name = "nominal"
             self._using_backup = False
             self.metrics.feasible_candidates_per_step.append(1)
             self.metrics.rollout_safe_candidates_per_step.append(1)
             self.metrics.qp_feasible_candidates_per_step.append(1)
-            self.metrics.record_selection("nominal", 0.0)
-            return u_nom.reshape(-1, 1)
+            self.metrics.record_selection(
+                "nominal", float(np.linalg.norm(applied_nominal - u_nom))
+            )
+            return applied_nominal.reshape(-1, 1)
 
         x0_jax = jnp.asarray(robot_state)
         try:

@@ -165,6 +165,7 @@ def test_diagnostic_event_applies_exact_returned_control_and_continues(event):
         None,
         np.zeros(3),
         np.array([np.nan, 0.0, 0.0, 0.0]),
+        np.array([10.0 + 5e-6, 0.0, 0.0, 0.0]),
         np.array([11.0, 0.0, 0.0, 0.0]),
     ],
 )

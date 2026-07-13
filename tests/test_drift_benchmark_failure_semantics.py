@@ -118,6 +118,7 @@ def _run(monkeypatch, returned):
         None,
         np.zeros(3),
         np.array([np.inf, 0.0]),
+        np.array([1.0 + 5e-6, 0.0]),
         np.array([1.1, 0.0]),
     ],
 )

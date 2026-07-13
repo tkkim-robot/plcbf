@@ -50,6 +50,10 @@ from safe_control.position_control.backup_cbf_qp import BackupCBF
 from examples.warehouse.controllers.policies_quad3d_jax import (
     WaypointPolicyParams,
 )
+from examples.warehouse.algorithms.additional_baseline_control_quad3d import (
+    SOLVER_INPUT_TOL,
+    project_quad3d_solver_control,
+)
 from examples.warehouse.algorithms.plcbf_quad3d import PLCBF_Quad3D
 
 
@@ -732,11 +736,15 @@ class _StrictBackupCBFCandidate(BackupCBF):
             u_ref_scaled = u_ref / u_scale
 
             if not lhs_rows:
+                realized_error = self.Q_u * (
+                    u_ref_scaled
+                    - np.asarray(u_nom, dtype=float).reshape(-1) / u_scale
+                )
                 return CandidateCBFResult(
                     policy_name=name,
                     feasible=True,
                     u=u_ref.copy(),
-                    objective=0.0,
+                    objective=float(realized_error @ realized_error),
                     solver_status="no_constraints",
                     rollout_safe=rollout_safe,
                     terminal_safe=terminal_safe,
@@ -801,13 +809,13 @@ class _StrictBackupCBFCandidate(BackupCBF):
                 )
 
             scaled_solution = np.asarray(u_scaled.value, dtype=float).reshape(-1)
-            u_solution = u_scale * scaled_solution
-            input_tol = 1e-5
+            raw_solution = u_scale * scaled_solution
+            input_tol = SOLVER_INPUT_TOL
             valid = (
-                u_solution.shape == (self.n_controls,)
-                and np.all(np.isfinite(u_solution))
-                and np.all(u_solution <= u_scale + input_tol)
-                and np.all(u_solution >= -u_scale - input_tol)
+                raw_solution.shape == (self.n_controls,)
+                and np.all(np.isfinite(raw_solution))
+                and np.all(raw_solution <= u_scale + input_tol)
+                and np.all(raw_solution >= -u_scale - input_tol)
             )
             if not valid:
                 return CandidateCBFResult(
@@ -823,6 +831,16 @@ class _StrictBackupCBFCandidate(BackupCBF):
                     error="QP returned a non-finite or out-of-bounds input",
                 )
 
+            u_solution = project_quad3d_solver_control(
+                raw_solution,
+                -u_scale,
+                u_scale,
+                expected_dimension=self.n_controls,
+                tolerance=input_tol,
+            )
+            if u_solution is None:  # Kept explicit for static type checkers.
+                raise AssertionError("validated Backup-CBF solution could not be projected")
+            scaled_solution = u_solution / u_scale
             realized_error = self.Q_u * (scaled_solution - u_ref_scaled)
             realized_objective = float(realized_error @ realized_error)
             return CandidateCBFResult(
@@ -1180,9 +1198,8 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
                     "MB-CBF-MI candidate evaluation failed; certificate status "
                     "is unknown"
                 )
-            # Return the shared library stop action as an observable emergency
-            # result.  The benchmark applies this same continuation action to
-            # all three policy-library comparison rows.
+            # Return this baseline's shared-library stop action as its
+            # observable emergency result.
             emergency = self._candidate_adapters["stop"].compute_control(state)
             limit = float(self.robot_spec.get("u_max", 10.0))
             return np.clip(np.asarray(emergency, dtype=float), -limit, limit)

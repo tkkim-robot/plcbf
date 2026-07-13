@@ -8,6 +8,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from examples.additional_baseline_control_utils import (
+    SOLVER_INPUT_TOL,
+    project_solver_control,
+)
+
 
 POLICY_ORDER: Tuple[str, ...] = (
     "lane_change_left",
@@ -16,7 +21,7 @@ POLICY_ORDER: Tuple[str, ...] = (
     "nominal",
 )
 NOMINAL_POLICY_REPRESENTATION = "frozen_mpcc_sequence"
-INPUT_TOL = 1e-5
+INPUT_TOL = SOLVER_INPUT_TOL
 TIE_TOL = 1e-5
 
 
@@ -170,12 +175,21 @@ def valid_bounded_control(
     u_max: np.ndarray,
     tol: float = INPUT_TOL,
 ) -> bool:
-    if u is None:
-        return False
-    value = np.asarray(u, dtype=float).reshape(-1)
-    return bool(
-        value.shape == np.asarray(u_min).shape
-        and np.all(np.isfinite(value))
-        and np.all(value >= np.asarray(u_min) - tol)
-        and np.all(value <= np.asarray(u_max) + tol)
+    return project_bounded_control(u, u_min, u_max, tol=tol) is not None
+
+
+def project_bounded_control(
+    u: Optional[np.ndarray],
+    u_min: np.ndarray,
+    u_max: np.ndarray,
+    tol: float = INPUT_TOL,
+) -> Optional[np.ndarray]:
+    """Project only a solver-tolerance-feasible input to exact bounds."""
+
+    return project_solver_control(
+        u,
+        u_min,
+        u_max,
+        expected_shape=np.asarray(u_min).shape,
+        tolerance=tol,
     )

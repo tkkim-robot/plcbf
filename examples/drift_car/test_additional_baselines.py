@@ -23,6 +23,7 @@ from examples.drift_car.algorithms.multi_backup_cbf_mi_drift import (
 )
 from examples.drift_car.algorithms.multi_policy_baseline_common_drift import (
     CandidateCBFResult,
+    INPUT_TOL,
     assert_runtime_library_equal,
     runtime_library_signature,
     select_minimum_intervention,
@@ -671,6 +672,34 @@ def test_single_policy_library_qp_matches_plcbf_qp():
     ).reshape(-1)
     assert result.feasible
     np.testing.assert_allclose(result.u, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_library_candidate_projects_solver_residual_before_scoring(monkeypatch):
+    controller, _, _, _, _ = _library_baseline()
+    nominal = np.zeros(2, dtype=float)
+    raw_control = np.asarray(controller.u_max, dtype=float).copy()
+    raw_control[0] += 0.5 * INPUT_TOL
+
+    def fake_solve(*args, **kwargs):
+        del args, kwargs
+        controller.status = "optimal"
+        return raw_control.copy()
+
+    monkeypatch.setattr(controller, "_solve_cbf_qp", fake_solve)
+    result = controller._solve_policy_candidate(
+        "lane_change_left",
+        nominal,
+        1.0,
+        np.zeros(8),
+        np.zeros(8),
+        np.zeros((8, 2)),
+    )
+
+    assert result.feasible is True
+    np.testing.assert_array_equal(result.u, controller.u_max)
+    assert result.objective == pytest.approx(
+        controller._intervention_objective(controller.u_max, nominal)
+    )
 
 
 def test_certificate_loss_does_not_increment_historical_failure(monkeypatch):

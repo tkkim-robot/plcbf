@@ -27,13 +27,17 @@ from examples.warehouse.controllers.policies_quad3d_jax import (
     StopPolicyJAX,
     WaypointPolicyParams,
 )
+from .additional_baseline_control_quad3d import (
+    SOLVER_INPUT_TOL,
+    project_quad3d_solver_control,
+)
 from .plcbf_quad3d import PLCBF_Quad3D
 
 
 # The existing PL-CBF selector already uses 1e-6 as its numerical comparison
 # tolerance.  Reuse it here for deterministic objective ties.
 _TIE_TOL = 1e-6
-_INPUT_TOL = 1e-5  # OSQP's default absolute feasibility tolerance.
+_INPUT_TOL = SOLVER_INPUT_TOL  # OSQP's default absolute feasibility tolerance.
 _ACCEPTED_STATUSES = ("optimal", "optimal_inaccurate")
 
 
@@ -351,7 +355,7 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
         solution = None if u.value is None else np.asarray(u.value, dtype=float).reshape(-1)
         lower = float(self.dynamics_params.u_min)
         upper = float(self.dynamics_params.u_max)
-        valid_solution = (
+        solver_solution_valid = (
             solver_status in _ACCEPTED_STATUSES
             and solution is not None
             and solution.shape == (4,)
@@ -360,7 +364,7 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
             and np.all(solution <= upper + _INPUT_TOL)
         )
 
-        if not valid_solution:
+        if not solver_solution_valid:
             if error is None and solver_status in _ACCEPTED_STATUSES:
                 error = "solver returned an invalid or out-of-bounds control"
             return CandidatePCBFResult(
@@ -377,6 +381,9 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
                 error=error,
             )
 
+        solution = project_quad3d_solver_control(solution, lower, upper)
+        if solution is None:  # Kept explicit for static type checkers.
+            raise AssertionError("validated Quad3D QP solution could not be projected")
         delta = solution - u_nom
         objective = float(np.dot(delta, delta))
         return CandidatePCBFResult(

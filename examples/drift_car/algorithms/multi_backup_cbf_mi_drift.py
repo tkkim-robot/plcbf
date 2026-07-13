@@ -33,8 +33,8 @@ from examples.drift_car.algorithms.multi_policy_baseline_common_drift import (
     MultiPolicyMetrics,
     NOMINAL_POLICY_REPRESENTATION,
     assert_runtime_library_equal,
+    project_bounded_control,
     select_minimum_intervention,
-    valid_bounded_control,
 )
 from examples.drift_car.algorithms.plcbf_drift import PLCBF
 from examples.drift_car.controllers.drift_policies_jax import (
@@ -423,11 +423,15 @@ class _StrictCandidateBackupCBF(BackupCBF):
 
             clipped_nominal = np.clip(np.asarray(u_nom, dtype=float).reshape(-1), u_min, u_max)
             if not G_list:
+                intervention = self.Q_u * (
+                    clipped_nominal / u_scale
+                    - np.asarray(u_nom, dtype=float).reshape(-1) / u_scale
+                )
                 return CandidateCBFResult(
                     policy_name=self.policy_name,
                     feasible=True,
                     u=clipped_nominal,
-                    objective=0.0,
+                    objective=float(np.sum(np.square(intervention))),
                     solver_status="no_constraints",
                     rollout_safe=True,
                     terminal_safe=True,
@@ -472,25 +476,35 @@ class _StrictCandidateBackupCBF(BackupCBF):
                     error=f"Backup-CBF QP failed: {solver_status}",
                 )
 
-            control = np.asarray(np.diag(u_scale) @ scaled_control.value, dtype=float).reshape(-1)
-            input_valid = valid_bounded_control(control, u_min, u_max)
-            feasible = input_valid
+            raw_control = np.asarray(
+                np.diag(u_scale) @ scaled_control.value, dtype=float
+            ).reshape(-1)
+            control = project_bounded_control(raw_control, u_min, u_max)
+            if control is None:
+                return CandidateCBFResult(
+                    policy_name=self.policy_name,
+                    feasible=False,
+                    u=None,
+                    objective=float("inf"),
+                    solver_status="invalid_solution",
+                    rollout_safe=rollout_safe,
+                    terminal_safe=terminal_safe,
+                    solve_time_sec=time.perf_counter() - started,
+                    qp_solved=True,
+                    error="QP returned a non-finite or out-of-bounds input",
+                )
             intervention = self.Q_u * (control / u_scale - nominal_scaled)
             return CandidateCBFResult(
                 policy_name=self.policy_name,
-                feasible=feasible,
-                u=control if feasible else None,
-                objective=float(np.sum(np.square(intervention))) if feasible else float("inf"),
-                solver_status=solver_status if feasible else "invalid_solution",
+                feasible=True,
+                u=control,
+                objective=float(np.sum(np.square(intervention))),
+                solver_status=solver_status,
                 rollout_safe=rollout_safe,
                 terminal_safe=terminal_safe,
                 solve_time_sec=time.perf_counter() - started,
                 qp_solved=True,
-                error=(
-                    None
-                    if feasible
-                    else "QP returned a non-finite or out-of-bounds input"
-                ),
+                error=None,
             )
         except Exception as exc:
             return CandidateCBFResult(
