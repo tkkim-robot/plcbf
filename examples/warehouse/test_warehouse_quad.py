@@ -46,6 +46,12 @@ from safe_control.utils.animation import AnimationSaver
 from examples.warehouse.algorithms.pcbf_quad3d import PCBF_Quad3D
 from examples.warehouse.algorithms.plcbf_quad3d import PLCBF_Quad3D
 from examples.warehouse.algorithms.mip_mpc_quad3d import MIPMPC_Quad3D
+from examples.warehouse.algorithms.library_pcbf_mi_quad3d import (
+    LibraryPCBFMinInterventionQuad3D,
+)
+from examples.warehouse.algorithms.multi_backup_cbf_mi_quad3d import (
+    MultiBackupCBFMinInterventionQuad3D,
+)
 from examples.warehouse.controllers.policies_quad3d_jax import (
     AnglePolicyJAX, AnglePolicyParams, WaypointPolicyParams, RetracePolicyParams, Quad3DControlParams
 )
@@ -212,6 +218,36 @@ def setup_test(
             safety_margin=safety_margin,
             num_angle_policies=plcbf_num_angle_policies,
             line_width_scale=line_width_scale
+        )
+        filter_algo.set_environment(env)
+
+    elif algo == 'library_pcbf_mi':
+        # Controlled selector ablation: identical PL-CBF certificates and
+        # policies, with one QP per certified policy and realized minimum-
+        # intervention selection.
+        filter_algo = LibraryPCBFMinInterventionQuad3D(
+            robot_spec, dt=env.dt,
+            backup_horizon=backup_horizon,
+            cbf_alpha=alpha_val,
+            safety_margin=safety_margin,
+            num_angle_policies=plcbf_num_angle_policies,
+            line_width_scale=line_width_scale
+        )
+        filter_algo.set_environment(env)
+
+    elif algo == 'multi_backup_cbf_mi':
+        # Benchmark-adapted Chen et al. multi-backup strategy.  Gains match
+        # the existing warehouse Backup-CBF row for every library candidate.
+        filter_algo = MultiBackupCBFMinInterventionQuad3D(
+            robot=robot,
+            robot_spec=robot_spec,
+            dt=env.dt,
+            backup_horizon=backup_horizon,
+            cbf_alpha=2.0,
+            terminal_alpha=2.0,
+            safety_margin=safety_margin,
+            num_angle_policies=plcbf_num_angle_policies,
+            ax=None,
         )
         filter_algo.set_environment(env)
 
@@ -561,14 +597,20 @@ def run_simulation(args, scenario_ghosts=None):
         statics = env.get_static_obstacles()
         
         # 2. Update Shielding Info
-        if args.algo in ['pcbf', 'plcbf', 'mip_mpc']:
+        if args.algo in [
+            'pcbf', 'plcbf', 'mip_mpc',
+            'library_pcbf_mi', 'multi_backup_cbf_mi'
+        ]:
             shielding.update_obstacles(ghosts, statics)
             # PCBF/PLCBF need nominal reference u
             u_nom = nom_ctrl.get_control(current_state)
             control_ref = {'u_ref': u_nom}
             
             # Predict nominal trajectory for PLCBF visualization (optional)
-            if args.algo in ['plcbf', 'mip_mpc']:
+            if args.algo in [
+                'plcbf', 'mip_mpc',
+                'library_pcbf_mi', 'multi_backup_cbf_mi'
+            ]:
                 control_ref['waypoints'] = nom_ctrl.waypoints
                 control_ref['wp_idx'] = nom_ctrl.wp_idx
             
@@ -593,8 +635,25 @@ def run_simulation(args, scenario_ghosts=None):
                           shielding.set_policy('retrace_waypoint', new_params)
 
             t_solve0 = time.perf_counter()
-            u_safe = shielding.solve_control_problem(current_state, control_ref)
+            try:
+                u_safe = shielding.solve_control_problem(current_state, control_ref)
+            except ValueError as exc:
+                if args.algo not in ['library_pcbf_mi', 'multi_backup_cbf_mi']:
+                    raise
+                print(f"Infeasible: {exc}")
+                infeasible = True
+                _draw_failure_marker_and_hold(current_state[:2])
+                break
             t_solve1 = time.perf_counter()
+            if (
+                args.algo in ['library_pcbf_mi', 'multi_backup_cbf_mi']
+                and bool(getattr(shielding, 'certificate_lost', False))
+            ):
+                print(
+                    f"Certificate loss: {args.algo} is applying its bounded "
+                    "fallback and the physical episode will continue"
+                )
+                infeasible = True
             u_safe = np.array(u_safe).flatten()
             if hasattr(shielding, 'last_total_time_sec'):
                 solve_times.append(float(shielding.last_total_time_sec))
@@ -869,7 +928,15 @@ def plot_results(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--algo', type=str, default='plcbf', choices=['pcbf', 'plcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps'])
+    parser.add_argument(
+        '--algo',
+        type=str,
+        default='plcbf',
+        choices=[
+            'pcbf', 'plcbf', 'mip_mpc', 'backup_cbf', 'gatekeeper', 'mps',
+            'multi_backup_cbf_mi', 'library_pcbf_mi'
+        ],
+    )
     parser.add_argument('--level', type=int, default=7)
     parser.add_argument('--no_render', action='store_true')
     parser.add_argument('--save', action='store_true')

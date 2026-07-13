@@ -81,6 +81,12 @@ from safe_control.utils.animation import AnimationSaver
 # Import PCBF and PLCBF from drift car algorithms
 from examples.drift_car.algorithms.pcbf_drift import PCBF
 from examples.drift_car.algorithms.plcbf_drift import PLCBF, MAX_OPERATOR_TYPES
+from examples.drift_car.algorithms.library_pcbf_mi_drift import (
+    LibraryPCBFMinInterventionDrift,
+)
+from examples.drift_car.algorithms.multi_backup_cbf_mi_drift import (
+    MultiBackupCBFMinInterventionDrift,
+)
 
 
 # =============================================================================
@@ -142,7 +148,10 @@ class JAXAlignedLaneChangeController(LaneChangeController):
 # Algorithm Types
 # =============================================================================
 
-ALGO_TYPES = ['gatekeeper', 'mps', 'backupcbf', 'pcbf', 'plcbf']
+ALGO_TYPES = [
+    'gatekeeper', 'mps', 'backupcbf', 'pcbf', 'plcbf',
+    'multi_backup_cbf_mi', 'library_pcbf_mi',
+]
 
 
 # =============================================================================
@@ -404,7 +413,50 @@ def setup_controllers(
     
     # Shielding algorithm - choose based on config
     algo_type = config.algo_type
-    if algo_type == 'plcbf':
+    if algo_type in ('multi_backup_cbf_mi', 'library_pcbf_mi'):
+        reference_plcbf = PLCBF(
+            robot=car,
+            robot_spec=car.robot_spec,
+            dt=sim.dt,
+            backup_horizon=sim.backup_horizon_time,
+            cbf_alpha=sim.pcbf_alpha,
+            left_lane_y=left_lane_y,
+            right_lane_y=right_lane_y,
+            safety_margin=1.0,
+            max_operator=config.max_operator,
+            debug=False,
+            ax=None,
+        )
+        if algo_type == 'multi_backup_cbf_mi':
+            shielding = MultiBackupCBFMinInterventionDrift(
+                robot=car,
+                robot_spec=car.robot_spec,
+                dt=sim.dt,
+                backup_horizon=sim.backup_horizon_time,
+                ax=None,
+                reference_plcbf=reference_plcbf,
+            )
+            print("  Using MB-CBF-MI (shared library, sequential candidate Backup-CBF QPs)")
+        else:
+            shielding = LibraryPCBFMinInterventionDrift(
+                robot=car,
+                robot_spec=car.robot_spec,
+                dt=sim.dt,
+                backup_horizon=sim.backup_horizon_time,
+                cbf_alpha=sim.pcbf_alpha,
+                left_lane_y=left_lane_y,
+                right_lane_y=right_lane_y,
+                safety_margin=1.0,
+                debug=False,
+                ax=ax,
+                reference_plcbf=reference_plcbf,
+            )
+            print("  Using Lib-PCBF-MI (shared rollout certificate, minimum intervention)")
+        print(
+            "    Policies: lane_change_left, lane_change_right, stop, nominal "
+            "(runtime equality asserted)"
+        )
+    elif algo_type == 'plcbf':
         # PLCBF uses multiple policies internally (left/right lane change + stop)
         shielding = PLCBF(
             robot=car,
@@ -469,7 +521,7 @@ def setup_controllers(
         print(f"  Using GATEKEEPER algorithm (backward search)")
     
     # Set backup controller (not needed for PLCBF which has built-in multi-policy)
-    if not isinstance(shielding, PLCBF):
+    if not isinstance(shielding, (PLCBF, MultiBackupCBFMinInterventionDrift)):
         shielding.set_backup_controller(backup_controller, target=backup_target)
     shielding.set_environment(env)
     
@@ -618,7 +670,10 @@ def run_simulation(
         if abs(current_friction - car.get_friction()) > 0.01:
             car.set_friction(current_friction)
             # Also update PCBF/PLCBF's friction
-            if isinstance(shielding, (PCBF, PLCBF)):
+            if isinstance(
+                shielding,
+                (PCBF, PLCBF, MultiBackupCBFMinInterventionDrift),
+            ):
                 shielding.set_friction(current_friction)
             if abs(current_friction - last_friction) > 0.01:
                 if current_friction < robot_spec['mu']:
@@ -633,7 +688,10 @@ def run_simulation(
             pred_states, pred_controls = mpcc.get_full_predictions()
             
             # For baseline shielding methods, supply externally planned nominal trajectory.
-            if isinstance(shielding, (BackupCBF, Gatekeeper, MPS)):
+            if isinstance(
+                shielding,
+                (BackupCBF, Gatekeeper, MPS, MultiBackupCBFMinInterventionDrift),
+            ):
                 if pred_states is not None and pred_controls is not None:
                     shielding.set_nominal_trajectory(pred_states, pred_controls)
         except Exception as e:
@@ -655,6 +713,15 @@ def run_simulation(
                     friction=car.get_friction(),
                     nominal_trajectory=pred_states.T if pred_states is not None else None,
                     nominal_controls=pred_controls.T if pred_controls is not None else None
+                )
+            elif isinstance(shielding, MultiBackupCBFMinInterventionDrift):
+                control_ref = {'u_ref': mpcc_control}
+                U = shielding.solve_control_problem(
+                    state,
+                    control_ref=control_ref,
+                    friction=car.get_friction(),
+                    nominal_trajectory=pred_states.T if pred_states is not None else None,
+                    nominal_controls=pred_controls.T if pred_controls is not None else None,
                 )
             elif isinstance(shielding, PCBF):
                 # PCBF uses nominal control as reference
@@ -694,7 +761,7 @@ def run_simulation(
                 'timing_warmup_skipped': warmup_skip,
             }
             return result
-        
+
         # Track mode
         if shielding.is_using_backup():
             backup_steps += 1
@@ -731,6 +798,9 @@ def run_simulation(
             if isinstance(shielding, PLCBF):
                 best = status.get('best_policy', 'unknown')
                 mode = f"PLCBF (status={status['status']}, best={best})"
+            elif isinstance(shielding, MultiBackupCBFMinInterventionDrift):
+                best = status.get('best_policy', 'unknown')
+                mode = f"MB-CBF-MI (status={status['status']}, best={best})"
             elif isinstance(shielding, PCBF):
                 mode = f"PCBF (status={status['status']})"
             else:

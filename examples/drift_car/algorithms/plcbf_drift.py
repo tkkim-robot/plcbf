@@ -329,6 +329,12 @@ class PLCBF(PCBF):
         self.multi_backup_trajs = {}  # policy_name -> list of trajectories
         self.best_policy_name = None
         self.prev_best_policy = None  # For hysteresis
+        # Behavior-neutral diagnostics for apples-to-apples benchmark metrics.
+        self.last_certificate_lost = False
+        self.last_qp_infeasible = False
+        self.last_fallback_used = False
+        self.last_max_certificate = float('-inf')
+        self.last_values = {}
         
         # Visualization handles for multi-policy
         self.policy_traj_lines = {}
@@ -818,6 +824,12 @@ class PLCBF(PCBF):
         Selection is based on maximum CBF constraint value (Vdot + alpha*V),
         not just maximum V.
         """
+        self.last_certificate_lost = False
+        self.last_qp_infeasible = False
+        self.last_fallback_used = False
+        self.last_max_certificate = float('-inf')
+        self.last_values = {}
+
         robot_state = np.array(robot_state).flatten()
         
         if friction is not None:
@@ -847,6 +859,13 @@ class PLCBF(PCBF):
             print(f"Multi-policy value computation failed: {e}")
             self.status = 'error'
             return u_nom.reshape(-1, 1)
+
+        self.last_values = dict(V_dict)
+        finite_values = [float(value) for value in V_dict.values() if np.isfinite(value)]
+        self.last_max_certificate = max(finite_values) if finite_values else float('-inf')
+        self.last_certificate_lost = not any(
+            np.isfinite(value) and value > 0.0 for value in V_dict.values()
+        )
         
         # Compute f and G at current state (needed for constraint selection)
         f = np.array(self.dynamics_jax.f_full(x0_jax, self.current_friction))
@@ -900,8 +919,10 @@ class PLCBF(PCBF):
         try:
             u_safe = self._solve_cbf_qp(u_nom, V_best, grad_V_best, f, G)
         except ValueError as err:
+            self.last_qp_infeasible = True
             if V_best > 0.0:
                 self.status = 'policy_fallback'
+                self.last_fallback_used = True
                 u_safe = self._compute_policy_control(best_policy, robot_state, u_nom)
             else:
                 raise err
@@ -916,6 +937,14 @@ class PLCBF(PCBF):
         status = super().get_status()
         status['best_policy'] = self.best_policy_name
         status['algorithm'] = 'plcbf'
+        status['certificate_lost'] = bool(self.last_certificate_lost)
+        status['qp_infeasible'] = bool(self.last_qp_infeasible)
+        status['fallback_applied'] = bool(self.last_fallback_used)
+        status['max_certificate'] = (
+            float(self.last_max_certificate)
+            if np.isfinite(self.last_max_certificate)
+            else None
+        )
         return status
     
     def get_multi_backup_trajectories(self):

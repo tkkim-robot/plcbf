@@ -60,6 +60,50 @@ uv run python examples/warehouse/test_warehouse_quad.py \
   --algo plcbf 
 ```
 
+### Additional multi-policy comparison baselines
+
+Two additive paper-comparison methods are available without changing the
+historical default benchmark rows:
+
+- `multi_backup_cbf_mi`: **MB-CBF-MI**, a benchmark-adapted multi-Backup-CBF
+  heuristic that first rejects candidates whose complete sampled rollout or
+  terminal proxy fails, then selects the feasible candidate-QP result with
+  minimum realized intervention. Its sampled stop-tail/hover proxy is not a
+  proof of terminal-set invariance, so Chen et al.'s theorem is not inherited.
+- `library_pcbf_mi`: **Lib-PCBF-MI**, the PL-CBF certificate library with one
+  QP per certified policy and minimum realized-intervention selection.
+
+Run the apples-to-apples 50-trial drift-car comparison with the paper seed:
+
+```bash
+uv run python examples/drift_car/benchmark_black_ice.py \
+  --num-runs 50 --seed 7 \
+  --variant-key plcbf \
+  --variant-key multi_backup_cbf_mi \
+  --variant-key library_pcbf_mi \
+  --num-workers 1
+```
+
+Run the apples-to-apples 100-trial Quad3D comparison at `P=64` with the
+paper seed. The actual runtime library is 64 angle policies + `stop` +
+`nominal`, hence `|Pi|=P+2=66`:
+
+```bash
+uv run python examples/warehouse/benchmark_warehouse_randomized_quad.py \
+  --algorithms plcbf multi_backup_cbf_mi library_pcbf_mi \
+  --num-trials 100 --seed 11 \
+  --plcbf-num-angle-policies 64 \
+  --num-workers 1 --skip-timing-refresh
+```
+
+Both benchmark drivers separately report physical collision, certificate
+loss, QP infeasibility, goal completion, horizon survival, runtime error, and
+a defined union failure. After certificate loss or QP failure, all three rows
+apply the exact shared stop action and continue under the same physical rule.
+Detailed per-trial JSON/CSV data records the seeded obstacle geometry.
+Candidate QPs inside MB-CBF-MI are evaluated sequentially; parallel workers
+preserve scenarios but make compute-time measurements tentative.
+
 ## Useful Options
 
 ### Highway Driving: `examples/drift_car/test_drift_pcbf.py`
@@ -67,7 +111,7 @@ uv run python examples/warehouse/test_warehouse_quad.py \
 | Option | Description |
 |---|---|
 | `--test` | `puddle_surprise`, `high_friction`, `low_friction`, `straight_safe`, `far_left_safe`, `all` |
-| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf` |
+| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf`, `multi_backup_cbf_mi`, `library_pcbf_mi` |
 | `--backup` | `lane_change`, `lane_change_left`, `lane_change_right`, `stop` |
 | `--obs` | Number of obstacles (`1` or `2`) |
 | `--no-render` | Headless run |
@@ -77,7 +121,7 @@ uv run python examples/warehouse/test_warehouse_quad.py \
 
 | Option | Description |
 |---|---|
-| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf` |
+| `--algo` | `mps`, `gatekeeper`, `backupcbf`, `pcbf`, `plcbf`, `multi_backup_cbf_mi`, `library_pcbf_mi` |
 | `--level` | `7` (default), `1` to `6` |
 | `--plcbf_num_angle_policies` | `64` (default): Number of PLCBF angle fallback policies |
 | `--no_render` | Headless run |
