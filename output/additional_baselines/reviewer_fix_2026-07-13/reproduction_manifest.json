@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-13T06:18:32-04:00",
+  "branch": "multi-backup-baselines",
+  "code_commit": "a9c34d7a27c5bffbef91999ad56fe58e8db54677",
+  "base_main_commit": "34795fae8ab04846e312cdb399872e9a6deda7b5",
+  "safe_control_gitlink": "b748c41daa953e4e457c552d795d7f3f5a5255ab",
+  "uv_lock_sha256": "152a1cc5b357610e304aafc8d14ed79bdb6c06bd0454ccccbf4501e037b1cd88",
+  "result_dir": "/Users/ktk/Desktop/mycode/plcbf/output/additional_baselines/reviewer_fix_2026-07-13",
+  "benchmark_source": {
+    "kind": "clean recursive clone",
+    "path_during_run": "/tmp/plcbf-repro-a9c34d7",
+    "parent_git_status": "clean",
+    "submodule_git_status": "clean"
+  },
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.10.18",
+    "logical_cpu_count": 10,
+    "physical_cpu_count": 10,
+    "packages": {
+      "numpy": "2.2.6",
+      "scipy": "1.15.3",
+      "cvxpy": "1.7.5",
+      "jax": "0.6.2",
+      "jaxlib": "0.6.2"
+    },
+    "cvxpy_solvers": ["CLARABEL", "OSQP", "SCIPY", "SCS"]
+  },
+  "failure_semantics": {
+    "certificate_loss": "no policy has a positive rollout certificate (max_i H_T^{pi_i} <= 0)",
+    "qp_infeasibility": "a certified set exists but no required QP returns an accepted bounded input",
+    "continuation": "all three comparison controllers apply the exact shared stop action after certificate loss or QP failure and continue physically",
+    "task_completion": "goal reached",
+    "horizon_survival": "fixed horizon reached without goal, collision, or runtime error",
+    "union_failure": "collision OR certificate loss OR QP infeasibility OR runtime error OR neither task completion nor horizon survival"
+  },
+  "benchmarks": {
+    "drift_outcome": {
+      "cwd": "/tmp/plcbf-repro-a9c34d7",
+      "command": "/Users/ktk/Desktop/mycode/plcbf/.venv/bin/python examples/drift_car/benchmark_black_ice.py --num-runs 50 --seed 7 --variant-key plcbf --variant-key multi_backup_cbf_mi --variant-key library_pcbf_mi --num-workers 8 --output-md $RESULT_DIR/drift_seed7_50.md --output-json $RESULT_DIR/drift_seed7_50.json --output-csv $RESULT_DIR/drift_seed7_50.csv",
+      "trials_per_method": 50,
+      "seed": 7,
+      "workers": 8,
+      "puddle_friction": 0.30,
+      "library_size": 4,
+      "summary": {
+        "plcbf": {"collision": 17, "certificate_loss": 46, "qp_infeasible": 0, "goal": 0, "horizon_survival": 33, "union_failure": 46},
+        "multi_backup_cbf_mi": {"collision": 0, "certificate_loss": 0, "qp_infeasible": 0, "goal": 0, "horizon_survival": 50, "union_failure": 0},
+        "library_pcbf_mi": {"collision": 17, "certificate_loss": 45, "qp_infeasible": 9, "goal": 0, "horizon_survival": 33, "union_failure": 47}
+      }
+    },
+    "warehouse_outcome": {
+      "cwd": "/tmp/plcbf-repro-a9c34d7",
+      "command": "/Users/ktk/Desktop/mycode/plcbf/.venv/bin/python examples/warehouse/benchmark_warehouse_randomized_quad.py --algorithms plcbf multi_backup_cbf_mi library_pcbf_mi --num-trials 100 --seed 11 --plcbf-num-angle-policies 64 --mip-num-angle-policies 64 --num-workers 8 --skip-timing-refresh --progress-every 10 --output-md $RESULT_DIR/warehouse_seed11_p64_100.md --output-json $RESULT_DIR/warehouse_seed11_p64_100.json --output-csv $RESULT_DIR/warehouse_seed11_p64_100.csv",
+      "trials_per_method": 100,
+      "seed": 11,
+      "workers": 8,
+      "angle_policy_count": 64,
+      "library_definition": "P angle policies + stop + nominal",
+      "library_size": 66,
+      "summary": {
+        "plcbf": {"collision": 84, "certificate_loss": 98, "qp_infeasible": 16, "goal": 0, "horizon_survival": 16, "union_failure": 98},
+        "multi_backup_cbf_mi": {"collision": 86, "certificate_loss": 100, "qp_infeasible": 95, "goal": 0, "horizon_survival": 14, "union_failure": 100},
+        "library_pcbf_mi": {"collision": 82, "certificate_loss": 98, "qp_infeasible": 12, "goal": 0, "horizon_survival": 18, "union_failure": 98}
+      }
+    },
+    "drift_timing": {
+      "command": "/Users/ktk/Desktop/mycode/plcbf/.venv/bin/python examples/drift_car/benchmark_black_ice.py --num-runs 3 --seed 7 --variant-key plcbf --variant-key multi_backup_cbf_mi --variant-key library_pcbf_mi --num-workers 1 --output-md $RESULT_DIR/drift_timing_serial3.md --output-json $RESULT_DIR/drift_timing_serial3.json --output-csv $RESULT_DIR/drift_timing_serial3.csv",
+      "trials_per_method": 3,
+      "workers": 1,
+      "tentative_warmed_mean_ms_per_step": {
+        "plcbf": 6.01,
+        "multi_backup_cbf_mi": 503.43,
+        "library_pcbf_mi": 9.87
+      }
+    },
+    "warehouse_timing": {
+      "command": "/Users/ktk/Desktop/mycode/plcbf/.venv/bin/python examples/warehouse/benchmark_warehouse_randomized_quad.py --algorithms plcbf multi_backup_cbf_mi library_pcbf_mi --num-trials 3 --seed 11 --plcbf-num-angle-policies 64 --mip-num-angle-policies 64 --num-workers 1 --skip-timing-refresh --progress-every 1 --output-md $RESULT_DIR/warehouse_timing_serial3.md --output-json $RESULT_DIR/warehouse_timing_serial3.json --output-csv $RESULT_DIR/warehouse_timing_serial3.csv",
+      "trials_per_method": 3,
+      "workers": 1,
+      "tentative_warmed_mean_ms_per_step": {
+        "plcbf": 22.159,
+        "multi_backup_cbf_mi": 140.408,
+        "library_pcbf_mi": 143.959
+      }
+    }
+  },
+  "validation": {
+    "focused_clean_clone_tests": {
+      "files": [
+        "examples/drift_car/test_additional_baselines.py",
+        "tests/test_quad3d_additional_baselines.py",
+        "tests/test_warehouse_benchmark_failure_semantics.py"
+      ],
+      "result": "46 passed",
+      "warnings": "3 optional do-mpc feature warnings"
+    },
+    "ruff": "passed for changed Python files with pre-existing E402 ignored",
+    "artifact_checks": [
+      "exact scenario run-index, seed, and obstacle-geometry pairing across methods",
+      "expected library size on every trial",
+      "zero runtime errors",
+      "certificate_loss_steps + qp_infeasible_steps <= total_steps",
+      "fallback_steps == certificate_loss_steps + qp_infeasible_steps",
+      "task_completed == reached_goal",
+      "completed_or_survived == task_completed OR survived_horizon",
+      "union-failure identity",
+      "raw-trial counts agree with summaries"
+    ],
+    "result": "passed for all four JSON artifacts"
+  },
+  "artifacts_sha256": {
+    "drift_seed7_50.csv": "662e618fc23665aa6a850991fe71e3e711b36fd302246a0249c0dfd67bcba965",
+    "drift_seed7_50.json": "bc6d05931cc4530901e1daaebf61f2215597742ad79353b1a658d7937c897412",
+    "drift_seed7_50.md": "365180fb74a2419c8c7e3718c479fbb9e22799ea44b90a8820c7206009374f42",
+    "drift_timing_serial3.csv": "609fe569ed0427b2cb631b8f13179574fb14e1bb0ff347379e3d479989b60dfb",
+    "drift_timing_serial3.json": "dbb132088502eb533cf1ee2b3005402f1ff571831c58f5292b6d4d68c384d81c",
+    "drift_timing_serial3.md": "2097b983402bb78501a1f26d23f3162b94a26c57fb542bcf61ba2f15f5651f32",
+    "warehouse_seed11_p64_100.csv": "1d00594f50f1ec70c2b3d13e4161baf78887888290060d73ccc457aa8dea4be4",
+    "warehouse_seed11_p64_100.json": "63ff4c2ff2fd2e77647fab1a1c97b48c6aefe32ee28f391e720985e6623961d5",
+    "warehouse_seed11_p64_100.md": "984184cac4106db3bdf4429d6f826066a929f474097cea8ad682406adb720250",
+    "warehouse_timing_serial3.csv": "5787c666ae54de32fd4c3a42ba9137aadbcf39cd98db03dd0a4f642ea9d02a1d",
+    "warehouse_timing_serial3.json": "3dd71c6146af420431770afb32912c8359708ccd887340d4c4dbb55d66e19aff",
+    "warehouse_timing_serial3.md": "7e31519c994a00cab62633e388859f5800b232a99a7a4ffc83ee67898e5eee80"
+  },
+  "scientific_caveat": "MB-CBF-MI uses benchmark-specific sampled terminal proxies, not a proven safe control-invariant terminal set; Chen et al.'s formal theorem is not inherited."
+}
