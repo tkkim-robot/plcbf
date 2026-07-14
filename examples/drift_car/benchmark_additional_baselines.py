@@ -1,9 +1,8 @@
 """Baseline-only drift-car black-ice benchmark.
 
 This entry point intentionally exposes only MB-CBF-MI and Lib-PCBF-MI.  The
-historical benchmark remains in ``benchmark_black_ice.py`` byte-for-byte.  A
-certificate or candidate-QP event is recorded without changing the action
-returned by the selected baseline.
+historical benchmark remains in ``benchmark_black_ice.py`` byte-for-byte.  The
+simulator applies the exact valid action returned by the selected baseline.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import os
 import sys
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,12 +41,7 @@ from examples.drift_car.algorithms.multi_backup_cbf_mi_drift import (
 
 QUIET_SINK = open(os.devnull, "w", encoding="utf-8")
 ADDITIONAL_ALGOS = ("multi_backup_cbf_mi", "library_pcbf_mi")
-FILTER_FAILURE_DEFINITION = "collision OR certificate_lost OR qp_infeasible"
 HISTORICAL_FAILURE_DEFINITION = "collision OR unrecoverable_infeasibility"
-UNION_FAILURE_DEFINITION = (
-    "filter_failure OR runtime_error OR NOT completed_or_survived; task_completed "
-    "means reaching the track goal and horizon survival is reported separately"
-)
 UNRECOVERABLE_INFEASIBLE_DEFINITION = (
     "unrecoverable solve exception, runtime error, non-finite control, invalid "
     "control dimension, or out-of-bounds control"
@@ -113,65 +107,13 @@ class EpisodeResult:
     seed: int
     run_idx: int
     obstacle_geometry: List[Tuple[float, str]]
-    P_or_library_size: int
+    library_size: int
     collision: bool
-    infeasible: bool
     unrecoverable_infeasible: bool
     historical_failure: bool
-    certificate_lost: bool
-    qp_infeasible: bool
-    runtime_error: bool
-    reached_goal: bool
-    survived_horizon: bool
-    task_completed: bool
-    completed_or_survived: bool
-    filter_failure: bool
-    union_failure: bool
     total_steps: int
     timed_steps: int
-    mean_compute_ms: float
-    median_compute_ms: float
-    p95_compute_ms: float
-    max_compute_ms: float
-    nominal_tracking_fraction: float
-    mean_intervention_l2: float
-    max_intervention_l2: float
-    policy_switch_count: int
-    selected_policy_histogram: Dict[str, int] = field(default_factory=dict)
-    num_candidate_qps_solved: int = 0
-    num_steps_with_no_safe_policy: int = 0
-    num_feasible_backup_candidates_per_step: List[int] = field(default_factory=list)
-    num_certified_backup_candidates_per_step: List[int] = field(default_factory=list)
-    terminal_failure_count: int = 0
-    num_rollout_safe_candidates_per_step: List[int] = field(default_factory=list)
-    num_qp_feasible_candidates_per_step: List[int] = field(default_factory=list)
-    certificate_loss_steps: int = 0
-    qp_infeasible_steps: int = 0
-    fallback_steps: int = 0
-    candidate_qp_failure_count: int = 0
-    projection_occurred: bool = False
-    num_post_projection_audits: int = 0
-    projection_event_count: int = 0
-    post_projection_rejection_count: int = 0
-    max_projection_delta_inf: float = 0.0
-    max_post_projection_constraint_violation: float = 0.0
-    max_post_projection_violation_ratio: float = 0.0
-    num_post_projection_audits_per_step: List[int] = field(default_factory=list)
-    projection_event_count_per_step: List[int] = field(default_factory=list)
-    post_projection_rejection_count_per_step: List[int] = field(default_factory=list)
-    max_projection_delta_inf_per_step: List[float] = field(default_factory=list)
-    max_post_projection_constraint_violation_per_step: List[float] = field(
-        default_factory=list
-    )
-    max_post_projection_violation_ratio_per_step: List[float] = field(
-        default_factory=list
-    )
-
-    @property
-    def nominal_tracking_pct(self) -> float:
-        """Compatibility accessor used by older analysis scripts."""
-
-        return 100.0 * self.nominal_tracking_fraction
+    solve_time_sum_sec: float
 
 
 def build_vehicle_spec() -> Dict[str, float]:
@@ -430,34 +372,12 @@ def call_quiet(quiet: bool, fn, *args, **kwargs):
     return fn(*args, **kwargs)
 
 
-def classify_baseline_status(variant: AlgoVariant, shielding, status: dict):
-    """Return disjoint certificate/QP/runtime events for one filter step.
+def controller_reported_runtime_error(shielding) -> bool:
+    """Recognize an unrecoverable controller error without collecting metrics."""
 
-    MB-CBF-MI exposes the split directly. Lib-PCBF-MI's already-computed
-    candidate list disambiguates an empty certified set from a certified set
-    whose QPs all failed. This helper is diagnostic only and never changes the
-    controller's returned action.
-    """
-
-    if variant.algo not in ADDITIONAL_ALGOS:
-        return False, False, False, False
-
-    status_text = str(status.get("status", "")).lower()
-    runtime_error = bool(status.get("runtime_error", False)) or status_text.startswith(
+    status_text = str(getattr(shielding, "status", "")).lower()
+    return bool(getattr(shielding, "runtime_error", False)) or status_text.startswith(
         ("error", "value_error", "candidate_evaluation_error")
-    )
-    if runtime_error:
-        return False, False, True, bool(status.get("fallback_applied", False))
-
-    certificate_lost = bool(status.get("certificate_lost", False))
-    qp_infeasible = bool(
-        status.get("qp_infeasible", status.get("infeasible", False))
-    ) and not certificate_lost
-    return (
-        certificate_lost,
-        qp_infeasible,
-        False,
-        bool(status.get("fallback_applied", False)),
     )
 
 
@@ -506,35 +426,14 @@ def run_episode(
 
     n_steps = int(cfg.tf / cfg.dt)
     total_steps = 0
-    nominal_like_steps = 0
     collision = False
-    infeasible = False
-    certificate_lost = False
-    qp_infeasible = False
     runtime_error = False
-    certificate_loss_steps = 0
-    qp_infeasible_steps = 0
-    fallback_steps = 0
-    observed_candidate_qp_failure_count = 0
-    reached_goal = False
     compute_times_s: List[float] = []
-    intervention_samples: List[float] = []
-    selected_policy_histogram: Dict[str, int] = {}
-    policy_switch_count = 0
-    previous_policy: Optional[str] = None
     solve_calls = 0
     timing_warmup_steps = 5
-
-    u_scale = np.array(
-        [
-            float(vehicle_spec["delta_dot_max"]),
-            float(vehicle_spec["tau_dot_max"]),
-        ],
-        dtype=float,
-    )
     quiet = not verbose
 
-    for step in range(n_steps):
+    for _step in range(n_steps):
         state = car.get_state()
         pos = car.get_position()
 
@@ -549,7 +448,6 @@ def run_episode(
             pred_states, pred_controls = call_quiet(quiet, mpcc.get_full_predictions)
         except Exception:
             runtime_error = True
-            infeasible = True
             break
 
         try:
@@ -569,7 +467,6 @@ def run_episode(
             solve_elapsed = time.perf_counter() - solve_started
         except Exception:
             runtime_error = True
-            infeasible = True
             break
 
         try:
@@ -579,58 +476,19 @@ def run_episode(
             u_safe_vec = validate_returned_control(u_safe, shielding)
         except (TypeError, ValueError):
             runtime_error = True
-            infeasible = True
             break
 
-        try:
-            status = shielding.get_status() if hasattr(shielding, "get_status") else {}
-        except Exception:
+        # A controller may explicitly classify an internal evaluation failure
+        # after returning. Normal native fallback actions remain valid and are
+        # passed to the simulator unchanged.
+        if controller_reported_runtime_error(shielding):
             runtime_error = True
-            infeasible = True
-            break
-        (
-            step_certificate_lost,
-            step_qp_infeasible,
-            step_runtime_error,
-            step_fallback,
-        ) = classify_baseline_status(variant, shielding, status)
-        certificate_lost = certificate_lost or step_certificate_lost
-        qp_infeasible = qp_infeasible or step_qp_infeasible
-        runtime_error = runtime_error or step_runtime_error
-        certificate_loss_steps += int(step_certificate_lost)
-        qp_infeasible_steps += int(step_qp_infeasible)
-        fallback_steps += int(step_fallback)
-        observed_candidate_qp_failure_count += sum(
-            bool(candidate.qp_solved and not candidate.feasible)
-            for candidate in getattr(shielding, "last_candidate_results", [])
-        )
-
-        # Certificate loss and candidate-QP infeasibility are diagnostics, not
-        # physical terminal conditions. Apply the exact finite control returned
-        # by the baseline and continue. The benchmark never substitutes an
-        # action.
-        if step_runtime_error:
-            infeasible = True
             break
 
-        diff = np.linalg.norm((u_safe_vec - u_nom_vec) / np.maximum(u_scale, 1e-8))
-        intervention_samples.append(float(np.linalg.norm(u_safe_vec - u_nom_vec)))
-        if diff < cfg.nominal_track_eps:
-            nominal_like_steps += 1
-        selected_policy = status.get("best_policy")
-        if selected_policy is not None:
-            selected_policy = str(selected_policy)
-            selected_policy_histogram[selected_policy] = (
-                selected_policy_histogram.get(selected_policy, 0) + 1
-            )
-            if previous_policy is not None and previous_policy != selected_policy:
-                policy_switch_count += 1
-            previous_policy = selected_policy
         try:
             sim_res = simulator.step(u_safe_vec.reshape(-1, 1))
         except Exception:
             runtime_error = True
-            infeasible = True
             break
         total_steps += 1
         if solve_calls > timing_warmup_steps:
@@ -641,158 +499,27 @@ def run_episode(
 
         # Track finished
         if car.get_position()[0] > env.track_length - 10.0:
-            reached_goal = True
             break
 
-    survived_horizon = bool(
-        total_steps == n_steps and not collision and not runtime_error
-    )
-    # Goal completion and fixed-horizon survival are distinct outcomes.
-    task_completed = bool(reached_goal)
-    completed_or_survived = bool(task_completed or survived_horizon)
-    filter_failure = bool(collision or certificate_lost or qp_infeasible)
-    union_failure = bool(filter_failure or runtime_error or not completed_or_survived)
-    # Preserve the historical meaning: only an unrecoverable solve/runtime
-    # failure is infeasible. Candidate-QP failure is a separate diagnostic.
-    infeasible = bool(infeasible or runtime_error)
-    historical_failure = bool(collision or infeasible)
-    nominal_fraction = nominal_like_steps / max(total_steps, 1)
-    timing_ms = 1000.0 * np.asarray(compute_times_s, dtype=float)
-    try:
-        controller_metrics = (
-            shielding.get_metrics() if hasattr(shielding, "get_metrics") else {}
-        )
-    except Exception:
-        controller_metrics = {}
-        runtime_error = True
-        infeasible = True
-        historical_failure = True
-        survived_horizon = False
-        union_failure = True
-    if controller_metrics.get("selected_policy_histogram"):
-        selected_policy_histogram = dict(controller_metrics["selected_policy_histogram"])
-        policy_switch_count = int(controller_metrics.get("policy_switch_count", policy_switch_count))
-    mean_intervention = float(
-        controller_metrics.get(
-            "mean_intervention_l2",
-            np.mean(intervention_samples) if intervention_samples else 0.0,
-        )
-    )
-    max_intervention = float(
-        controller_metrics.get(
-            "max_intervention_l2",
-            np.max(intervention_samples) if intervention_samples else 0.0,
-        )
-    )
+    historical_failure = bool(collision or runtime_error)
     if verbose:
         print(
             f"run={scenario.run_idx:02d} variant={variant.key} "
-            f"obs={scenario.num_obstacles} collision={collision} infeasible={infeasible} "
-            f"certificate_lost={certificate_lost} qp_infeasible={qp_infeasible} "
-            f"task_completed={task_completed} nominal={100.0 * nominal_fraction:.1f}% "
-            f"steps={total_steps}"
+            f"obs={scenario.num_obstacles} collision={collision} "
+            f"unrecoverable={runtime_error} steps={total_steps}"
         )
     return EpisodeResult(
         algorithm=variant.key,
         seed=scenario.seed,
         run_idx=scenario.run_idx,
         obstacle_geometry=list(scenario.obstacles),
-        P_or_library_size=4,
+        library_size=4,
         collision=collision,
-        infeasible=infeasible,
-        unrecoverable_infeasible=infeasible,
+        unrecoverable_infeasible=runtime_error,
         historical_failure=historical_failure,
-        certificate_lost=certificate_lost,
-        qp_infeasible=qp_infeasible,
-        runtime_error=runtime_error,
-        reached_goal=reached_goal,
-        survived_horizon=survived_horizon,
-        task_completed=task_completed,
-        completed_or_survived=completed_or_survived,
-        filter_failure=filter_failure,
-        union_failure=union_failure,
         total_steps=total_steps,
-        timed_steps=len(timing_ms),
-        mean_compute_ms=float(np.mean(timing_ms)) if len(timing_ms) else float("nan"),
-        median_compute_ms=float(np.median(timing_ms)) if len(timing_ms) else float("nan"),
-        p95_compute_ms=float(np.percentile(timing_ms, 95)) if len(timing_ms) else float("nan"),
-        max_compute_ms=float(np.max(timing_ms)) if len(timing_ms) else float("nan"),
-        nominal_tracking_fraction=nominal_fraction,
-        mean_intervention_l2=mean_intervention,
-        max_intervention_l2=max_intervention,
-        policy_switch_count=policy_switch_count,
-        selected_policy_histogram=selected_policy_histogram,
-        num_candidate_qps_solved=int(controller_metrics.get("num_candidate_qps_solved", 0)),
-        num_steps_with_no_safe_policy=int(
-            controller_metrics.get("num_steps_with_no_safe_policy", 0)
-        ),
-        num_feasible_backup_candidates_per_step=list(
-            controller_metrics.get("num_feasible_backup_candidates_per_step", [])
-        ),
-        num_certified_backup_candidates_per_step=list(
-            controller_metrics.get("num_certified_backup_candidates_per_step", [])
-        ),
-        terminal_failure_count=int(controller_metrics.get("terminal_failure_count", 0)),
-        num_rollout_safe_candidates_per_step=list(
-            controller_metrics.get("num_rollout_safe_candidates_per_step", [])
-        ),
-        num_qp_feasible_candidates_per_step=list(
-            controller_metrics.get("num_qp_feasible_candidates_per_step", [])
-        ),
-        certificate_loss_steps=certificate_loss_steps,
-        qp_infeasible_steps=qp_infeasible_steps,
-        fallback_steps=fallback_steps,
-        candidate_qp_failure_count=int(
-            max(
-                observed_candidate_qp_failure_count,
-                controller_metrics.get("candidate_qp_failure_count", 0),
-            )
-        ),
-        projection_occurred=bool(
-            controller_metrics.get("projection_occurred", False)
-        ),
-        num_post_projection_audits=int(
-            controller_metrics.get("num_post_projection_audits", 0)
-        ),
-        projection_event_count=int(
-            controller_metrics.get("projection_event_count", 0)
-        ),
-        post_projection_rejection_count=int(
-            controller_metrics.get("post_projection_rejection_count", 0)
-        ),
-        max_projection_delta_inf=float(
-            controller_metrics.get("max_projection_delta_inf", 0.0)
-        ),
-        max_post_projection_constraint_violation=float(
-            controller_metrics.get(
-                "max_post_projection_constraint_violation", 0.0
-            )
-        ),
-        max_post_projection_violation_ratio=float(
-            controller_metrics.get("max_post_projection_violation_ratio", 0.0)
-        ),
-        num_post_projection_audits_per_step=list(
-            controller_metrics.get("num_post_projection_audits_per_step", [])
-        ),
-        projection_event_count_per_step=list(
-            controller_metrics.get("projection_event_count_per_step", [])
-        ),
-        post_projection_rejection_count_per_step=list(
-            controller_metrics.get("post_projection_rejection_count_per_step", [])
-        ),
-        max_projection_delta_inf_per_step=list(
-            controller_metrics.get("max_projection_delta_inf_per_step", [])
-        ),
-        max_post_projection_constraint_violation_per_step=list(
-            controller_metrics.get(
-                "max_post_projection_constraint_violation_per_step", []
-            )
-        ),
-        max_post_projection_violation_ratio_per_step=list(
-            controller_metrics.get(
-                "max_post_projection_violation_ratio_per_step", []
-            )
-        ),
+        timed_steps=len(compute_times_s),
+        solve_time_sum_sec=float(np.sum(compute_times_s)),
     )
 
 
@@ -825,7 +552,8 @@ def aggregate_results(
                     if verbose:
                         print(
                             f"  {variant.key:22s} run {index + 1:2d}/{len(scenarios)} "
-                            f"collision={int(ep.collision)} infeasible={int(ep.infeasible)}"
+                            f"collision={int(ep.collision)} "
+                            f"unrecoverable={int(ep.unrecoverable_infeasible)}"
                         )
         else:
             for payload in payloads:
@@ -834,61 +562,26 @@ def aggregate_results(
     summary_rows = []
     for variant in variants:
         rows = all_results[variant.key]
+        if any(
+            result.historical_failure
+            != bool(result.collision or result.unrecoverable_infeasible)
+            for result in rows
+        ):
+            raise AssertionError(
+                "historical_failure must equal collision OR unrecoverable_infeasible"
+            )
         n = len(rows)
         fail_count = sum(1 for r in rows if r.historical_failure)
         collision_count = sum(1 for r in rows if r.collision)
-        infeasible_count = sum(1 for r in rows if r.infeasible)
-        certificate_lost_count = sum(1 for r in rows if r.certificate_lost)
-        qp_infeasible_count = sum(1 for r in rows if r.qp_infeasible)
-        runtime_error_count = sum(1 for r in rows if r.runtime_error)
-        task_completed_count = sum(1 for r in rows if r.task_completed)
-        survived_horizon_count = sum(1 for r in rows if r.survived_horizon)
-        successful_outcome_count = sum(1 for r in rows if r.completed_or_survived)
-        filter_failure_count = sum(1 for r in rows if r.filter_failure)
-        union_failure_count = sum(1 for r in rows if r.union_failure)
-        projection_trial_count = sum(
-            1 for r in rows if getattr(r, "projection_occurred", False)
+        unrecoverable_count = sum(
+            1 for r in rows if r.unrecoverable_infeasible
         )
-        num_post_projection_audits = sum(
-            int(getattr(r, "num_post_projection_audits", 0)) for r in rows
-        )
-        projection_event_count = sum(
-            int(getattr(r, "projection_event_count", 0)) for r in rows
-        )
-        post_projection_rejection_count = sum(
-            int(getattr(r, "post_projection_rejection_count", 0)) for r in rows
-        )
-        max_projection_delta_inf = max(
-            (float(getattr(r, "max_projection_delta_inf", 0.0)) for r in rows),
-            default=0.0,
-        )
-        max_post_projection_constraint_violation = max(
-            (
-                float(
-                    getattr(r, "max_post_projection_constraint_violation", 0.0)
-                )
-                for r in rows
-            ),
-            default=0.0,
-        )
-        max_post_projection_violation_ratio = max(
-            (
-                float(getattr(r, "max_post_projection_violation_ratio", 0.0))
-                for r in rows
-            ),
-            default=0.0,
-        )
-        nominal_avg = float(np.mean([r.nominal_tracking_pct for r in rows])) if rows else 0.0
-        timed_rows = [
-            r for r in rows
-            if r.timed_steps > 0 and np.isfinite(r.mean_compute_ms)
-        ]
+        timed_rows = [r for r in rows if r.timed_steps > 0]
         total_timed_steps = sum(r.timed_steps for r in timed_rows)
         mean_compute_ms = (
-            float(
-                sum(r.mean_compute_ms * r.timed_steps for r in timed_rows)
-                / total_timed_steps
-            )
+            1000.0
+            * float(sum(r.solve_time_sum_sec for r in timed_rows))
+            / total_timed_steps
             if total_timed_steps
             else float("nan")
         )
@@ -901,37 +594,11 @@ def aggregate_results(
                 "fail_rate": 100.0 * fail_count / max(n, 1),
                 "collision_count": collision_count,
                 "collision_rate": 100.0 * collision_count / max(n, 1),
-                "infeasible_count": infeasible_count,
-                "infeasible_rate": 100.0 * infeasible_count / max(n, 1),
-                "certificate_lost_count": certificate_lost_count,
-                "certificate_lost_rate": 100.0 * certificate_lost_count / max(n, 1),
-                "qp_infeasible_count": qp_infeasible_count,
-                "qp_infeasible_rate": 100.0 * qp_infeasible_count / max(n, 1),
-                "runtime_error_count": runtime_error_count,
-                "task_completed_count": task_completed_count,
-                "task_completed_rate": 100.0 * task_completed_count / max(n, 1),
-                "survived_horizon_count": survived_horizon_count,
-                "survived_horizon_rate": 100.0 * survived_horizon_count / max(n, 1),
-                "successful_outcome_count": successful_outcome_count,
-                "successful_outcome_rate": 100.0 * successful_outcome_count / max(n, 1),
-                "filter_failure_count": filter_failure_count,
-                "filter_failure_rate": 100.0 * filter_failure_count / max(n, 1),
-                "union_failure_count": union_failure_count,
-                "union_failure_rate": 100.0 * union_failure_count / max(n, 1),
-                "projection_trial_count": projection_trial_count,
-                "num_post_projection_audits": num_post_projection_audits,
-                "projection_event_count": projection_event_count,
-                "post_projection_rejection_count": (
-                    post_projection_rejection_count
+                "unrecoverable_count": unrecoverable_count,
+                "unrecoverable_rate": (
+                    100.0 * unrecoverable_count / max(n, 1)
                 ),
-                "max_projection_delta_inf": max_projection_delta_inf,
-                "max_post_projection_constraint_violation": (
-                    max_post_projection_constraint_violation
-                ),
-                "max_post_projection_violation_ratio": (
-                    max_post_projection_violation_ratio
-                ),
-                "nominal_avg": nominal_avg,
+                "total_timed_steps": total_timed_steps,
                 "mean_compute_ms": mean_compute_ms,
             }
         )
@@ -954,7 +621,6 @@ def format_markdown_table(
     num_runs: int,
     seed: int,
     cfg: SimConfig,
-    detailed: bool = True,
 ) -> str:
     lines: List[str] = []
     lines.append("# Drift Car Additional-Baseline Results")
@@ -965,11 +631,15 @@ def format_markdown_table(
         f"- Puddle: x={cfg.puddle_x:.1f}, radius={cfg.puddle_radius:.1f}, friction={cfg.puddle_friction:.2f}"
     )
     lines.append("- Obstacles per run: random 1 or 2, placed near and beyond puddle center (x in ~[72, 85])")
+    lines.append("- Policy library size: 4")
     lines.append(f"- Main failure: `{HISTORICAL_FAILURE_DEFINITION}`")
-    lines.append(f"- Filter diagnostic: `{FILTER_FAILURE_DEFINITION}`")
     lines.append(
-        "- Certificate loss and candidate-QP failure are diagnostics only. The "
-        "simulator applies the selected baseline's returned control unchanged."
+        "- The simulator applies the selected baseline's exact finite, "
+        "dimension-valid, actuator-valid returned control."
+    )
+    lines.append(
+        "- Timing is end-to-end solve_control_problem wall time and excludes "
+        "the first five calls of each trial."
     )
     lines.append(
         "- † MB-CBF-MI uses a sampled terminal proxy, not a proven "
@@ -977,49 +647,13 @@ def format_markdown_table(
         "guarantee of Chen et al."
     )
     lines.append("")
-    lines.append(
-        "| Algorithm | Failure (historical) | Collision | Unrecoverable infeasible | "
-        "Certificate loss | Candidate-QP failure | Goal | Horizon survival | Mean Time [ms] |"
-    )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| Algorithm | Failure | Mean Time [ms] |")
+    lines.append("|---|---:|---:|")
     for row in summary_rows:
         lines.append(
             f"| {row['label']} | "
             f"{_fmt_count_rate(row['fail_count'], row['n'], row['fail_rate'])} | "
-            f"{_fmt_count_rate(row['collision_count'], row['n'], row['collision_rate'])} | "
-            f"{_fmt_count_rate(row['infeasible_count'], row['n'], row['infeasible_rate'])} | "
-            f"{_fmt_count_rate(row['certificate_lost_count'], row['n'], row['certificate_lost_rate'])} | "
-            f"{_fmt_count_rate(row['qp_infeasible_count'], row['n'], row['qp_infeasible_rate'])} | "
-            f"{_fmt_count_rate(row['task_completed_count'], row['n'], row['task_completed_rate'])} | "
-            f"{_fmt_count_rate(row['survived_horizon_count'], row['n'], row['survived_horizon_rate'])} | "
             f"{row['mean_compute_ms']:.2f} |"
-        )
-    lines.append("")
-    lines.append("## Post-projection QP audit")
-    lines.append("")
-    lines.append(
-        "Every finite, actuator-tolerance-valid successful-status candidate is "
-        "checked against its original QP inequalities after actuator-bound "
-        "projection. A residual above the declared post-projection audit tolerance "
-        "rejects that candidate before minimum-intervention selection."
-    )
-    lines.append("")
-    lines.append(
-        "| Algorithm | Audited candidates | Trials with projection | Projection "
-        "events (candidates) | Audit rejections | Max "
-        "$\\|\\Delta u\\|_\\infty$ (native units) | Max violation | Max "
-        "violation/tolerance |"
-    )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
-    for row in summary_rows:
-        lines.append(
-            f"| {row['label']} | {row['num_post_projection_audits']} | "
-            f"{row['projection_trial_count']}/{row['n']} | "
-            f"{row['projection_event_count']} | "
-            f"{row['post_projection_rejection_count']} | "
-            f"{row['max_projection_delta_inf']:.9g} | "
-            f"{row['max_post_projection_constraint_violation']:.9g} | "
-            f"{row['max_post_projection_violation_ratio']:.9g} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -1101,7 +735,6 @@ def main(argv=None):
         args.num_runs,
         args.seed,
         cfg,
-        detailed=True,
     )
 
     output_path = Path(args.output_md)
@@ -1121,34 +754,23 @@ def main(argv=None):
             "num_runs": args.num_runs,
             "scenario_seed": args.seed,
             "algorithms": [variant.key for variant in variants],
-            "timing_note": (
-                "Sequential candidates within each control step; end-to-end wall-clock "
-                "filter latency. Each baseline excludes its first five warm-up calls. "
-                "Independent "
-                f"trials used {max(1, int(args.num_workers))} worker(s)."
-            ),
-            "historical_failure_definition": HISTORICAL_FAILURE_DEFINITION,
-            "filter_failure_definition": FILTER_FAILURE_DEFINITION,
-            "union_failure_definition": UNION_FAILURE_DEFINITION,
-            "unrecoverable_infeasible_definition": UNRECOVERABLE_INFEASIBLE_DEFINITION,
-            "post_diagnostic_action": "exact control returned by selected baseline",
-            "projection_audit": {
-                "scope": (
-                    "every finite, actuator-tolerance-valid successful-status "
-                    "candidate QP"
+            "failure_contract": {
+                "failure": HISTORICAL_FAILURE_DEFINITION,
+                "unrecoverable_infeasibility": (
+                    UNRECOVERABLE_INFEASIBLE_DEFINITION
                 ),
-                "action": (
-                    "project to exact actuator bounds, evaluate every original "
-                    "affine QP inequality, and reject the candidate if any "
-                    "scale-aware residual exceeds its declared tolerance"
-                ),
-                "osqp_absolute_tolerance": 1e-5,
-                "osqp_relative_tolerance": 1e-5,
-                "multi_backup_scs_fallback_absolute_tolerance": 1e-4,
-                "multi_backup_scs_fallback_relative_tolerance": 1e-4,
-                "drift_library_scs_absolute_tolerance": 1e-4,
-                "drift_library_scs_relative_tolerance": 1e-4,
             },
+            "control_contract": (
+                "apply the exact finite, dimension-valid, actuator-valid control "
+                "returned by the selected baseline"
+            ),
+            "timing": {
+                "scope": "solve_control_problem wall-clock time",
+                "candidate_execution": "sequential within each control step",
+                "warmup_calls_excluded_per_trial": 5,
+                "worker_count": max(1, int(args.num_workers)),
+            },
+            "policy_library_size": 4,
             "config": asdict(cfg),
             "summary": summary_rows,
             "trials": {

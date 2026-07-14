@@ -95,17 +95,25 @@ uv run python examples/warehouse/benchmark_additional_baselines_quad.py \
   --num-angle-policies 64 --num-workers 8
 ```
 
-The main failure column preserves the historical definition: physical
-collision or unrecoverable infeasibility/runtime failure. Certificate loss and
-candidate-QP failure are separate diagnostics. When either diagnostic occurs,
-the benchmark applies the selected baseline's returned finite, bounded control
-unchanged and continues. Solve exceptions, invalid controls, and simulator
-errors terminate the trial as unrecoverable.
+The live benchmark outputs are intentionally table-oriented: they retain the
+seeded scenario geometry, collision and unrecoverable-infeasibility flags, the
+historical failure value, and the timing numerator and denominator. The main
+failure column is exactly physical collision or unrecoverable
+infeasibility/runtime failure. The simulator always applies the selected
+baseline's returned finite, bounded control unchanged; solve exceptions,
+invalid controls, and simulator errors terminate the trial as unrecoverable.
 
-For publication timing, rerun each command separately with one worker and a
-small trial count. Both drivers exclude warm-up calls from timing. † MB-CBF-MI
-uses a sampled terminal proxy rather than a proven control-invariant terminal
-set, so it does not inherit the formal guarantee of Chen et al.
+For tentative timing, run the same drivers with one worker and a small trial
+count, for example `--num-runs 3 --num-workers 1` for drift and
+`--num-trials 3 --num-workers 1` for Warehouse. Both drivers exclude their
+documented warm-up calls. Timing should be compared between the two new
+baselines only unless PL-CBF is rerun under the same protocol. The verbose
+projection-audit artifacts in
+`output/additional_baselines/projection_audited_baseline_only_2026-07-14/`
+remain frozen and are exactly reproducible from the ancestor commit recorded in
+their manifest. † MB-CBF-MI uses a sampled terminal proxy rather than a proven
+control-invariant terminal set, so it does not inherit the formal guarantee of
+Chen et al.
 
 ## Useful Options
 

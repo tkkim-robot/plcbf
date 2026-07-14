@@ -12,6 +12,59 @@ from examples.warehouse import benchmark_additional_baselines_quad as warehouse
 
 
 EXPECTED_KEYS = {"multi_backup_cbf_mi", "library_pcbf_mi"}
+DRIFT_TRIAL_FIELDS = {
+    "algorithm",
+    "seed",
+    "run_idx",
+    "obstacle_geometry",
+    "library_size",
+    "collision",
+    "unrecoverable_infeasible",
+    "historical_failure",
+    "total_steps",
+    "timed_steps",
+    "solve_time_sum_sec",
+}
+DRIFT_SUMMARY_FIELDS = {
+    "key",
+    "label",
+    "n",
+    "fail_count",
+    "fail_rate",
+    "collision_count",
+    "collision_rate",
+    "unrecoverable_count",
+    "unrecoverable_rate",
+    "total_timed_steps",
+    "mean_compute_ms",
+}
+WAREHOUSE_TRIAL_FIELDS = {
+    "algorithm",
+    "seed",
+    "run_idx",
+    "obstacle_geometry",
+    "library_size",
+    "collision",
+    "unrecoverable_infeasible",
+    "historical_failure",
+    "solve_time_sum_sec",
+    "timed_steps",
+    "total_steps",
+}
+WAREHOUSE_SUMMARY_FIELDS = {
+    "key",
+    "label",
+    "n_trials",
+    "library_size",
+    "collisions",
+    "unrecoverable_infeasibles",
+    "fail_count",
+    "collision_rate_pct",
+    "unrecoverable_infeasible_rate_pct",
+    "fail_rate_pct",
+    "avg_compute_ms",
+    "total_timed_steps",
+}
 ROOT = Path(__file__).resolve().parents[1]
 PUBLICATION_DIRECTORY = (
     ROOT
@@ -149,30 +202,13 @@ def _drift_result(variant, scenario):
         seed=scenario.seed,
         run_idx=scenario.run_idx,
         obstacle_geometry=list(scenario.obstacles),
-        P_or_library_size=4,
+        library_size=4,
         collision=False,
-        infeasible=False,
         unrecoverable_infeasible=False,
         historical_failure=False,
-        certificate_lost=True,
-        qp_infeasible=False,
-        runtime_error=False,
-        reached_goal=False,
-        survived_horizon=True,
-        task_completed=False,
-        completed_or_survived=True,
-        filter_failure=True,
-        union_failure=True,
         total_steps=1,
         timed_steps=1,
-        mean_compute_ms=1.0,
-        median_compute_ms=1.0,
-        p95_compute_ms=1.0,
-        max_compute_ms=1.0,
-        nominal_tracking_fraction=0.0,
-        mean_intervention_l2=1.0,
-        max_intervention_l2=1.0,
-        policy_switch_count=0,
+        solve_time_sum_sec=0.001,
     )
 
 
@@ -204,31 +240,34 @@ def test_drift_writer_emits_only_two_baseline_keys(tmp_path, monkeypatch):
     assert set(payload["algorithms"]) == EXPECTED_KEYS
     assert set(payload["trials"]) == EXPECTED_KEYS
     assert {row["key"] for row in payload["summary"]} == EXPECTED_KEYS
+    assert all(
+        set(row) == DRIFT_SUMMARY_FIELDS for row in payload["summary"]
+    )
+    assert all(
+        set(trial) == DRIFT_TRIAL_FIELDS
+        for trials in payload["trials"].values()
+        for trial in trials
+    )
     with paths["csv"].open(newline="") as stream:
-        assert {row["algorithm"] for row in csv.DictReader(stream)} == EXPECTED_KEYS
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+    assert set(reader.fieldnames or ()) == DRIFT_TRIAL_FIELDS
+    assert {row["algorithm"] for row in rows} == EXPECTED_KEYS
 
 
 def _warehouse_result(algo, scenario):
     return warehouse.TrialResult(
-        collision=False,
-        infeasible=False,
-        unrecoverable_infeasible=False,
-        historical_failure=False,
-        reached_goal=False,
-        nominal_tracking_pct=0.0,
-        solve_time_sum_sec=0.001,
-        timed_steps=1,
-        total_steps=1,
         algorithm=algo,
         seed=scenario.seed,
         run_idx=scenario.run_idx,
         obstacle_geometry=list(scenario.ghosts),
-        p_or_library_size=66,
-        certificate_lost=True,
-        survived_horizon=True,
-        completed_or_survived=True,
-        filter_failure=True,
-        union_failure=True,
+        library_size=66,
+        collision=False,
+        unrecoverable_infeasible=False,
+        historical_failure=False,
+        solve_time_sum_sec=0.001,
+        timed_steps=1,
+        total_steps=1,
     )
 
 
@@ -263,8 +302,19 @@ def test_warehouse_writer_emits_only_two_baseline_keys(tmp_path, monkeypatch):
     assert set(payload["algorithms"]) == EXPECTED_KEYS
     assert set(payload["trials"]) == EXPECTED_KEYS
     assert {row["key"] for row in payload["summaries"]} == EXPECTED_KEYS
+    assert all(
+        set(row) == WAREHOUSE_SUMMARY_FIELDS for row in payload["summaries"]
+    )
+    assert all(
+        set(trial) == WAREHOUSE_TRIAL_FIELDS
+        for trials in payload["trials"].values()
+        for trial in trials
+    )
     with paths["csv"].open(newline="") as stream:
-        assert {row["algorithm"] for row in csv.DictReader(stream)} == EXPECTED_KEYS
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+    assert set(reader.fieldnames or ()) == WAREHOUSE_TRIAL_FIELDS
+    assert {row["algorithm"] for row in rows} == EXPECTED_KEYS
 
 
 def test_superseded_directory_is_labeled_common_stop_audit():

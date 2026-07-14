@@ -785,54 +785,59 @@ def test_multi_backup_candidate_rejects_failed_post_projection_audit(monkeypatch
     assert result.error == "post-projection constraint audit failed"
 
 
-def test_certificate_loss_does_not_increment_historical_failure(monkeypatch):
+def test_compact_benchmark_aggregate_reports_failure_and_timing(monkeypatch):
     variant = next(
         variant
         for variant in benchmark.make_variants()
         if variant.key == "library_pcbf_mi"
     )
-    scenario = benchmark.Scenario(0, 11, 1, ((80.0, "middle"),))
-    failure = SimpleNamespace(
-        collision=False,
-        infeasible=False,
-        historical_failure=False,
-        certificate_lost=True,
-        qp_infeasible=False,
-        runtime_error=False,
-        task_completed=True,
-        survived_horizon=True,
-        completed_or_survived=True,
-        filter_failure=True,
-        union_failure=True,
-        nominal_tracking_pct=0.0,
-        mean_compute_ms=1.0,
-        timed_steps=1,
-    )
-    monkeypatch.setattr(benchmark, "run_episode", lambda *args, **kwargs: failure)
-    summary, _ = benchmark.aggregate_results(
-        [variant], [scenario], benchmark.SimConfig()
-    )
-    assert summary[0]["fail_count"] == 0
-    assert summary[0]["infeasible_count"] == 0
-    assert summary[0]["certificate_lost_count"] == 1
-
-
-def test_benchmark_does_not_double_count_qp_failure_with_certificate_loss():
-    variant = benchmark.AlgoVariant(
-        "library_pcbf_mi", "Lib-PCBF-MI", "library_pcbf_mi"
-    )
-    status = {
-        "status": "qp_failed_after_certificate_loss",
-        "certificate_lost": True,
-        "qp_infeasible": True,
-        "fallback_applied": True,
+    scenarios = [
+        benchmark.Scenario(0, 11, 1, ((80.0, "middle"),)),
+        benchmark.Scenario(1, 11, 1, ((82.0, "left"),)),
+    ]
+    results = {
+        0: benchmark.EpisodeResult(
+            algorithm=variant.key,
+            seed=11,
+            run_idx=0,
+            obstacle_geometry=[(80.0, "middle")],
+            library_size=4,
+            collision=True,
+            unrecoverable_infeasible=False,
+            historical_failure=True,
+            total_steps=2,
+            timed_steps=2,
+            solve_time_sum_sec=0.004,
+        ),
+        1: benchmark.EpisodeResult(
+            algorithm=variant.key,
+            seed=11,
+            run_idx=1,
+            obstacle_geometry=[(82.0, "left")],
+            library_size=4,
+            collision=False,
+            unrecoverable_infeasible=True,
+            historical_failure=True,
+            total_steps=1,
+            timed_steps=1,
+            solve_time_sum_sec=0.003,
+        ),
     }
-    assert benchmark.classify_baseline_status(variant, object(), status) == (
-        True,
-        False,
-        False,
-        True,
+    monkeypatch.setattr(
+        benchmark,
+        "run_episode",
+        lambda unused_variant, scenario, unused_config, verbose=False: results[
+            scenario.run_idx
+        ],
     )
+    summary, _ = benchmark.aggregate_results(
+        [variant], scenarios, benchmark.SimConfig()
+    )
+    assert summary[0]["fail_count"] == 2
+    assert summary[0]["collision_count"] == 1
+    assert summary[0]["unrecoverable_count"] == 1
+    assert summary[0]["total_timed_steps"] == 3
+    assert summary[0]["mean_compute_ms"] == pytest.approx(7.0 / 3.0)
 
 
 @pytest.mark.parametrize("event_kind", ["certificate_lost", "qp_infeasible"])
@@ -895,33 +900,16 @@ def test_benchmark_applies_exact_returned_control_after_diagnostic_event(
             self.calls = 0
             self.u_min = np.array([-1.0, -8000.0], dtype=float)
             self.u_max = np.array([1.0, 8000.0], dtype=float)
+            self.status = (
+                "certificate_lost_no_backup_candidate"
+                if event_kind == "certificate_lost"
+                else "qp_infeasible_no_backup_candidate"
+            )
+            self.runtime_error = False
 
         def solve_control_problem(self, *args, **kwargs):
             self.calls += 1
             return returned_control.reshape(-1, 1).copy()
-
-        def get_status(self):
-            is_certificate_loss = event_kind == "certificate_lost"
-            return {
-                "status": (
-                    "certificate_lost_no_backup_candidate"
-                    if is_certificate_loss
-                    else "qp_infeasible_no_backup_candidate"
-                ),
-                "certificate_lost": is_certificate_loss,
-                "qp_infeasible": not is_certificate_loss,
-                "infeasible": not is_certificate_loss,
-                "fallback_applied": False,
-                "best_policy": None,
-            }
-
-        @staticmethod
-        def get_metrics():
-            return {}
-
-        @staticmethod
-        def _emergency_control(unused_state):
-            return np.zeros(2, dtype=float)
 
     env = StubEnv()
     car = StubCar()
@@ -953,20 +941,6 @@ def test_benchmark_applies_exact_returned_control_after_diagnostic_event(
         np.array_equal(control, returned_control) for control in simulator.controls
     )
     assert result.total_steps == n_steps
-    assert result.certificate_lost is (event_kind == "certificate_lost")
-    assert result.certificate_loss_steps == (
-        n_steps if event_kind == "certificate_lost" else 0
-    )
-    assert result.qp_infeasible is (event_kind == "qp_infeasible")
-    assert result.qp_infeasible_steps == (
-        n_steps if event_kind == "qp_infeasible" else 0
-    )
     assert result.collision is False
-    assert result.infeasible is False
+    assert result.unrecoverable_infeasible is False
     assert result.historical_failure is False
-    assert result.fallback_steps == 0
-    assert result.survived_horizon is True
-    assert result.task_completed is False
-    assert result.completed_or_survived is True
-    assert result.filter_failure is True
-    assert result.union_failure is True

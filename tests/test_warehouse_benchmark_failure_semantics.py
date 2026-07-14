@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -56,6 +55,7 @@ class _FakeNominal:
 class _FakeShield:
     def __init__(self, *, event: str | None = None, returned=DISTINCTIVE_CONTROL):
         self.calls = 0
+        self.metrics_calls = 0
         self.event = event
         self.returned = returned
         self.runtime_error = False
@@ -72,6 +72,7 @@ class _FakeShield:
         return self.returned
 
     def get_last_step_metrics(self):
+        self.metrics_calls += 1
         active_event = self.event if self.calls == 1 else None
         return {
             "selected_policy": None if active_event else "policy_0",
@@ -109,7 +110,6 @@ def _run(*, shield, max_steps=3, collide=False):
             alpha=6.0,
             max_steps=max_steps,
             jit_warmup_steps=0,
-            tracking_tol=0.1,
             num_angle_policies=64,
         )
     return result, robot
@@ -122,40 +122,21 @@ def test_registry_contains_only_two_additional_baselines():
     )
 
 
-def test_certificate_and_qp_events_are_disjoint_and_fallback_is_explicit():
-    empty = SimpleNamespace(certificate_lost=True)
-    assert benchmark._step_failure_events(
-        {
-            "num_steps_with_no_certified_rollout": 1,
-            "num_steps_with_no_feasible_qp": 0,
-        },
-        empty,
-    ) == (True, False, False)
-    assert benchmark._step_failure_events(
-        {
-            "num_steps_with_no_certified_rollout": 0,
-            "num_steps_with_no_feasible_qp": 1,
-            "fallback_used": True,
-        },
-        empty,
-    ) == (False, True, True)
-
-
 @pytest.mark.parametrize("event", ["certificate_lost", "qp_infeasible"])
-def test_diagnostic_event_applies_exact_returned_control_and_continues(event):
-    result, robot = _run(shield=_FakeShield(event=event))
+def test_controller_status_applies_exact_returned_control_and_continues(event):
+    shield = _FakeShield(event=event)
+    result, robot = _run(shield=shield)
 
     assert len(robot.controls) == 3
     assert all(
         np.array_equal(control, DISTINCTIVE_CONTROL) for control in robot.controls
     )
-    assert result.certificate_lost is (event == "certificate_lost")
-    assert result.qp_infeasible is (event == "qp_infeasible")
-    assert result.infeasible is False
+    assert shield.calls == 3
+    assert shield.metrics_calls == 0
+    assert result.collision is False
     assert result.unrecoverable_infeasible is False
     assert result.historical_failure is False
-    assert result.survived_horizon is True
-    assert result.fallback_steps == 0
+    assert result.total_steps == 3
 
 
 @pytest.mark.parametrize(
@@ -173,37 +154,69 @@ def test_unrecoverable_control_failure_terminates_without_simulator_step(returne
     result, robot = _run(shield=_FakeShield(returned=returned))
 
     assert robot.controls == []
-    assert result.runtime_error is True
-    assert result.infeasible is True
+    assert result.collision is False
     assert result.unrecoverable_infeasible is True
     assert result.historical_failure is True
     assert result.total_steps == 0
 
 
-def test_summary_main_failure_ignores_certificate_and_union_diagnostics():
-    trial = benchmark.TrialResult(
-        collision=False,
-        infeasible=False,
-        unrecoverable_infeasible=False,
-        historical_failure=False,
-        reached_goal=False,
-        nominal_tracking_pct=100.0,
-        solve_time_sum_sec=0.003,
-        timed_steps=3,
-        total_steps=3,
-        certificate_lost=True,
-        survived_horizon=True,
-        completed_or_survived=True,
-        filter_failure=True,
-        union_failure=True,
-        p_or_library_size=66,
+def test_summary_reports_failure_identity_and_aggregate_timing():
+    trials = [
+        benchmark.TrialResult(
+            algorithm="library_pcbf_mi",
+            seed=11,
+            run_idx=0,
+            obstacle_geometry=[],
+            library_size=66,
+            collision=False,
+            unrecoverable_infeasible=False,
+            historical_failure=False,
+            solve_time_sum_sec=0.003,
+            timed_steps=3,
+            total_steps=3,
+        ),
+        benchmark.TrialResult(
+            algorithm="library_pcbf_mi",
+            seed=12,
+            run_idx=1,
+            obstacle_geometry=[],
+            library_size=66,
+            collision=True,
+            unrecoverable_infeasible=False,
+            historical_failure=True,
+            solve_time_sum_sec=0.002,
+            timed_steps=2,
+            total_steps=2,
+        ),
+        benchmark.TrialResult(
+            algorithm="library_pcbf_mi",
+            seed=13,
+            run_idx=2,
+            obstacle_geometry=[],
+            library_size=66,
+            collision=False,
+            unrecoverable_infeasible=True,
+            historical_failure=True,
+            solve_time_sum_sec=0.001,
+            timed_steps=1,
+            total_steps=1,
+        ),
+    ]
+    assert all(
+        trial.historical_failure
+        == (trial.collision or trial.unrecoverable_infeasible)
+        for trial in trials
     )
     summary = benchmark.summarize_trials(
-        benchmark.AlgoSpec("library_pcbf_mi", "Lib-PCBF-MI"), [trial]
+        benchmark.AlgoSpec("library_pcbf_mi", "Lib-PCBF-MI"), trials
     )
-    assert summary.fail_count == 0
-    assert summary.union_failures == 1
-    assert summary.certificate_losses == 1
+    assert summary.n_trials == 3
+    assert summary.library_size == 66
+    assert summary.collisions == 1
+    assert summary.unrecoverable_infeasibles == 1
+    assert summary.fail_count == 2
+    assert summary.total_timed_steps == 6
+    assert summary.avg_compute_ms == pytest.approx(1.0)
 
 
 def test_collision_causing_action_is_applied_and_sets_historical_failure():
@@ -212,5 +225,8 @@ def test_collision_causing_action_is_applied_and_sets_historical_failure():
     assert len(robot.controls) == 1
     assert np.array_equal(robot.controls[0], DISTINCTIVE_CONTROL)
     assert result.collision is True
+    assert result.unrecoverable_infeasible is False
     assert result.total_steps == 1
-    assert result.historical_failure is True
+    assert result.historical_failure is (
+        result.collision or result.unrecoverable_infeasible
+    )

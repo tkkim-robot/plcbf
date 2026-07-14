@@ -72,19 +72,6 @@ class _Shield:
             raise self.returned
         return self.returned
 
-    @staticmethod
-    def get_status():
-        return {
-            "certificate_lost": False,
-            "qp_infeasible": False,
-            "runtime_error": False,
-            "fallback_applied": False,
-        }
-
-    @staticmethod
-    def get_metrics():
-        return {}
-
 
 def _run(monkeypatch, returned):
     config = replace(benchmark.SimConfig(), tf=0.1, dt=0.05)
@@ -126,8 +113,6 @@ def test_invalid_or_failed_control_is_unrecoverable(monkeypatch, returned):
     result, simulator = _run(monkeypatch, returned)
 
     assert simulator.controls == []
-    assert result.runtime_error is True
-    assert result.infeasible is True
     assert result.unrecoverable_infeasible is True
     assert result.historical_failure is True
     assert result.total_steps == 0
