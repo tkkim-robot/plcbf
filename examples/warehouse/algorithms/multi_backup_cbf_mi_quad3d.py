@@ -1,38 +1,4 @@
-"""Benchmark-adapted multi-backup CBF for the Quad3D benchmark.
-
-This module implements the minimum-intervention multiple-backup strategy used
-for the MB-CBF-MI comparison.  It is intentionally additive: the repository's
-``BackupCBF`` and ``PLCBF_Quad3D`` implementations are not modified.
-
-Every policy is taken directly from ``PLCBF_Quad3D.policy_configs``.  One
-independent strict Backup-CBF candidate is maintained per policy, every
-candidate receives the same frozen nominal command and obstacle prediction,
-and the feasible solution with the smallest *realized Backup-CBF QP
-objective* is returned.  The candidates are evaluated sequentially so the
-reported wall time includes every rollout, constraint construction, and QP.
-
-To give every maneuver a common terminal equilibrium, each non-stop candidate
-is a compound backup strategy.  Under the 4 s benchmark default it executes
-its exact inherited PL-CBF policy for 2 s, then the exact inherited ``stop``
-policy for 2 s.  The ``stop`` candidate executes stop for the full horizon.
-
-Each policy is adapted directly to the repository's existing single-policy
-``BackupCBF`` rollout and QP implementation.  The generic implementation's
-terminal helper interprets state index 5 as speed for every non-double-
-integrator model, but index 5 is yaw for Quad3D.  This additive wrapper uses a
-warehouse-specific terminal envelope based on ``x[6:9]`` and verifies that the
-shared stop policy preserves that envelope for one additional integration step.
-That is an operational finite-horizon certificate, not a proof of
-infinite-horizon controlled invariance.
-
-The wrapper applies the configured safety margin consistently to its static
-and moving-obstacle rollout checks and also enforces the warehouse boundaries.
-This geometry is intentionally recorded because the historical PL-CBF
-certificate does not include the boundary term.
-
-This is a benchmark adaptation of Chen, Singletary, and Ames (2021), not a
-line-by-line reproduction of their multi-robot implementation.
-"""
+"""Multi-backup CBF with minimum-intervention selection for Quad3D."""
 
 from __future__ import annotations
 
@@ -65,8 +31,6 @@ _SCS_AUDIT_TOL = 1e-4
 
 @dataclass(frozen=True)
 class CandidateCBFResult:
-    """One strict Backup-CBF candidate result."""
-
     policy_name: str
     feasible: bool
     u: Optional[np.ndarray]
@@ -90,46 +54,7 @@ class CandidateCBFResult:
     solver_name: Optional[str] = None
 
 
-def _projection_step_metrics(results: Iterable[CandidateCBFResult]) -> Dict[str, object]:
-    """Return one step's aggregate post-projection audit diagnostics."""
-
-    results = tuple(results)
-    audited = [
-        result
-        for result in results
-        if result.post_projection_constraints_satisfied is not None
-    ]
-    projection_events = [result for result in audited if result.projection_occurred]
-    rejected = [
-        result
-        for result in audited
-        if result.post_projection_constraints_satisfied is False
-    ]
-    return {
-        "num_post_projection_audits": len(audited),
-        "projection_occurred": bool(projection_events),
-        "projection_event_count": len(projection_events),
-        "post_projection_rejection_count": len(rejected),
-        "max_projection_delta_inf": max(
-            (result.projection_delta_inf for result in audited), default=0.0
-        ),
-        "max_post_projection_constraint_violation": max(
-            (
-                result.max_post_projection_constraint_violation or 0.0
-                for result in audited
-            ),
-            default=0.0,
-        ),
-        "max_post_projection_violation_ratio": max(
-            (result.max_post_projection_violation_ratio or 0.0 for result in audited),
-            default=0.0,
-        ),
-    }
-
-
 class _FrozenGhostPredictor:
-    """Stateless snapshot of the warehouse predictor used by BackupCBF."""
-
     def __init__(self, obstacles: Iterable[dict]):
         active = [dict(obs) for obs in obstacles if obs.get("active", True)]
         self._obstacles = tuple(active)
@@ -182,16 +107,6 @@ class _FrozenGhostPredictor:
 
 
 class _QuadPolicyAdapter:
-    """BackupCBF adapter for a compound PL-CBF-policy/stop strategy.
-
-    Non-stop candidates execute their exact policy during the configured
-    maneuver prefix, then execute the exact ``stop`` entry from the same
-    runtime policy library.  The stop candidate executes stop throughout.
-    Rollout phase is set explicitly by the candidate integrator, rather than
-    inferred from controller-call count, so finite-difference evaluations do
-    not advance the strategy.
-    """
-
     def __init__(self, policy_name: str, policy_type: str, params):
         self.policy_name = policy_name
         self.policy_type = policy_type
@@ -227,14 +142,10 @@ class _QuadPolicyAdapter:
         )
 
     def prepare_rollout(self, state) -> None:
-        # All state needed by the controller is immutable in ``params``.  This
-        # explicit no-op prevents candidate order from changing controller state.
         del state
         self._rollout_step = 0
 
     def compute_terminal_stop_control(self, state):
-        """Evaluate the shared exact stop policy without mutating phase."""
-
         if self._stop_params is None:
             raise RuntimeError(f"No stop-tail policy configured for {self.policy_name}")
         return self._compute_control_for("stop", self._stop_params, state)
@@ -251,12 +162,6 @@ class _QuadPolicyAdapter:
 
     @staticmethod
     def _compute_control_for(policy_type: str, params, state):
-        # BackupCBF evaluates the controller O(horizon * state_dimension)
-        # times while finite-differencing its sensitivity.  Calling the JAX
-        # wrapper for each scalar perturbation adds dispatch overhead but no
-        # algorithmic value, so use the exact policy equations and the exact
-        # inherited parameter objects in NumPy here.  Focused regression tests
-        # compare these controls against the JAX policy implementations.
         x = np.asarray(state, dtype=float).reshape(-1)
         ctrl = params.ctrl
 
@@ -342,7 +247,7 @@ class _QuadPolicyAdapter:
             ax = float(params.Kp) * (desired_velocity[0] - x[6])
             ay = float(params.Kp) * (desired_velocity[1] - x[7])
             ax, ay = clip_xy(ax, ay)
-        else:  # Fail loudly instead of silently substituting another policy.
+        else:
             raise ValueError(
                 f"Unsupported Quad3D PL-CBF policy type {policy_type!r}"
             )
@@ -351,24 +256,8 @@ class _QuadPolicyAdapter:
 
 
 class _StrictBackupCBFCandidate(BackupCBF):
-    """BackupCBF candidate with observable solver feasibility.
-
-    ``BackupCBF.solve_control_problem`` intentionally falls back to nominal or
-    backup control on a failed QP.  That behavior is appropriate for the
-    existing baseline, but it cannot be used to decide which candidate QPs are
-    feasible.  This subclass reuses all inherited rollout, sensitivity,
-    barrier, terminal-set, and dynamics helpers and exposes a strict candidate
-    solve with the same QP scaling/objective/solvers.  A candidate enters the
-    sampled certified-candidate set, analogous to Chen et al.'s active set,
-    only when its compound rollout and warehouse-specific terminal envelope
-    are both certified.  Uncertified
-    candidates return before any QP is constructed.
-    """
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Include both t=0 and the terminal sample at t=T without depending on
-        # the developer worktree's uncommitted safe_control sample-count edit.
         self.N = int(np.ceil(self.backup_horizon / self.dt)) + 1
 
     def configure_terminal_proxy(
@@ -412,8 +301,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return next_state
 
     def _integrate_state_trajectory(self, x0):
-        """Roll out candidate states without constructing sensitivities."""
-
         phi = np.zeros((self.N, self.n_states))
         state = np.asarray(x0, dtype=float).reshape(-1).copy()
         phi[0] = state
@@ -427,8 +314,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return phi
 
     def _compute_rollout_sensitivities(self, phi):
-        """Build finite-difference sensitivities only for a certified rollout."""
-
         sensitivities = np.zeros((self.N, self.n_states, self.n_states))
         sensitivity = np.eye(self.n_states)
         sensitivities[0] = sensitivity
@@ -438,8 +323,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
             state = np.asarray(phi[step - 1], dtype=float)
             next_state = np.asarray(phi[step], dtype=float)
             if hasattr(self.backup_controller, "set_rollout_step"):
-                # Every finite-difference evaluation sees the same compound-
-                # strategy phase as the nominal rollout transition.
                 self.backup_controller.set_rollout_step(step - 1)
             discrete_jacobian = np.zeros((self.n_states, self.n_states))
             for state_index in range(self.n_states):
@@ -460,8 +343,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return sensitivities
 
     def _integrate_backup_trajectory(self, x0):
-        """Compatibility interface matching the inherited BackupCBF method."""
-
         phi = self._integrate_state_trajectory(x0)
         return phi, self._compute_rollout_sensitivities(phi)
 
@@ -481,8 +362,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         self._static_radius = np.asarray(static_radius, dtype=float)
 
     def _h_safety(self, x, t=0.0):
-        """Vectorized equivalent of BackupCBF's warehouse safety value."""
-
         if self.env is None or not (
             hasattr(self.env, "width") and hasattr(self.env, "height")
         ):
@@ -536,14 +415,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return float(min(values))
 
     def _grad_h_safety(self, x, t=0.0, h0=None):
-        """Exact parent finite difference, exploiting Quad3D sparsity.
-
-        The inherited warehouse safety function depends only on planar
-        position.  Perturbing the other ten state coordinates returns exactly
-        zero, so skipping those redundant obstacle scans preserves the parent
-        result while keeping the P=64 benchmark tractable.
-        """
-
         eps = 1e-5
         state = np.asarray(x, dtype=float).reshape(-1)
         gradient = np.zeros(self.n_states)
@@ -557,8 +428,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
     def _near_hover_components(
         self, state: np.ndarray, time_value: float, prefix: str = ""
     ) -> Dict[str, float]:
-        """Margins for the explicit sampled near-hover terminal proxy."""
-
         angles = (state[3:6] + np.pi) % (2.0 * np.pi) - np.pi
         z_ref = float(self.robot_spec.get("z_ref", 0.0))
         return {
@@ -574,22 +443,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         }
 
     def _terminal_envelope_components(self, x) -> Dict[str, float]:
-        """Evaluate the compound strategy's near-hover terminal proxy.
-
-        All candidates have already switched to the exact shared stop policy
-        before reaching this state.  The proxy requires terminal safety,
-        near-zero linear velocity ``x[6:9]``, near-level attitude ``x[3:6]``,
-        low angular rates ``x[9:12]``, and small altitude error.  It also
-        applies one more exact stop-policy step and requires the successor to
-        satisfy the same margins.
-
-        This sampled terminal-equilibrium check addresses the generic base
-        class's yaw-as-speed bug and rules out nonzero-speed angle equilibria.
-        Because moving obstacles continue beyond the finite prediction and the
-        check covers one successor sample, it is not an infinite-horizon
-        controlled-invariance guarantee.
-        """
-
         state = np.asarray(x, dtype=float).reshape(-1)
         if state.shape != (self.n_states,):
             raise ValueError(
@@ -629,8 +482,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return components
 
     def _h_terminal(self, x):
-        """Warehouse-specific, velocity-aware terminal certificate value."""
-
         components = self._terminal_envelope_components(x)
         values = np.asarray(tuple(components.values()), dtype=float)
         if not np.all(np.isfinite(values)):
@@ -638,14 +489,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
         return float(np.min(values))
 
     def _grad_h_terminal(self, x, h0=None):
-        """Finite-difference gradient of the candidate-specific terminal value.
-
-        The one-step successor includes the state-dependent backup policy, so
-        the terminal value can depend on any Quad3D coordinate.  Retaining all
-        twelve finite-difference columns is necessary here; the planar
-        sparsity optimization used for ``_grad_h_safety`` does not apply.
-        """
-
         eps = 1e-5
         state = np.asarray(x, dtype=float).reshape(-1)
         gradient = np.zeros(self.n_states)
@@ -972,15 +815,6 @@ class _StrictBackupCBFCandidate(BackupCBF):
 
 
 class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
-    """Multi-Backup CBF with compound maneuver/stop backup strategies.
-
-    The 4 s benchmark defaults allocate 2 s to the selected maneuver and 2 s
-    to the common stop tail.  The sampled near-hover proxy defaults are
-    0.5 m/s linear speed, 0.4 rad attitude norm, 0.5 rad/s angular-rate norm,
-    and 0.25 m altitude error.  They are explicit comparison configuration,
-    not separately tuned per candidate.
-    """
-
     algorithm_key = "multi_backup_cbf_mi"
     table_name = "MB-CBF-MI"
 
@@ -1017,8 +851,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
             if not np.isfinite(value) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
 
-        # The parent is used as the single source of truth for the runtime
-        # policy dictionary.  Its PCBF solve path is never called here.
         super().__init__(
             robot_spec=robot_spec,
             dt=dt,
@@ -1048,9 +880,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
         self.runtime_error = False
         self.infeasible = False
         self.fallback_applied = False
-        self._last_selected_policy: Optional[str] = None
-        self._last_candidate_results: Tuple[CandidateCBFResult, ...] = tuple()
-        self._last_step_metrics: Dict[str, object] = {}
 
         self._candidate_adapters: "OrderedDict[str, _QuadPolicyAdapter]" = OrderedDict()
         self._candidate_filters: "OrderedDict[str, _StrictBackupCBFCandidate]" = OrderedDict()
@@ -1086,20 +915,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
     def policy_names(self) -> Tuple[str, ...]:
         return tuple(self.policy_configs.keys())
 
-    def get_terminal_config(self) -> Dict[str, float | int]:
-        """Return the compound-strategy and sampled terminal-proxy settings."""
-
-        return {
-            "maneuver_prefix_sec": self.maneuver_prefix_sec,
-            "maneuver_prefix_steps": self.maneuver_prefix_steps,
-            "terminal_tail_sec": self.terminal_tail_sec,
-            "terminal_linear_speed_tol": self.terminal_linear_speed_tol,
-            "terminal_attitude_tol": self.terminal_attitude_tol,
-            "terminal_angular_rate_tol": self.terminal_angular_rate_tol,
-            "terminal_altitude_error_tol": self.terminal_altitude_error_tol,
-            "terminal_successor_steps": 1,
-        }
-
     def _assert_library_alignment(self) -> None:
         expected = tuple(self.policy_configs.keys())
         if tuple(self._candidate_adapters.keys()) != expected:
@@ -1112,57 +927,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
                 raise AssertionError(f"Policy parameters were reconstructed for {name}")
             if adapter._maneuver_prefix_steps != self.maneuver_prefix_steps:
                 raise AssertionError(f"Stop-tail switch differs for {name}")
-
-    def assert_library_equal_to(self, plcbf: PLCBF_Quad3D) -> None:
-        """Regression assertion against an independently created PL-CBF."""
-        if tuple(plcbf.policy_configs.keys()) != self.policy_names:
-            raise AssertionError("Policy names/order differ from PL-CBF")
-        for field in (
-            "num_angle_policies",
-            "dt",
-            "backup_horizon",
-            "eval_horizon_steps",
-            "safety_margin",
-        ):
-            if getattr(self, field) != getattr(plcbf, field):
-                raise AssertionError(f"PL-CBF configuration differs for {field!r}")
-        for name in self.policy_names:
-            own_type, own_params = self.policy_configs[name]
-            ref_type, ref_params = plcbf.policy_configs[name]
-            if own_type != ref_type:
-                raise AssertionError(f"Policy type mismatch for {name}")
-            # NamedTuple equality with JAX arrays is ambiguous, so compare the
-            # deterministic textual tree structure and every numeric leaf.
-            import jax
-
-            own_tree = jax.tree_util.tree_flatten(own_params)
-            ref_tree = jax.tree_util.tree_flatten(ref_params)
-            if own_tree[1] != ref_tree[1] or len(own_tree[0]) != len(ref_tree[0]):
-                raise AssertionError(f"Policy parameter structure mismatch for {name}")
-            for own_leaf, ref_leaf in zip(own_tree[0], ref_tree[0]):
-                if not np.array_equal(np.asarray(own_leaf), np.asarray(ref_leaf)):
-                    raise AssertionError(f"Policy parameter mismatch for {name}")
-
-        for name, candidate in self._candidate_filters.items():
-            if candidate.dt != self.dt or candidate.backup_horizon != self.backup_horizon:
-                raise AssertionError(f"Backup-CBF horizon differs for {name}")
-            if candidate.alpha != self.cbf_alpha:
-                raise AssertionError(f"Backup-CBF alpha differs for {name}")
-            if candidate.alpha_terminal != self.terminal_alpha:
-                raise AssertionError(f"Backup-CBF terminal alpha differs for {name}")
-            if candidate.safety_margin != self.safety_margin:
-                raise AssertionError(f"Backup-CBF safety margin differs for {name}")
-            if candidate.terminal_linear_speed_tol != self.terminal_linear_speed_tol:
-                raise AssertionError(f"Terminal linear-speed tolerance differs for {name}")
-            if candidate.terminal_attitude_tol != self.terminal_attitude_tol:
-                raise AssertionError(f"Terminal attitude tolerance differs for {name}")
-            if candidate.terminal_angular_rate_tol != self.terminal_angular_rate_tol:
-                raise AssertionError(f"Terminal angular-rate tolerance differs for {name}")
-            if (
-                candidate.terminal_altitude_error_tol
-                != self.terminal_altitude_error_tol
-            ):
-                raise AssertionError(f"Terminal altitude tolerance differs for {name}")
 
     def set_environment(self, env) -> None:
         super().set_environment(env)
@@ -1197,8 +961,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
     def _select_minimum_intervention(
         self, results: Iterable[CandidateCBFResult]
     ) -> Optional[CandidateCBFResult]:
-        """Select by realized objective, then by fixed library index."""
-
         policy_index = {name: index for index, name in enumerate(self.policy_names)}
         feasible = [result for result in results if result.feasible]
         if not feasible:
@@ -1215,7 +977,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
         return best
 
     def solve_control_problem(self, state, control_ref=None):
-        step_started = time.perf_counter()
         self.runtime_error = False
         u_nom = np.zeros(4, dtype=float)
         if control_ref is not None and "u_ref" in control_ref:
@@ -1248,7 +1009,6 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
         candidate_evaluation_error_count = sum(
             int(result.solver_status == "error") for result in candidate_results
         )
-        self._last_candidate_results = tuple(candidate_results)
         self.runtime_error = bool(
             candidate_evaluation_error_count and not feasible
         )
@@ -1260,109 +1020,19 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
         self.fallback_applied = not feasible
 
         if not feasible:
-            self._last_selected_policy = None
-            self._last_step_metrics = {
-                "selected_policy": None,
-                "intervention_l2": float("nan"),
-                "num_candidate_qps_solved": sum(
-                    int(result.qp_solved) for result in candidate_results
-                ),
-                "num_safe_candidates": sum(
-                    int(result.rollout_safe is True) for result in candidate_results
-                ),
-                "num_qp_feasible_candidates": 0,
-                "num_certified_backup_candidates": len(certified),
-                "num_steps_with_no_safe_policy": int(
-                    not certified and not self.runtime_error
-                ),
-                "num_steps_with_no_certified_rollout": int(
-                    not certified and not self.runtime_error
-                ),
-                "num_steps_with_no_feasible_qp": int(
-                    bool(certified) and not self.runtime_error
-                ),
-                "num_feasible_backup_candidates": 0,
-                "certificate_lost": self.certificate_lost,
-                "qp_infeasible": self.qp_infeasible,
-                "runtime_error": self.runtime_error,
-                "candidate_evaluation_error_count": (
-                    candidate_evaluation_error_count
-                ),
-                "fallback_used": True,
-                "terminal_failure_count": sum(
-                    int(result.terminal_safe is False) for result in candidate_results
-                ),
-                **_projection_step_metrics(candidate_results),
-                "compute_time_sec": time.perf_counter() - step_started,
-            }
             if self.runtime_error:
                 raise RuntimeError(
                     "MB-CBF-MI candidate evaluation failed; certificate status "
                     "is unknown"
                 )
-            # Return this baseline's shared-library stop action as its
-            # observable emergency result.
             emergency = self._candidate_adapters["stop"].compute_control(state)
             limit = float(self.robot_spec.get("u_max", 10.0))
             return np.clip(np.asarray(emergency, dtype=float), -limit, limit)
 
         best = self._select_minimum_intervention(candidate_results)
-        if best is None:  # Kept explicit for static type checkers.
+        if best is None:
             raise AssertionError("feasible candidate set unexpectedly became empty")
-
-        previous = self._last_selected_policy
-        self._last_selected_policy = best.policy_name
-        self._last_step_metrics = {
-            "selected_policy": best.policy_name,
-            "policy_switched": previous is not None and previous != best.policy_name,
-            "intervention_l2": float(np.linalg.norm(best.u - u_nom)),
-            "intervention_objective": best.objective,
-            "num_candidate_qps_solved": sum(
-                int(result.qp_solved) for result in candidate_results
-            ),
-            "num_safe_candidates": sum(
-                int(result.rollout_safe is True) for result in candidate_results
-            ),
-            "num_qp_feasible_candidates": len(feasible),
-            "num_certified_backup_candidates": len(certified),
-            "num_steps_with_no_safe_policy": 0,
-            "num_steps_with_no_certified_rollout": 0,
-            "num_steps_with_no_feasible_qp": 0,
-            "num_feasible_backup_candidates": len(feasible),
-            "certificate_lost": False,
-            "qp_infeasible": False,
-            "runtime_error": False,
-            "candidate_evaluation_error_count": (
-                candidate_evaluation_error_count
-            ),
-            "fallback_used": False,
-            "terminal_failure_count": sum(
-                int(result.terminal_safe is False) for result in candidate_results
-            ),
-            **_projection_step_metrics(candidate_results),
-            "compute_time_sec": time.perf_counter() - step_started,
-        }
         return np.asarray(best.u, dtype=float).reshape(-1)
-
-    def get_last_step_metrics(self) -> Dict[str, object]:
-        return dict(self._last_step_metrics)
-
-    def get_candidate_results(self) -> Tuple[CandidateCBFResult, ...]:
-        return self._last_candidate_results
-
-    def get_status(self) -> Dict[str, object]:
-        return {
-            "algorithm": self.algorithm_key,
-            "infeasible": self.infeasible,
-            "certificate_lost": self.certificate_lost,
-            "qp_infeasible": self.qp_infeasible,
-            "runtime_error": self.runtime_error,
-            "fallback_applied": self.fallback_applied,
-            "selected_policy": self._last_selected_policy,
-            "library_size": len(self.policy_configs),
-            "terminal_config": self.get_terminal_config(),
-            **self.get_last_step_metrics(),
-        }
 
 
 __all__ = [

@@ -1,16 +1,6 @@
-"""Benchmark-adapted Chen et al. multi-backup CBF for the drift car.
+"""Chen et al. multi-backup CBF for the drift car.
 
-Each candidate reuses the repository BackupCBF rollout, sensitivity, safety,
-terminal-set, objective, and solver definitions.  Unlike the legacy class,
-the strict candidate wrapper exposes failed QPs instead of silently applying a
-fallback.  The outer controller selects the feasible candidate with minimum
-realized intervention.  This is a benchmark adaptation, not a line-by-line
-reproduction of Chen, Singletary, and Ames (2021).
-
-For terminal compatibility, each non-stop strategy executes its exact runtime
-library maneuver for a documented 1.0 s prefix and then uses the exact shared
-stop policy for the remaining horizon; stop remains stop throughout.  Terminal
-membership uses a named sampled stopping envelope at the terminal sample and
+Terminal membership uses a named sampled stopping envelope at the terminal sample and
 one successor under stop.  This finite check is intentionally not claimed to
 be a formal invariant-set proof.
 """
@@ -53,14 +43,6 @@ _SCS_AUDIT_TOL = 1e-4
 @dataclass(frozen=True)
 class DriftSampledStoppingTerminalEnvelope:
     """Sampled stop-tail terminal proxy used by every drift MB candidate.
-
-    The speed tolerance is deliberately named a stopping-envelope tolerance,
-    not "near rest": the exact shared stop policy cannot bring every 1.0 s
-    maneuver-prefix candidate near zero speed within the fixed 3.0 s benchmark
-    horizon, especially at the sensed 0.3 friction.  The 7.5 m/s bound includes
-    those sampled prefix/tail rollouts while requiring a non-increasing absolute
-    speed at one exact-stop successor.  This finite collection is auditable but
-    is not a proof that the set is control invariant.
     """
 
     name: str = "drift_sampled_stop_tail_envelope_v1"
@@ -103,10 +85,6 @@ class _CompoundLibraryPolicyAdapter:
 
 class _FrozenNominalPolicyAdapter:
     """Pure frozen-MPCC prefix followed by the common exact stopping tail.
-
-    Candidate rollout never calls or advances MPCC.  At the documented common
-    prefix boundary (or earlier if the frozen plan is shorter), it switches to
-    exactly the same stopping controller used by every other compound strategy.
     """
 
     def __init__(self, stop_config: dict, maneuver_prefix_steps: int):
@@ -136,7 +114,6 @@ class _FrozenNominalPolicyAdapter:
 
 
 class _StrictCandidateBackupCBF(BackupCBF):
-    """BackupCBF candidate whose failed QP is reported, never hidden."""
 
     accepted_statuses = ("optimal", "optimal_inaccurate")
 
@@ -211,11 +188,6 @@ class _StrictCandidateBackupCBF(BackupCBF):
         record: bool = False,
     ) -> Dict[str, object]:
         """Evaluate the named sampled stop-tail terminal proxy.
-
-        Both the terminal sample and its one-step successor under the exact stop
-        policy must remain safe, satisfy the stopping-envelope bounds, and have
-        non-increasing absolute speed. This check is auditable, but it is not a
-        formal control-invariance proof.
         """
 
         state = np.asarray(state, dtype=float).reshape(-1)
@@ -241,12 +213,6 @@ class _StrictCandidateBackupCBF(BackupCBF):
         value = float(min(components.values()))
         status: Dict[str, object] = {
             "name": self.terminal_envelope.name,
-            "is_formal_invariant_proof": False,
-            "description": (
-                "sampled stopping-envelope proxy: terminal and one exact-stop "
-                "successor satisfy safety, settled lateral-state bounds, a bounded "
-                "longitudinal speed, and non-increasing absolute speed"
-            ),
             "value": value,
             "satisfied": bool(np.isfinite(value) and value >= 0.0),
             "tolerances": asdict(self.terminal_envelope),
@@ -316,12 +282,6 @@ class _StrictCandidateBackupCBF(BackupCBF):
 
     def solve_candidate(self, robot_state: np.ndarray, u_nom: np.ndarray) -> CandidateCBFResult:
         """Certify the complete backup rollout, then solve its candidate QP.
-
-        Selection is over a sampled certified-candidate set, analogous to the
-        active set in Chen et al.  An unsafe rollout or terminal state is
-        therefore rejected before system matrices, CBF constraints, or a QP
-        are constructed.  The outer wrapper records the loss and applies the
-        common bounded damage-mitigation action.
         """
 
         started = time.perf_counter()
@@ -871,10 +831,6 @@ class MultiBackupCBFMinInterventionDrift:
             "terminal_envelope": {
                 **asdict(self.terminal_envelope),
                 "is_formal_invariant_proof": False,
-                "description": (
-                    "sampled stopping-envelope proxy with one exact-stop successor; "
-                    "not a formal invariance proof"
-                ),
             },
             "candidate_terminal_status": {
                 name: candidate.get_terminal_envelope_status()

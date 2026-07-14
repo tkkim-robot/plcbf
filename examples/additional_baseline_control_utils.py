@@ -1,4 +1,4 @@
-"""Numerical control helpers used only by the additional baselines."""
+"""Control helpers for the additional baselines."""
 
 from __future__ import annotations
 
@@ -14,8 +14,6 @@ SOLVER_INPUT_TOL = 1e-5
 
 @dataclass(frozen=True)
 class SolverControlProjection:
-    """A tolerance-valid solver control and its exact-bound projection."""
-
     control: Optional[np.ndarray]
     projection_applied: bool
     projection_delta_inf: float
@@ -23,8 +21,6 @@ class SolverControlProjection:
 
 @dataclass(frozen=True)
 class ConstraintAudit:
-    """Post-projection residual audit for the QP's original inequalities."""
-
     passed: bool
     constraint_count: int
     max_violation: float
@@ -42,13 +38,6 @@ def project_solver_control(
     expected_shape: Tuple[int, ...],
     tolerance: float = SOLVER_INPUT_TOL,
 ) -> Optional[np.ndarray]:
-    """Return an exactly bounded copy of a tolerance-feasible QP result.
-
-    Validation happens before projection, so clipping only removes a small
-    actuator-bound residual. Callers must separately recheck every other QP
-    inequality before accepting the projected candidate.
-    """
-
     return project_solver_control_with_diagnostics(
         control,
         lower,
@@ -66,8 +55,6 @@ def project_solver_control_with_diagnostics(
     expected_shape: Tuple[int, ...],
     tolerance: float = SOLVER_INPUT_TOL,
 ) -> SolverControlProjection:
-    """Project a solver-tolerance-valid input and retain projection metadata."""
-
     invalid = SolverControlProjection(
         control=None,
         projection_applied=False,
@@ -104,19 +91,6 @@ def audit_cvxpy_inequalities(
     absolute_tolerance: float,
     relative_tolerance: float,
 ) -> ConstraintAudit:
-    """Audit the original affine CVXPY inequalities at assigned values.
-
-    CVXPY stores every inequality in canonical form ``expr <= 0``. For each
-    scalar row ``c.T @ z + d <= 0``, this function uses the declared scale-aware
-    post-projection audit threshold
-
-    ``absolute_tolerance + relative_tolerance * max(1, |d|, |c.T @ z|)``.
-
-    Variable attributes are not included in ``problem.constraints``. The
-    nonnegative attribute used by the drift PCBF slack is therefore audited
-    explicitly as ``-z <= 0``.
-    """
-
     absolute_tolerance = float(absolute_tolerance)
     relative_tolerance = float(relative_tolerance)
     if absolute_tolerance < 0.0 or relative_tolerance < 0.0:
@@ -143,8 +117,6 @@ def audit_cvxpy_inequalities(
                 if value.size != variable.size:
                     raise ValueError("CVXPY assignment has the wrong dimension")
                 assigned_value = value.reshape(variable.shape, order="F")
-            # ``save_value`` intentionally bypasses variable-attribute projection
-            # so a solver-returned nonnegative slack is audited exactly as returned.
             variable.save_value(assigned_value)
 
         for constraint in constraints:

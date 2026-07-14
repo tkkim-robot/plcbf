@@ -1,10 +1,4 @@
-"""Baseline-only randomized Warehouse Quad3D benchmark.
-
-Only MB-CBF-MI and Lib-PCBF-MI are selectable.  The driver records the seeded
-scenario, historical failure outcome, and solve timing needed for the paper
-table.  The simulator always receives the exact valid control returned by the
-selected baseline.
-"""
+"""Warehouse Quad3D benchmark for MB-CBF-MI and Lib-PCBF-MI."""
 
 from __future__ import annotations
 
@@ -87,7 +81,6 @@ def _fmt_count_rate(count: int, total: int) -> str:
 
 
 def _json_safe(value):
-    """Convert NumPy/non-finite values to strict JSON-compatible values."""
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -117,8 +110,6 @@ def validate_returned_control(
     *,
     tolerance: float = 1e-9,
 ) -> np.ndarray:
-    """Validate a native controller output without clipping or substitution."""
-
     vector = np.asarray(control, dtype=float).reshape(-1)
     if vector.shape != (4,):
         raise ValueError(f"controller returned shape {vector.shape}; expected (4,)")
@@ -139,8 +130,6 @@ def _sample_velocity(
     speed = float(rng.uniform(speed_min, speed_max))
     mode = float(rng.random())
 
-    # Mostly axis-aligned motion to mimic level-7 cross-flow style,
-    # with some diagonal/random movers for variability.
     if mode < 0.45:
         vx = speed if rng.random() < 0.5 else -speed
         vy = float(rng.uniform(-0.25, 0.25))
@@ -169,12 +158,6 @@ def generate_random_scenarios(
     start_clearance_radius: float,
     inter_ghost_clearance: float,
 ) -> List[TrialScenario]:
-    """
-    Generate randomized dynamic-obstacle scenarios.
-
-    Static obstacles and waypoints are not randomized.
-    Dynamic obstacles are kept away from the initial robot area to avoid immediate failure.
-    """
     env = WarehouseEnv(level=level)
     static_obs = env.get_static_obstacles()
     start_pos = np.array(env.start_pos, dtype=float)
@@ -194,15 +177,12 @@ def generate_random_scenarios(
                 x = float(rng.uniform(x_min, x_max))
                 y = float(rng.uniform(y_min, y_max))
 
-                # Keep a square near the start free (user requested).
                 if x <= start_exclusion_max_x and y <= start_exclusion_max_y:
                     continue
 
-                # Additional radial clearance from the initial state.
                 if np.linalg.norm(np.array([x, y]) - start_pos) < start_clearance_radius:
                     continue
 
-                # Avoid spawning inside/too close to static obstacles.
                 blocked_by_static = False
                 for obs in static_obs:
                     dist = np.hypot(x - float(obs["x"]), y - float(obs["y"]))
@@ -213,7 +193,6 @@ def generate_random_scenarios(
                 if blocked_by_static:
                     continue
 
-                # Keep some spacing among dynamic obstacles.
                 blocked_by_ghost = False
                 for gx, gy, _, _, gr in ghosts:
                     dist = np.hypot(x - gx, y - gy)
@@ -517,8 +496,6 @@ def run_algorithm_trials(
 
 
 def _run_trial_payload(payload) -> TrialResult:
-    """Pickle-friendly adapter for independent seeded trials."""
-
     (
         algo,
         scenario,

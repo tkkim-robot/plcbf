@@ -1,4 +1,4 @@
-"""Shared, side-effect-free helpers for the drift multi-policy baselines."""
+"""Shared helpers for the drift multi-policy baselines."""
 
 from __future__ import annotations
 
@@ -27,8 +27,6 @@ TIE_TOL = 1e-5
 
 @dataclass
 class CandidateCBFResult:
-    """Auditable result from one policy's candidate QP."""
-
     policy_name: str
     feasible: bool
     u: Optional[np.ndarray]
@@ -55,8 +53,6 @@ class CandidateCBFResult:
 
 @dataclass
 class MultiPolicyMetrics:
-    """Per-controller counters consumed by the benchmark logger."""
-
     selected_policy_histogram: Counter = field(default_factory=Counter)
     intervention_l2: list[float] = field(default_factory=list)
     policy_switch_count: int = 0
@@ -100,8 +96,6 @@ class MultiPolicyMetrics:
     def record_projection_audits(
         self, results: Sequence[CandidateCBFResult]
     ) -> None:
-        """Accumulate one control step's post-projection candidate audits."""
-
         audited = [
             result
             for result in results
@@ -220,8 +214,6 @@ def _params_signature(params: Any) -> Any:
 
 
 def runtime_library_signature(controller: Any) -> Dict[str, Any]:
-    """Return the fields whose equality defines a fair runtime library."""
-
     configs = controller.policy_configs
     names = tuple(getattr(controller, "policy_names", tuple(configs.keys()) + ("nominal",)))
     return {
@@ -251,8 +243,6 @@ def runtime_library_signature(controller: Any) -> Dict[str, Any]:
 
 
 def assert_runtime_library_equal(candidate: Any, reference_plcbf: Any) -> None:
-    """Fail loudly if a baseline is not using PL-CBF's exact runtime library."""
-
     candidate_signature = runtime_library_signature(candidate)
     reference_signature = runtime_library_signature(reference_plcbf)
     if candidate_signature != reference_signature:
@@ -267,8 +257,6 @@ def select_minimum_intervention(
     policy_names: Sequence[str],
     tie_tol: float = TIE_TOL,
 ) -> Optional[CandidateCBFResult]:
-    """Select by objective, using only fixed policy order for numerical ties."""
-
     order = {name: index for index, name in enumerate(policy_names)}
     feasible = [result for result in results if result.feasible]
     if not feasible:
@@ -296,8 +284,6 @@ def project_bounded_control(
     u_max: np.ndarray,
     tol: float = INPUT_TOL,
 ) -> Optional[np.ndarray]:
-    """Project only a solver-tolerance-feasible input to exact bounds."""
-
     return project_solver_control(
         u,
         u_min,

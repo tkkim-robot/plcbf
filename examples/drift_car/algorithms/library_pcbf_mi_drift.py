@@ -1,10 +1,4 @@
-"""Library PCBF with minimum-intervention selection for the drift car.
-
-This is the controlled selector ablation described in the accompanying paper:
-it reuses :class:`PLCBF`'s policy construction and exact value/gradient rollout
-path, but solves the same PCBF-QP for every certified policy and selects the
-realized minimum-intervention solution.  It is not presented as an unchanged
-algorithm from a prior paper.
+"""Multi-policy PCBF with minimum-intervention selection for the drift car.
 """
 
 from __future__ import annotations
@@ -330,8 +324,6 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
             self.metrics.num_steps_with_no_safe_policy += 1
             return self._emergency_control(robot_state).reshape(-1, 1)
 
-        # These are direct copies of the values used by PL-CBF, exposed for
-        # regression/fairness checks and benchmark diagnostics.
         self.last_values = dict(values)
         self.last_gradients = {name: np.array(value, copy=True) for name, value in gradients.items()}
         self.last_trajectories = {

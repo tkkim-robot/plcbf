@@ -1,9 +1,4 @@
-"""Baseline-only drift-car black-ice benchmark.
-
-This entry point intentionally exposes only MB-CBF-MI and Lib-PCBF-MI.  The
-historical benchmark remains in ``benchmark_black_ice.py`` byte-for-byte.  The
-simulator applies the exact valid action returned by the selected baseline.
-"""
+"""Drift-car benchmark for MB-CBF-MI and Lib-PCBF-MI."""
 
 from __future__ import annotations
 
@@ -22,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Add project root and submodule path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
@@ -78,7 +72,6 @@ class SimConfig:
     initial_velocity: float = 10.0
     target_velocity: float = 10.0
     nominal_track_eps: float = 0.05
-    # Black-ice puddle (always enabled)
     puddle_x: float = 70.0
     puddle_radius: float = 15.0
     puddle_friction: float = 0.30
@@ -97,7 +90,6 @@ class Scenario:
     run_idx: int
     seed: int
     num_obstacles: int
-    # tuples: (x, lane_name) lane_name in {"middle","left","right"}
     obstacles: Tuple[Tuple[float, str], ...]
 
 
@@ -129,11 +121,10 @@ def build_vehicle_spec() -> Dict[str, float]:
         "Iz": 5000.0,
         "Cc_f": 80000.0,
         "Cc_r": 100000.0,
-        "mu": 1.0,  # default outside puddle
+        "mu": 1.0,
         "r_w": 0.35,
         "gamma": 0.95,
         "delta_max": np.deg2rad(20.0),
-        # Keep agile steering from drift_pcbf tests
         "delta_dot_max": np.deg2rad(50.0),
         "tau_max": 4000.0,
         "tau_dot_max": 8000.0,
@@ -147,8 +138,6 @@ def build_vehicle_spec() -> Dict[str, float]:
 
 
 def make_variants() -> List[AlgoVariant]:
-    """Return the complete and exclusive publication-baseline registry."""
-
     return [
         AlgoVariant(
             "multi_backup_cbf_mi",
@@ -171,9 +160,7 @@ def generate_scenarios(num_runs: int, seed: int) -> List[Scenario]:
     lane_names = np.array(["middle", "left", "right"], dtype=object)
 
     for run_idx in range(num_runs):
-        num_obs = int(rng.integers(1, 3))  # 1 or 2
-        # Keep one primary obstacle near default center-line location.
-        # Single-obstacle cases can still be center/left/right.
+        num_obs = int(rng.integers(1, 3))
         x_first = float(rng.uniform(79.0, 83.0))
         if num_obs == 1:
             lane_first = str(rng.choice(lane_names, p=[0.7, 0.15, 0.15]))
@@ -187,9 +174,6 @@ def generate_scenarios(num_runs: int, seed: int) -> List[Scenario]:
                 x_second = float(np.clip(x_first + 1.0, 75.0, 85.0))
             obstacles = ((x_first, "middle"), (x_second, lane_second))
 
-        # Preserve the historical RNG stream (the old field consumed one draw
-        # but was never used to initialize a trial).  Trial records now store
-        # the actual master scenario seed plus run index, which is replayable.
         _unused_historical_trial_token = int(rng.integers(0, 2**31 - 1))
         scenarios.append(
             Scenario(
@@ -284,8 +268,6 @@ def create_reference_plcbf(
     lanes: Dict[str, float],
     cfg: SimConfig,
 ) -> PLCBF:
-    """Construct the one runtime library shared by all multi-policy methods."""
-
     controller = PLCBF(
         robot=car,
         robot_spec=car.robot_spec,
@@ -315,8 +297,6 @@ def setup_shielding(
             f"Unknown baseline {variant.algo!r}; valid keys are {ADDITIONAL_ALGOS}"
         )
 
-    # This object is only a policy-library equality oracle. Its PL-CBF solver
-    # is never called by this baseline-only benchmark.
     reference_plcbf = create_reference_plcbf(car, env, lanes, cfg)
     if variant.algo == "multi_backup_cbf_mi":
         shielding = MultiBackupCBFMinInterventionDrift(
@@ -373,8 +353,6 @@ def call_quiet(quiet: bool, fn, *args, **kwargs):
 
 
 def controller_reported_runtime_error(shielding) -> bool:
-    """Recognize an unrecoverable controller error without collecting metrics."""
-
     status_text = str(getattr(shielding, "status", "")).lower()
     return bool(getattr(shielding, "runtime_error", False)) or status_text.startswith(
         ("error", "value_error", "candidate_evaluation_error")
@@ -388,8 +366,6 @@ def validate_returned_control(
     expected_dimension: int = 2,
     tolerance: float = 1e-9,
 ) -> np.ndarray:
-    """Validate, but never clip or replace, a controller return value."""
-
     vector = np.asarray(control, dtype=float).reshape(-1)
     if vector.shape != (expected_dimension,):
         raise ValueError(
@@ -478,9 +454,6 @@ def run_episode(
             runtime_error = True
             break
 
-        # A controller may explicitly classify an internal evaluation failure
-        # after returning. Normal native fallback actions remain valid and are
-        # passed to the simulator unchanged.
         if controller_reported_runtime_error(shielding):
             runtime_error = True
             break
@@ -497,7 +470,6 @@ def run_episode(
         if collision:
             break
 
-        # Track finished
         if car.get_position()[0] > env.track_length - 10.0:
             break
 
@@ -606,7 +578,6 @@ def aggregate_results(
 
 
 def _run_episode_payload(payload):
-    """Pickle-friendly adapter for optional independent-trial parallelism."""
     variant, scenario, cfg, verbose = payload
     return run_episode(
         variant,

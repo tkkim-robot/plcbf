@@ -17,7 +17,7 @@ This repository implements **Policy Library CBF (PL-CBF)**. `PL-CBF` is motivate
 
 - __A runtime safety filter__ based on Policy-Library CBF (PL-CBF) that minimally modifies the pre-defined nominal policy (e.g., MPC, RL, etc.), without requiring any offline CBF design.
 - __JAX-accelerated__ parallel implementation for fast runtime performance (__< 10 ms__ for __8 states and 12 states__ robots on a Macbook Air)
-- Implemented baseline safety filters such as [Model Predictive Shielding (MPS)](https://ieeexplore.ieee.org/document/9483182), [gatekeeper](https://ieeexplore.ieee.org/abstract/document/10665919), [Backup CBF](https://ieeexplore.ieee.org/document/9683111), and [Policy PCBF](https://ieeexplore.ieee.org/document/11122656).
+- Implemented baseline safety filters such as [Model Predictive Shielding (MPS)](https://ieeexplore.ieee.org/document/9483182), [gatekeeper](https://ieeexplore.ieee.org/abstract/document/10665919), [Backup CBF](https://ieeexplore.ieee.org/document/9683111), [Policy PCBF](https://ieeexplore.ieee.org/document/11122656), Multi-Backup CBF with minimum-intervention selection (`multi_backup_cbf_mi`), and Library PCBF with minimum-intervention selection (`library_pcbf_mi`).
 - Integration with the [safe_control](https://github.com/tkkim-robot/safe_control) repository for simulating robotic navigation, offering various robot dynamics and controllers.
 - Unified base abstractions in `plcbf/plcbf.py`
 - Script-level tests and benchmarks for both `drift_car` and `warehouse` cases
@@ -59,61 +59,6 @@ uv run python examples/drift_car/test_drift_pcbf.py \
 uv run python examples/warehouse/test_warehouse_quad.py \
   --algo plcbf 
 ```
-
-### Additional multi-policy comparison baselines
-
-The two paper-comparison methods have separate, baseline-only benchmark entry
-points. The historical PL-CBF controllers and benchmark execution paths remain
-byte-identical to commit `34795fae8ab04846e312cdb399872e9a6deda7b5` and are
-not run by these commands:
-
-- `multi_backup_cbf_mi`: **MB-CBF-MI†**, a benchmark-adapted multi-Backup-CBF
-  heuristic that admits only candidates whose complete sampled rollout and
-  terminal proxy pass, then selects the feasible candidate-QP result with the
-  least realized intervention.
-- `library_pcbf_mi`: **Lib-PCBF-MI**, the same policy certificates and
-  per-policy QPs as the policy library, selected by least realized
-  intervention.
-
-Run the 50 paired drift-car trials with the paper seed:
-
-```bash
-uv run python examples/drift_car/benchmark_additional_baselines.py \
-  --num-runs 50 --seed 7 \
-  --variant-key multi_backup_cbf_mi \
-  --variant-key library_pcbf_mi \
-  --num-workers 8
-```
-
-Run the 100 paired Quad3D trials at `P=64`. The warehouse runtime library is
-64 angle policies + `stop` + `nominal`, so `|Pi|=P+2=66`:
-
-```bash
-uv run python examples/warehouse/benchmark_additional_baselines_quad.py \
-  --algorithms multi_backup_cbf_mi library_pcbf_mi \
-  --num-trials 100 --seed 11 \
-  --num-angle-policies 64 --num-workers 8
-```
-
-The live benchmark outputs are intentionally table-oriented: they retain the
-seeded scenario geometry, collision and unrecoverable-infeasibility flags, the
-historical failure value, and the timing numerator and denominator. The main
-failure column is exactly physical collision or unrecoverable
-infeasibility/runtime failure. The simulator always applies the selected
-baseline's returned finite, bounded control unchanged; solve exceptions,
-invalid controls, and simulator errors terminate the trial as unrecoverable.
-
-For tentative timing, run the same drivers with one worker and a small trial
-count, for example `--num-runs 3 --num-workers 1` for drift and
-`--num-trials 3 --num-workers 1` for Warehouse. Both drivers exclude their
-documented warm-up calls. Timing should be compared between the two new
-baselines only unless PL-CBF is rerun under the same protocol. The verbose
-projection-audit artifacts in
-`output/additional_baselines/projection_audited_baseline_only_2026-07-14/`
-remain frozen and are exactly reproducible from the ancestor commit recorded in
-their manifest. † MB-CBF-MI uses a sampled terminal proxy rather than a proven
-control-invariant terminal set, so it does not inherit the formal guarantee of
-Chen et al.
 
 ## Useful Options
 

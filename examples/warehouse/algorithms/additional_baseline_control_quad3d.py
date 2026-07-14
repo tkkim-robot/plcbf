@@ -1,4 +1,4 @@
-"""Strict actuator projection shared by the additional Quad3D baselines."""
+"""Control projection for the additional Quad3D baselines."""
 
 from __future__ import annotations
 
@@ -22,8 +22,6 @@ def project_quad3d_solver_control(
     expected_dimension: int = 4,
     tolerance: float = SOLVER_INPUT_TOL,
 ) -> Optional[np.ndarray]:
-    """Project a tolerance-feasible Quad3D QP result to exact bounds."""
-
     return project_solver_control(
         control,
         lower,
@@ -41,8 +39,6 @@ def project_quad3d_solver_control_with_diagnostics(
     expected_dimension: int = 4,
     tolerance: float = SOLVER_INPUT_TOL,
 ) -> SolverControlProjection:
-    """Project a Quad3D QP result and retain the numerical correction."""
-
     return project_solver_control_with_diagnostics(
         control,
         lower,

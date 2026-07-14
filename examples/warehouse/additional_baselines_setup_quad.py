@@ -1,9 +1,4 @@
-"""Setup shared exclusively by the two additional Warehouse Quad3D baselines.
-
-The historical setup/runner remains in test_warehouse_quad.py unchanged.
-This module preserves its level, robot, nominal-controller, horizon, dynamics,
-and policy-library parameters while rejecting every historical algorithm key.
-"""
+"""Setup for the additional Warehouse Quad3D baselines."""
 
 from __future__ import annotations
 
@@ -40,8 +35,6 @@ def setup_test(
     num_angle_policies: int = 64,
     alpha: float | None = None,
 ):
-    """Construct one baseline with the approved historical benchmark settings."""
-
     if algo not in BASELINE_KEYS:
         raise ValueError(
             f"Unsupported additional baseline {algo!r}; valid keys are {BASELINE_KEYS}"
