@@ -17,7 +17,7 @@ This repository implements **Policy Library CBF (PL-CBF)**. `PL-CBF` is motivate
 
 - __A runtime safety filter__ based on Policy-Library CBF (PL-CBF) that minimally modifies the pre-defined nominal policy (e.g., MPC, RL, etc.), without requiring any offline CBF design.
 - __JAX-accelerated__ parallel implementation for fast runtime performance (__< 10 ms__ for __8 states and 12 states__ robots on a Macbook Air)
-- Implemented baseline safety filters such as [Model Predictive Shielding (MPS)](https://ieeexplore.ieee.org/document/9483182), [gatekeeper](https://ieeexplore.ieee.org/abstract/document/10665919), [Backup CBF](https://ieeexplore.ieee.org/document/9683111), and [Policy PCBF](https://ieeexplore.ieee.org/document/11122656).
+- Implemented baseline safety filters such as [Model Predictive Shielding (MPS)](https://ieeexplore.ieee.org/document/9483182), [gatekeeper](https://ieeexplore.ieee.org/abstract/document/10665919), [Backup CBF](https://ieeexplore.ieee.org/document/9683111), [Policy PCBF](https://ieeexplore.ieee.org/document/11122656), Multi-Backup CBF with minimum-intervention selection (`multi_backup_cbf_mi`), and Library PCBF with minimum-intervention selection (`library_pcbf_mi`).
 - Integration with the [safe_control](https://github.com/tkkim-robot/safe_control) repository for simulating robotic navigation, offering various robot dynamics and controllers.
 - Unified base abstractions in `plcbf/plcbf.py`
 - Script-level tests and benchmarks for both `drift_car` and `warehouse` cases
