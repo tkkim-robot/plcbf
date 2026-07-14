@@ -23,13 +23,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from examples.additional_baseline_control_utils import audit_cvxpy_inequalities
 from examples.warehouse.controllers.policies_quad3d_jax import (
     StopPolicyJAX,
     WaypointPolicyParams,
 )
 from .additional_baseline_control_quad3d import (
     SOLVER_INPUT_TOL,
-    project_quad3d_solver_control,
+    project_quad3d_solver_control_with_diagnostics,
 )
 from .plcbf_quad3d import PLCBF_Quad3D
 
@@ -38,6 +39,8 @@ from .plcbf_quad3d import PLCBF_Quad3D
 # tolerance.  Reuse it here for deterministic objective ties.
 _TIE_TOL = 1e-6
 _INPUT_TOL = SOLVER_INPUT_TOL  # OSQP's default absolute feasibility tolerance.
+_QP_AUDIT_ATOL = _INPUT_TOL
+_QP_AUDIT_RTOL = _INPUT_TOL
 _ACCEPTED_STATUSES = ("optimal", "optimal_inaccurate")
 
 
@@ -56,6 +59,17 @@ class CandidatePCBFResult:
     solver_status: str
     solve_time_sec: float
     error: Optional[str] = None
+    raw_u: Optional[np.ndarray] = None
+    projected_u: Optional[np.ndarray] = None
+    projection_occurred: bool = False
+    projection_delta_inf: float = 0.0
+    post_projection_constraints_satisfied: Optional[bool] = None
+    max_post_projection_constraint_violation: Optional[float] = None
+    max_post_projection_violation_ratio: Optional[float] = None
+    constraint_audit_atol: Optional[float] = None
+    constraint_audit_rtol: Optional[float] = None
+    constraint_audit_count: int = 0
+    solver_name: Optional[str] = None
 
 
 class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
@@ -379,12 +393,53 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
                 solver_status=solver_status,
                 solve_time_sec=solve_time_sec,
                 error=error,
+                raw_u=None if solution is None else solution.copy(),
+                solver_name=(
+                    None
+                    if problem.solver_stats is None
+                    else str(problem.solver_stats.solver_name)
+                ),
             )
 
-        solution = project_quad3d_solver_control(solution, lower, upper)
-        if solution is None:  # Kept explicit for static type checkers.
+        projection = project_quad3d_solver_control_with_diagnostics(
+            solution, lower, upper
+        )
+        if projection.control is None:  # Kept explicit for static type checkers.
             raise AssertionError("validated Quad3D QP solution could not be projected")
-        delta = solution - u_nom
+        audit = audit_cvxpy_inequalities(
+            constraints,
+            [(u, projection.control)],
+            absolute_tolerance=_QP_AUDIT_ATOL,
+            relative_tolerance=_QP_AUDIT_RTOL,
+        )
+        solver_name = str(problem.solver_stats.solver_name)
+        if not audit.passed:
+            return CandidatePCBFResult(
+                policy_name=policy_name,
+                policy_index=policy_index,
+                certified=True,
+                value=value,
+                feasible=False,
+                u=None,
+                objective=float("inf"),
+                intervention_l2=float("inf"),
+                solver_status=solver_status,
+                solve_time_sec=solve_time_sec,
+                error="post-projection constraint audit failed",
+                raw_u=solution.copy(),
+                projected_u=projection.control.copy(),
+                projection_occurred=projection.projection_applied,
+                projection_delta_inf=projection.projection_delta_inf,
+                post_projection_constraints_satisfied=False,
+                max_post_projection_constraint_violation=audit.max_violation,
+                max_post_projection_violation_ratio=audit.max_violation_ratio,
+                constraint_audit_atol=audit.absolute_tolerance,
+                constraint_audit_rtol=audit.relative_tolerance,
+                constraint_audit_count=audit.constraint_count,
+                solver_name=solver_name,
+            )
+        projected_solution = projection.control
+        delta = projected_solution - u_nom
         objective = float(np.dot(delta, delta))
         return CandidatePCBFResult(
             policy_name=policy_name,
@@ -392,11 +447,22 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
             certified=True,
             value=value,
             feasible=True,
-            u=solution.copy(),
+            u=projected_solution.copy(),
             objective=objective,
             intervention_l2=float(np.sqrt(max(objective, 0.0))),
             solver_status=solver_status,
             solve_time_sec=solve_time_sec,
+            raw_u=solution.copy(),
+            projected_u=projected_solution.copy(),
+            projection_occurred=projection.projection_applied,
+            projection_delta_inf=projection.projection_delta_inf,
+            post_projection_constraints_satisfied=True,
+            max_post_projection_constraint_violation=audit.max_violation,
+            max_post_projection_violation_ratio=audit.max_violation_ratio,
+            constraint_audit_atol=audit.absolute_tolerance,
+            constraint_audit_rtol=audit.relative_tolerance,
+            constraint_audit_count=audit.constraint_count,
+            solver_name=solver_name,
         )
 
     @staticmethod
@@ -459,7 +525,40 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
                 "solver_status": candidate.solver_status,
                 "solve_time_sec": candidate.solve_time_sec,
                 "error": candidate.error,
+                "projection_occurred": candidate.projection_occurred,
+                "projection_delta_inf": candidate.projection_delta_inf,
+                "post_projection_constraints_satisfied": (
+                    candidate.post_projection_constraints_satisfied
+                ),
+                "max_post_projection_constraint_violation": finite_or_none(
+                    candidate.max_post_projection_constraint_violation
+                )
+                if candidate.max_post_projection_constraint_violation is not None
+                else None,
+                "max_post_projection_violation_ratio": finite_or_none(
+                    candidate.max_post_projection_violation_ratio
+                )
+                if candidate.max_post_projection_violation_ratio is not None
+                else None,
+                "constraint_audit_atol": candidate.constraint_audit_atol,
+                "constraint_audit_rtol": candidate.constraint_audit_rtol,
+                "constraint_audit_count": candidate.constraint_audit_count,
+                "solver_name": candidate.solver_name,
             })
+
+        audited = [
+            candidate
+            for candidate in self.last_candidate_results
+            if candidate.post_projection_constraints_satisfied is not None
+        ]
+        projection_events = [
+            candidate for candidate in audited if candidate.projection_occurred
+        ]
+        rejected = [
+            candidate
+            for candidate in audited
+            if candidate.post_projection_constraints_satisfied is False
+        ]
 
         return {
             "selected_policy": self.last_selected_policy_name,
@@ -490,6 +589,28 @@ class LibraryPCBFMinInterventionQuad3D(PLCBF_Quad3D):
             "qp_solve_time_sec": self.last_qp_solve_time_sec,
             "selection_time_sec": self.last_selection_time_sec,
             "total_time_sec": self.last_total_time_sec,
+            "num_post_projection_audits": len(audited),
+            "projection_occurred": bool(projection_events),
+            "projection_event_count": len(projection_events),
+            "post_projection_rejection_count": len(rejected),
+            "max_projection_delta_inf": max(
+                (candidate.projection_delta_inf for candidate in audited),
+                default=0.0,
+            ),
+            "max_post_projection_constraint_violation": max(
+                (
+                    candidate.max_post_projection_constraint_violation or 0.0
+                    for candidate in audited
+                ),
+                default=0.0,
+            ),
+            "max_post_projection_violation_ratio": max(
+                (
+                    candidate.max_post_projection_violation_ratio or 0.0
+                    for candidate in audited
+                ),
+                default=0.0,
+            ),
             "candidate_results": candidates,
         }
 

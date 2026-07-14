@@ -12,19 +12,27 @@ from __future__ import annotations
 import time
 from typing import Dict, Optional
 
+import cvxpy as cp
 import jax.numpy as jnp
 import numpy as np
 
+from examples.additional_baseline_control_utils import (
+    audit_cvxpy_inequalities,
+    project_solver_control_with_diagnostics,
+)
 from examples.drift_car.algorithms.multi_policy_baseline_common_drift import (
     CandidateCBFResult,
     MultiPolicyMetrics,
     NOMINAL_POLICY_REPRESENTATION,
     assert_runtime_library_equal,
-    project_bounded_control,
     select_minimum_intervention,
 )
 from examples.drift_car.algorithms.plcbf_drift import PLCBF, POLICY_ALPHA
 from examples.drift_car.controllers.drift_policies_jax import StoppingControllerJAX
+
+
+_SCS_AUDIT_ATOL = 1e-4
+_SCS_AUDIT_RTOL = 1e-4
 
 
 class LibraryPCBFMinInterventionDrift(PLCBF):
@@ -106,21 +114,108 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
 
         try:
             self.cbf_alpha = self._policy_alpha(policy_name)
-            raw_control = np.asarray(
-                self._solve_cbf_qp(u_nom, value, gradient, f, G),
-                dtype=float,
-            ).reshape(-1)
+            u_scale = self.u_max
+            u_nom_scaled = np.asarray(u_nom, dtype=float).reshape(-1) / u_scale
+            u_scaled = cp.Variable(2)
+            cbf_slack = cp.Variable(nonneg=True) if self.use_cbf_slack else None
+
+            weights = np.array([1.0, 10.0])
+            weighted_diff = cp.multiply(weights, u_scaled - u_nom_scaled)
+            cost = cp.sum_squares(weighted_diff)
+            constraints = [u_scaled >= -1.0, u_scaled <= 1.0]
+            if cbf_slack is not None:
+                cost += self.cbf_slack_weight * cp.square(cbf_slack)
+
+            grad_v_g = gradient @ G
+            grad_v_f = gradient @ f
+            cbf_rhs = grad_v_f + self.cbf_alpha * value
+            a_cbf = -grad_v_g * u_scale
+            if cbf_slack is not None:
+                constraints.insert(
+                    0, a_cbf @ u_scaled <= cbf_rhs + 1e-4 + cbf_slack
+                )
+            else:
+                constraints.insert(0, a_cbf @ u_scaled <= cbf_rhs + 1e-4)
+
+            problem = cp.Problem(cp.Minimize(cost), constraints)
+            problem.solve(
+                solver=cp.SCS,
+                verbose=False,
+                max_iters=2000,
+                eps=_SCS_AUDIT_ATOL,
+            )
+            if problem.status not in ("optimal", "optimal_inaccurate"):
+                self.status = str(problem.status)
+                raise ValueError(f"CBF-QP failed: {problem.status}")
+            if u_scaled.value is None:
+                self.status = "invalid_solution"
+                raise ValueError("CBF-QP returned no control")
+
+            slack_value = (
+                None
+                if cbf_slack is None or cbf_slack.value is None
+                else float(np.asarray(cbf_slack.value).reshape(-1)[0])
+            )
+            if cbf_slack is not None and slack_value is None:
+                self.status = "invalid_solution"
+                raise ValueError("CBF-QP returned no slack value")
+            self.status = (
+                "optimal_with_slack"
+                if slack_value is not None and slack_value > 1e-7
+                else "optimal"
+            )
             solver_status = str(self.status)
-            u = project_bounded_control(raw_control, self.u_min, self.u_max)
-            feasible = u is not None
-            error = None if feasible else "QP returned an invalid or out-of-bounds input"
-            objective = self._intervention_objective(u, u_nom) if feasible else float("inf")
+            solver_name = str(problem.solver_stats.solver_name)
+            raw_control = np.asarray(u_scaled.value * u_scale, dtype=float).reshape(-1)
+            projection = project_solver_control_with_diagnostics(
+                raw_control,
+                self.u_min,
+                self.u_max,
+                expected_shape=(2,),
+            )
+            if projection.control is None:
+                return CandidateCBFResult(
+                    policy_name=policy_name,
+                    feasible=False,
+                    u=None,
+                    objective=float("inf"),
+                    solver_status=solver_status,
+                    rollout_safe=True,
+                    terminal_safe=None,
+                    solve_time_sec=time.perf_counter() - started,
+                    qp_solved=True,
+                    error="QP returned an invalid or out-of-bounds input",
+                    raw_u=raw_control.copy(),
+                    solver_name=solver_name,
+                    cbf_slack=slack_value,
+                )
+
+            assignments = [(u_scaled, projection.control / u_scale)]
+            if cbf_slack is not None:
+                assignments.append((cbf_slack, slack_value))
+            audit = audit_cvxpy_inequalities(
+                constraints,
+                assignments,
+                absolute_tolerance=_SCS_AUDIT_ATOL,
+                relative_tolerance=_SCS_AUDIT_RTOL,
+            )
+            feasible = audit.passed
+            u = projection.control if feasible else None
+            error = None if feasible else "post-projection constraint audit failed"
+            objective = (
+                self._intervention_objective(u, u_nom) if feasible else float("inf")
+            )
         except Exception as exc:
             u = None
             feasible = False
             solver_status = str(self.status)
             objective = float("inf")
             error = str(exc)
+            raw_control = None
+            projection = None
+            audit = None
+            solver_name = None
+            slack_value = None
 
         return CandidateCBFResult(
             policy_name=policy_name,
@@ -133,6 +228,36 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
             solve_time_sec=time.perf_counter() - started,
             qp_solved=True,
             error=error,
+            raw_u=None if raw_control is None else raw_control.copy(),
+            projected_u=(
+                None
+                if projection is None or projection.control is None
+                else projection.control.copy()
+            ),
+            projection_occurred=bool(
+                projection is not None and projection.projection_applied
+            ),
+            projection_delta_inf=(
+                0.0 if projection is None else projection.projection_delta_inf
+            ),
+            post_projection_constraints_satisfied=(
+                None if audit is None else audit.passed
+            ),
+            max_post_projection_constraint_violation=(
+                None if audit is None else audit.max_violation
+            ),
+            max_post_projection_violation_ratio=(
+                None if audit is None else audit.max_violation_ratio
+            ),
+            constraint_audit_atol=(
+                None if audit is None else audit.absolute_tolerance
+            ),
+            constraint_audit_rtol=(
+                None if audit is None else audit.relative_tolerance
+            ),
+            constraint_audit_count=0 if audit is None else audit.constraint_count,
+            solver_name=solver_name,
+            cbf_slack=slack_value,
         )
 
     def _emergency_control(self, robot_state: np.ndarray) -> np.ndarray:
@@ -223,6 +348,7 @@ class LibraryPCBFMinInterventionDrift(PLCBF):
                 self._solve_policy_candidate(name, u_nom, values[name], gradients[name], f, G)
             )
 
+        self.metrics.record_projection_audits(self.last_candidate_results)
         self.metrics.num_candidate_qps_solved += sum(
             result.qp_solved for result in self.last_candidate_results
         )

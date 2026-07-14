@@ -1,6 +1,7 @@
 """Focused fairness and failure tests for the additive Quad3D baselines."""
 
 from collections import OrderedDict
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -63,6 +64,18 @@ def initial_state():
     state = np.zeros(12, dtype=float)
     state[:2] = (10.0, 10.0)
     return state
+
+
+def failed_constraint_audit():
+    return SimpleNamespace(
+        passed=False,
+        constraint_count=4,
+        max_violation=2e-5,
+        max_tolerance=1e-5,
+        max_violation_ratio=2.0,
+        absolute_tolerance=1e-5,
+        relative_tolerance=1e-5,
+    )
 
 
 class Quad3DAdditionalBaselineTests(unittest.TestCase):
@@ -268,9 +281,37 @@ class Quad3DAdditionalBaselineTests(unittest.TestCase):
             time_derivatives[selected],
         )
         self.assertTrue(candidate.feasible)
+        self.assertIs(candidate.post_projection_constraints_satisfied, True)
+        self.assertGreater(candidate.constraint_audit_count, 0)
+        self.assertLessEqual(candidate.max_post_projection_violation_ratio, 1.0)
         np.testing.assert_allclose(
             candidate.u, expected_control, atol=2e-5, rtol=2e-5
         )
+
+    def test_lib_rejects_failed_post_projection_constraint_audit(self):
+        controller = LibraryPCBFMinInterventionQuad3D(
+            self.spec, dt=self.env.dt, backup_horizon=0.2, num_angle_policies=2
+        )
+        with patch(
+            "examples.warehouse.algorithms.library_pcbf_mi_quad3d."
+            "audit_cvxpy_inequalities",
+            return_value=failed_constraint_audit(),
+        ):
+            candidate = controller._solve_candidate_qp(
+                policy_name="angle_0",
+                policy_index=0,
+                state=initial_state(),
+                u_nom=np.zeros(4),
+                value=1.0,
+                gradient=np.zeros(12),
+                time_derivative=0.0,
+            )
+
+        self.assertFalse(candidate.feasible)
+        self.assertIsNone(candidate.u)
+        self.assertIs(candidate.post_projection_constraints_satisfied, False)
+        self.assertEqual(candidate.max_post_projection_violation_ratio, 2.0)
+        self.assertEqual(candidate.error, "post-projection constraint audit failed")
 
     def test_mb_no_candidate_is_explicit_failure(self):
         controller = MultiBackupCBFMinInterventionQuad3D(
@@ -421,6 +462,11 @@ class Quad3DAdditionalBaselineTests(unittest.TestCase):
         self.assertTrue(strict_result.feasible)
         self.assertTrue(strict_result.rollout_safe)
         self.assertTrue(strict_result.terminal_safe)
+        self.assertIs(strict_result.post_projection_constraints_satisfied, True)
+        self.assertGreater(strict_result.constraint_audit_count, 0)
+        self.assertLessEqual(
+            strict_result.max_post_projection_violation_ratio, 1.0
+        )
         np.testing.assert_allclose(strict_result.u, legacy_result, atol=2e-4, rtol=2e-4)
         np.testing.assert_allclose(
             candidate.latest_backup_trajectory,
@@ -428,6 +474,37 @@ class Quad3DAdditionalBaselineTests(unittest.TestCase):
             atol=1e-8,
             rtol=1e-8,
         )
+
+    def test_mb_rejects_failed_post_projection_constraint_audit(self):
+        controller = MultiBackupCBFMinInterventionQuad3D(
+            self.robot, self.spec, num_angle_policies=1
+        )
+        controller.set_environment(self.env)
+        controller.update_obstacles([], self.env.get_static_obstacles())
+        candidate = controller._candidate_filters["stop"]
+        candidate.set_moving_obstacles(None)
+        state = initial_state()
+        state[2:12] = np.array(
+            [0.2, 0.04, -0.03, 0.02, 0.35, -0.25, 0.1, 0.03, -0.02, 0.01]
+        )
+        nominal = np.array([0.4, -0.3, 0.2, -0.1])
+        candidate.set_nominal_trajectory(
+            None, np.repeat(nominal.reshape(1, -1), 4, axis=0)
+        )
+
+        with patch(
+            "examples.warehouse.algorithms.multi_backup_cbf_mi_quad3d."
+            "audit_cvxpy_inequalities",
+            return_value=failed_constraint_audit(),
+        ):
+            result = candidate.solve_candidate(state, nominal)
+
+        self.assertTrue(result.qp_solved)
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.u)
+        self.assertIs(result.post_projection_constraints_satisfied, False)
+        self.assertEqual(result.max_post_projection_violation_ratio, 2.0)
+        self.assertEqual(result.error, "post-projection constraint audit failed")
 
     def test_mb_terminal_proxy_uses_velocity_and_rejects_nonhover_yaw(self):
         controller = MultiBackupCBFMinInterventionQuad3D(

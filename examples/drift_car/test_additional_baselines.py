@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import cvxpy as cp
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -14,6 +15,12 @@ from safe_control.robots.drifting_car import DriftingCar
 
 from examples.drift_car import benchmark_additional_baselines as benchmark
 from examples.drift_car import benchmark_black_ice as historical_benchmark
+from examples.drift_car.algorithms import (
+    library_pcbf_mi_drift as library_pcbf_module,
+)
+from examples.drift_car.algorithms import (
+    multi_backup_cbf_mi_drift as multi_backup_module,
+)
 from examples.drift_car.algorithms.library_pcbf_mi_drift import (
     LibraryPCBFMinInterventionDrift,
 )
@@ -117,6 +124,18 @@ def _candidate(
         terminal_safe=feasible if terminal_safe is None else terminal_safe,
         solve_time_sec=0.0,
         qp_solved=qp_solved,
+    )
+
+
+def _failed_constraint_audit():
+    return SimpleNamespace(
+        passed=False,
+        constraint_count=3,
+        max_violation=2e-4,
+        max_tolerance=1e-4,
+        max_violation_ratio=2.0,
+        absolute_tolerance=1e-4,
+        relative_tolerance=1e-4,
     )
 
 
@@ -616,6 +635,7 @@ def test_single_policy_backup_candidate_matches_existing_backup_cbf():
     strict = controller.filters["stop"]
     state = np.array(state, copy=True)
     state[[3, 4, 5, 6, 7]] = 0.0
+    state[5] = 2.0
     legacy = BackupCBF(
         robot=controller.robot,
         robot_spec=controller.robot_spec,
@@ -631,6 +651,10 @@ def test_single_policy_backup_candidate_matches_existing_backup_cbf():
     candidate = strict.solve_candidate(state, np.zeros(2))
     legacy_output = legacy.solve_control_problem(state).reshape(-1)
     assert candidate.feasible
+    assert candidate.qp_solved is True
+    assert candidate.post_projection_constraints_satisfied is True
+    assert candidate.constraint_audit_count > 0
+    assert candidate.max_post_projection_violation_ratio <= 1.0
     np.testing.assert_allclose(candidate.u, legacy_output, atol=2e-4, rtol=2e-4)
     legacy_rollout, _ = legacy._integrate_backup_trajectory(state)
     # The strict wrapper deliberately adds the terminal t=T sample locally so
@@ -671,6 +695,9 @@ def test_single_policy_library_qp_matches_plcbf_qp():
         nominal, values[name], gradient, f, G
     ).reshape(-1)
     assert result.feasible
+    assert result.post_projection_constraints_satisfied is True
+    assert result.constraint_audit_count > 0
+    assert result.max_post_projection_violation_ratio <= 1.0
     np.testing.assert_allclose(result.u, expected, atol=2e-4, rtol=2e-4)
 
 
@@ -680,12 +707,17 @@ def test_library_candidate_projects_solver_residual_before_scoring(monkeypatch):
     raw_control = np.asarray(controller.u_max, dtype=float).copy()
     raw_control[0] += 0.5 * INPUT_TOL
 
-    def fake_solve(*args, **kwargs):
+    def fake_solve(problem, *args, **kwargs):
         del args, kwargs
-        controller.status = "optimal"
-        return raw_control.copy()
+        for variable in problem.variables():
+            if variable.shape == (2,):
+                variable.value = raw_control / controller.u_max
+            else:
+                variable.value = 0.0
+        problem._status = cp.OPTIMAL
+        problem._solver_stats = SimpleNamespace(solver_name="SCS")
 
-    monkeypatch.setattr(controller, "_solve_cbf_qp", fake_solve)
+    monkeypatch.setattr(cp.Problem, "solve", fake_solve)
     result = controller._solve_policy_candidate(
         "lane_change_left",
         nominal,
@@ -697,9 +729,60 @@ def test_library_candidate_projects_solver_residual_before_scoring(monkeypatch):
 
     assert result.feasible is True
     np.testing.assert_array_equal(result.u, controller.u_max)
+    assert result.projection_occurred is True
+    assert result.projection_delta_inf == pytest.approx(0.5 * INPUT_TOL)
+    assert result.post_projection_constraints_satisfied is True
+    assert result.max_post_projection_violation_ratio <= 1.0
     assert result.objective == pytest.approx(
         controller._intervention_objective(controller.u_max, nominal)
     )
+
+
+def test_library_candidate_rejects_failed_post_projection_audit(monkeypatch):
+    controller, _, _, _, _ = _library_baseline()
+    monkeypatch.setattr(
+        library_pcbf_module,
+        "audit_cvxpy_inequalities",
+        lambda *args, **kwargs: _failed_constraint_audit(),
+    )
+
+    result = controller._solve_policy_candidate(
+        "lane_change_left",
+        np.zeros(2),
+        1.0,
+        np.zeros(8),
+        np.zeros(8),
+        np.zeros((8, 2)),
+    )
+
+    assert result.feasible is False
+    assert result.u is None
+    assert result.post_projection_constraints_satisfied is False
+    assert result.max_post_projection_violation_ratio == pytest.approx(2.0)
+    assert result.error == "post-projection constraint audit failed"
+
+
+def test_multi_backup_candidate_rejects_failed_post_projection_audit(monkeypatch):
+    controller, _, state, _, _ = _multi_backup_baseline()
+    state = np.array(state, copy=True)
+    state[[3, 4, 5, 6, 7]] = 0.0
+    state[5] = 2.0
+    candidate = controller.filters["stop"]
+    candidate.set_environment(controller.env)
+    monkeypatch.setattr(
+        multi_backup_module,
+        "audit_cvxpy_inequalities",
+        lambda *args, **kwargs: _failed_constraint_audit(),
+    )
+
+    result = candidate.solve_candidate(state, np.zeros(2))
+
+    assert result.qp_solved is True
+    assert result.feasible is False
+    assert result.u is None
+    assert result.post_projection_constraints_satisfied is False
+    assert result.max_post_projection_violation_ratio == pytest.approx(2.0)
+    assert result.error == "post-projection constraint audit failed"
 
 
 def test_certificate_loss_does_not_increment_historical_failure(monkeypatch):

@@ -28,12 +28,15 @@ import numpy as np
 
 from safe_control.position_control.backup_cbf_qp import BackupCBF
 
+from examples.additional_baseline_control_utils import (
+    audit_cvxpy_inequalities,
+    project_solver_control_with_diagnostics,
+)
 from examples.drift_car.algorithms.multi_policy_baseline_common_drift import (
     CandidateCBFResult,
     MultiPolicyMetrics,
     NOMINAL_POLICY_REPRESENTATION,
     assert_runtime_library_equal,
-    project_bounded_control,
     select_minimum_intervention,
 )
 from examples.drift_car.algorithms.plcbf_drift import PLCBF
@@ -41,6 +44,10 @@ from examples.drift_car.controllers.drift_policies_jax import (
     LaneChangeControllerJAX,
     StoppingControllerJAX,
 )
+
+
+_OSQP_AUDIT_TOL = 1e-5
+_SCS_AUDIT_TOL = 1e-4
 
 
 @dataclass(frozen=True)
@@ -479,8 +486,19 @@ class _StrictCandidateBackupCBF(BackupCBF):
             raw_control = np.asarray(
                 np.diag(u_scale) @ scaled_control.value, dtype=float
             ).reshape(-1)
-            control = project_bounded_control(raw_control, u_min, u_max)
-            if control is None:
+            solver_name = str(problem.solver_stats.solver_name)
+            audit_tolerance = (
+                _SCS_AUDIT_TOL
+                if solver_name.upper() == "SCS"
+                else _OSQP_AUDIT_TOL
+            )
+            projection = project_solver_control_with_diagnostics(
+                raw_control,
+                u_min,
+                u_max,
+                expected_shape=(self.n_controls,),
+            )
+            if projection.control is None:
                 return CandidateCBFResult(
                     policy_name=self.policy_name,
                     feasible=False,
@@ -492,7 +510,40 @@ class _StrictCandidateBackupCBF(BackupCBF):
                     solve_time_sec=time.perf_counter() - started,
                     qp_solved=True,
                     error="QP returned a non-finite or out-of-bounds input",
+                    raw_u=raw_control.copy(),
+                    solver_name=solver_name,
                 )
+            audit = audit_cvxpy_inequalities(
+                constraints,
+                [(scaled_control, projection.control / u_scale)],
+                absolute_tolerance=audit_tolerance,
+                relative_tolerance=audit_tolerance,
+            )
+            if not audit.passed:
+                return CandidateCBFResult(
+                    policy_name=self.policy_name,
+                    feasible=False,
+                    u=None,
+                    objective=float("inf"),
+                    solver_status=solver_status,
+                    rollout_safe=rollout_safe,
+                    terminal_safe=terminal_safe,
+                    solve_time_sec=time.perf_counter() - started,
+                    qp_solved=True,
+                    error="post-projection constraint audit failed",
+                    raw_u=raw_control.copy(),
+                    projected_u=projection.control.copy(),
+                    projection_occurred=projection.projection_applied,
+                    projection_delta_inf=projection.projection_delta_inf,
+                    post_projection_constraints_satisfied=False,
+                    max_post_projection_constraint_violation=audit.max_violation,
+                    max_post_projection_violation_ratio=audit.max_violation_ratio,
+                    constraint_audit_atol=audit.absolute_tolerance,
+                    constraint_audit_rtol=audit.relative_tolerance,
+                    constraint_audit_count=audit.constraint_count,
+                    solver_name=solver_name,
+                )
+            control = projection.control
             intervention = self.Q_u * (control / u_scale - nominal_scaled)
             return CandidateCBFResult(
                 policy_name=self.policy_name,
@@ -505,6 +556,17 @@ class _StrictCandidateBackupCBF(BackupCBF):
                 solve_time_sec=time.perf_counter() - started,
                 qp_solved=True,
                 error=None,
+                raw_u=raw_control.copy(),
+                projected_u=control.copy(),
+                projection_occurred=projection.projection_applied,
+                projection_delta_inf=projection.projection_delta_inf,
+                post_projection_constraints_satisfied=True,
+                max_post_projection_constraint_violation=audit.max_violation,
+                max_post_projection_violation_ratio=audit.max_violation_ratio,
+                constraint_audit_atol=audit.absolute_tolerance,
+                constraint_audit_rtol=audit.relative_tolerance,
+                constraint_audit_count=audit.constraint_count,
+                solver_name=solver_name,
             )
         except Exception as exc:
             return CandidateCBFResult(
@@ -717,6 +779,7 @@ class MultiBackupCBFMinInterventionDrift:
         self.runtime_error = False
         self.fallback_applied = False
         self.last_candidate_results = self.evaluate_candidates(robot_state, u_nom)
+        self.metrics.record_projection_audits(self.last_candidate_results)
         self.metrics.num_candidate_qps_solved += sum(
             result.qp_solved for result in self.last_candidate_results
         )

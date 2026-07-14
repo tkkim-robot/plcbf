@@ -39,6 +39,18 @@ class CandidateCBFResult:
     solve_time_sec: float
     qp_solved: bool = False
     error: Optional[str] = None
+    raw_u: Optional[np.ndarray] = None
+    projected_u: Optional[np.ndarray] = None
+    projection_occurred: bool = False
+    projection_delta_inf: float = 0.0
+    post_projection_constraints_satisfied: Optional[bool] = None
+    max_post_projection_constraint_violation: Optional[float] = None
+    max_post_projection_violation_ratio: Optional[float] = None
+    constraint_audit_atol: Optional[float] = None
+    constraint_audit_rtol: Optional[float] = None
+    constraint_audit_count: int = 0
+    solver_name: Optional[str] = None
+    cbf_slack: Optional[float] = None
 
 
 @dataclass
@@ -60,6 +72,22 @@ class MultiPolicyMetrics:
     fallback_step_count: int = 0
     candidate_qp_failure_count: int = 0
     candidate_evaluation_error_count: int = 0
+    num_post_projection_audits: int = 0
+    projection_event_count: int = 0
+    post_projection_rejection_count: int = 0
+    max_projection_delta_inf: float = 0.0
+    max_post_projection_constraint_violation: float = 0.0
+    max_post_projection_violation_ratio: float = 0.0
+    num_post_projection_audits_per_step: list[int] = field(default_factory=list)
+    projection_event_count_per_step: list[int] = field(default_factory=list)
+    post_projection_rejection_count_per_step: list[int] = field(default_factory=list)
+    max_projection_delta_inf_per_step: list[float] = field(default_factory=list)
+    max_post_projection_constraint_violation_per_step: list[float] = field(
+        default_factory=list
+    )
+    max_post_projection_violation_ratio_per_step: list[float] = field(
+        default_factory=list
+    )
     _previous_policy: Optional[str] = None
 
     def record_selection(self, policy_name: str, intervention_l2: float) -> None:
@@ -68,6 +96,59 @@ class MultiPolicyMetrics:
         self._previous_policy = policy_name
         self.selected_policy_histogram[policy_name] += 1
         self.intervention_l2.append(float(intervention_l2))
+
+    def record_projection_audits(
+        self, results: Sequence[CandidateCBFResult]
+    ) -> None:
+        """Accumulate one control step's post-projection candidate audits."""
+
+        audited = [
+            result
+            for result in results
+            if result.post_projection_constraints_satisfied is not None
+        ]
+        projection_events = [result for result in audited if result.projection_occurred]
+        rejected = [
+            result
+            for result in audited
+            if result.post_projection_constraints_satisfied is False
+        ]
+
+        delta_max = max(
+            (float(result.projection_delta_inf) for result in audited),
+            default=0.0,
+        )
+        violation_max = max(
+            (
+                float(result.max_post_projection_constraint_violation or 0.0)
+                for result in audited
+            ),
+            default=0.0,
+        )
+        ratio_max = max(
+            (
+                float(result.max_post_projection_violation_ratio or 0.0)
+                for result in audited
+            ),
+            default=0.0,
+        )
+
+        self.num_post_projection_audits += len(audited)
+        self.projection_event_count += len(projection_events)
+        self.post_projection_rejection_count += len(rejected)
+        self.max_projection_delta_inf = max(self.max_projection_delta_inf, delta_max)
+        self.max_post_projection_constraint_violation = max(
+            self.max_post_projection_constraint_violation, violation_max
+        )
+        self.max_post_projection_violation_ratio = max(
+            self.max_post_projection_violation_ratio, ratio_max
+        )
+        self.num_post_projection_audits_per_step.append(len(audited))
+        self.projection_event_count_per_step.append(len(projection_events))
+        self.post_projection_rejection_count_per_step.append(len(rejected))
+        self.max_projection_delta_inf_per_step.append(delta_max)
+        self.max_post_projection_constraint_violation_per_step.append(violation_max)
+        self.max_post_projection_violation_ratio_per_step.append(ratio_max)
 
     def as_dict(self) -> Dict[str, Any]:
         values = np.asarray(self.intervention_l2, dtype=float)
@@ -91,6 +172,37 @@ class MultiPolicyMetrics:
             "candidate_qp_failure_count": int(self.candidate_qp_failure_count),
             "candidate_evaluation_error_count": int(
                 self.candidate_evaluation_error_count
+            ),
+            "num_post_projection_audits": int(self.num_post_projection_audits),
+            "projection_occurred": bool(self.projection_event_count > 0),
+            "projection_event_count": int(self.projection_event_count),
+            "post_projection_rejection_count": int(
+                self.post_projection_rejection_count
+            ),
+            "max_projection_delta_inf": float(self.max_projection_delta_inf),
+            "max_post_projection_constraint_violation": float(
+                self.max_post_projection_constraint_violation
+            ),
+            "max_post_projection_violation_ratio": float(
+                self.max_post_projection_violation_ratio
+            ),
+            "num_post_projection_audits_per_step": list(
+                self.num_post_projection_audits_per_step
+            ),
+            "projection_event_count_per_step": list(
+                self.projection_event_count_per_step
+            ),
+            "post_projection_rejection_count_per_step": list(
+                self.post_projection_rejection_count_per_step
+            ),
+            "max_projection_delta_inf_per_step": list(
+                self.max_projection_delta_inf_per_step
+            ),
+            "max_post_projection_constraint_violation_per_step": list(
+                self.max_post_projection_constraint_violation_per_step
+            ),
+            "max_post_projection_violation_ratio_per_step": list(
+                self.max_post_projection_violation_ratio_per_step
             ),
         }
 

@@ -47,17 +47,20 @@ import numpy as np
 
 from safe_control.position_control.backup_cbf_qp import BackupCBF
 
+from examples.additional_baseline_control_utils import audit_cvxpy_inequalities
 from examples.warehouse.controllers.policies_quad3d_jax import (
     WaypointPolicyParams,
 )
 from examples.warehouse.algorithms.additional_baseline_control_quad3d import (
     SOLVER_INPUT_TOL,
-    project_quad3d_solver_control,
+    project_quad3d_solver_control_with_diagnostics,
 )
 from examples.warehouse.algorithms.plcbf_quad3d import PLCBF_Quad3D
 
 
 ACCEPTED_QP_STATUSES = frozenset({"optimal", "optimal_inaccurate"})
+_OSQP_AUDIT_TOL = SOLVER_INPUT_TOL
+_SCS_AUDIT_TOL = 1e-4
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,54 @@ class CandidateCBFResult:
     solve_time_sec: float
     qp_solved: bool = False
     error: Optional[str] = None
+    raw_u: Optional[np.ndarray] = None
+    projected_u: Optional[np.ndarray] = None
+    projection_occurred: bool = False
+    projection_delta_inf: float = 0.0
+    post_projection_constraints_satisfied: Optional[bool] = None
+    max_post_projection_constraint_violation: Optional[float] = None
+    max_post_projection_violation_ratio: Optional[float] = None
+    constraint_audit_atol: Optional[float] = None
+    constraint_audit_rtol: Optional[float] = None
+    constraint_audit_count: int = 0
+    solver_name: Optional[str] = None
+
+
+def _projection_step_metrics(results: Iterable[CandidateCBFResult]) -> Dict[str, object]:
+    """Return one step's aggregate post-projection audit diagnostics."""
+
+    results = tuple(results)
+    audited = [
+        result
+        for result in results
+        if result.post_projection_constraints_satisfied is not None
+    ]
+    projection_events = [result for result in audited if result.projection_occurred]
+    rejected = [
+        result
+        for result in audited
+        if result.post_projection_constraints_satisfied is False
+    ]
+    return {
+        "num_post_projection_audits": len(audited),
+        "projection_occurred": bool(projection_events),
+        "projection_event_count": len(projection_events),
+        "post_projection_rejection_count": len(rejected),
+        "max_projection_delta_inf": max(
+            (result.projection_delta_inf for result in audited), default=0.0
+        ),
+        "max_post_projection_constraint_violation": max(
+            (
+                result.max_post_projection_constraint_violation or 0.0
+                for result in audited
+            ),
+            default=0.0,
+        ),
+        "max_post_projection_violation_ratio": max(
+            (result.max_post_projection_violation_ratio or 0.0 for result in audited),
+            default=0.0,
+        ),
+    }
 
 
 class _FrozenGhostPredictor:
@@ -810,6 +861,12 @@ class _StrictBackupCBFCandidate(BackupCBF):
 
             scaled_solution = np.asarray(u_scaled.value, dtype=float).reshape(-1)
             raw_solution = u_scale * scaled_solution
+            solver_name = str(problem.solver_stats.solver_name)
+            audit_tolerance = (
+                _SCS_AUDIT_TOL
+                if solver_name.upper() == "SCS"
+                else _OSQP_AUDIT_TOL
+            )
             input_tol = SOLVER_INPUT_TOL
             valid = (
                 raw_solution.shape == (self.n_controls,)
@@ -829,17 +886,50 @@ class _StrictBackupCBFCandidate(BackupCBF):
                     solve_time_sec=time.perf_counter() - started,
                     qp_solved=True,
                     error="QP returned a non-finite or out-of-bounds input",
+                    raw_u=raw_solution.copy(),
+                    solver_name=solver_name,
                 )
 
-            u_solution = project_quad3d_solver_control(
+            projection = project_quad3d_solver_control_with_diagnostics(
                 raw_solution,
                 -u_scale,
                 u_scale,
                 expected_dimension=self.n_controls,
                 tolerance=input_tol,
             )
-            if u_solution is None:  # Kept explicit for static type checkers.
+            if projection.control is None:  # Kept explicit for static type checkers.
                 raise AssertionError("validated Backup-CBF solution could not be projected")
+            audit = audit_cvxpy_inequalities(
+                constraints,
+                [(u_scaled, projection.control / u_scale)],
+                absolute_tolerance=audit_tolerance,
+                relative_tolerance=audit_tolerance,
+            )
+            if not audit.passed:
+                return CandidateCBFResult(
+                    policy_name=name,
+                    feasible=False,
+                    u=None,
+                    objective=float("inf"),
+                    solver_status=status,
+                    rollout_safe=rollout_safe,
+                    terminal_safe=terminal_safe,
+                    solve_time_sec=time.perf_counter() - started,
+                    qp_solved=True,
+                    error="post-projection constraint audit failed",
+                    raw_u=raw_solution.copy(),
+                    projected_u=projection.control.copy(),
+                    projection_occurred=projection.projection_applied,
+                    projection_delta_inf=projection.projection_delta_inf,
+                    post_projection_constraints_satisfied=False,
+                    max_post_projection_constraint_violation=audit.max_violation,
+                    max_post_projection_violation_ratio=audit.max_violation_ratio,
+                    constraint_audit_atol=audit.absolute_tolerance,
+                    constraint_audit_rtol=audit.relative_tolerance,
+                    constraint_audit_count=audit.constraint_count,
+                    solver_name=solver_name,
+                )
+            u_solution = projection.control
             scaled_solution = u_solution / u_scale
             realized_error = self.Q_u * (scaled_solution - u_ref_scaled)
             realized_objective = float(realized_error @ realized_error)
@@ -854,6 +944,17 @@ class _StrictBackupCBFCandidate(BackupCBF):
                 solve_time_sec=time.perf_counter() - started,
                 qp_solved=True,
                 error=None,
+                raw_u=raw_solution.copy(),
+                projected_u=u_solution.copy(),
+                projection_occurred=projection.projection_applied,
+                projection_delta_inf=projection.projection_delta_inf,
+                post_projection_constraints_satisfied=True,
+                max_post_projection_constraint_violation=audit.max_violation,
+                max_post_projection_violation_ratio=audit.max_violation_ratio,
+                constraint_audit_atol=audit.absolute_tolerance,
+                constraint_audit_rtol=audit.relative_tolerance,
+                constraint_audit_count=audit.constraint_count,
+                solver_name=solver_name,
             )
         except Exception as exc:
             return CandidateCBFResult(
@@ -1191,6 +1292,7 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
                 "terminal_failure_count": sum(
                     int(result.terminal_safe is False) for result in candidate_results
                 ),
+                **_projection_step_metrics(candidate_results),
                 "compute_time_sec": time.perf_counter() - step_started,
             }
             if self.runtime_error:
@@ -1237,6 +1339,7 @@ class MultiBackupCBFMinInterventionQuad3D(PLCBF_Quad3D):
             "terminal_failure_count": sum(
                 int(result.terminal_safe is False) for result in candidate_results
             ),
+            **_projection_step_metrics(candidate_results),
             "compute_time_sec": time.perf_counter() - step_started,
         }
         return np.asarray(best.u, dtype=float).reshape(-1)

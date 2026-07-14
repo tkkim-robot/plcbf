@@ -91,6 +91,23 @@ class TrialResult:
     num_feasible_backup_candidates_per_step: List[int] = field(default_factory=list)
     num_rollout_safe_candidates_per_step: List[int] = field(default_factory=list)
     num_qp_feasible_candidates_per_step: List[int] = field(default_factory=list)
+    projection_occurred: bool = False
+    num_post_projection_audits: int = 0
+    projection_event_count: int = 0
+    post_projection_rejection_count: int = 0
+    max_projection_delta_inf: float = 0.0
+    max_post_projection_constraint_violation: float = 0.0
+    max_post_projection_violation_ratio: float = 0.0
+    num_post_projection_audits_per_step: List[int] = field(default_factory=list)
+    projection_event_count_per_step: List[int] = field(default_factory=list)
+    post_projection_rejection_count_per_step: List[int] = field(default_factory=list)
+    max_projection_delta_inf_per_step: List[float] = field(default_factory=list)
+    max_post_projection_constraint_violation_per_step: List[float] = field(
+        default_factory=list
+    )
+    max_post_projection_violation_ratio_per_step: List[float] = field(
+        default_factory=list
+    )
 
 
 @dataclass
@@ -125,6 +142,13 @@ class SummaryRow:
     avg_nominal_tracking_pct: float
     avg_compute_ms: float
     total_timed_steps: int
+    projection_trial_count: int
+    num_post_projection_audits: int
+    projection_event_count: int
+    post_projection_rejection_count: int
+    max_projection_delta_inf: float
+    max_post_projection_constraint_violation: float
+    max_post_projection_violation_ratio: float
     library_size: int = 0
 
 
@@ -414,6 +438,18 @@ def run_trial(
     terminal_failure_count = 0
     rollout_safe_counts: List[float] = []
     qp_feasible_counts: List[float] = []
+    num_post_projection_audits = 0
+    projection_event_count = 0
+    post_projection_rejection_count = 0
+    max_projection_delta_inf = 0.0
+    max_post_projection_constraint_violation = 0.0
+    max_post_projection_violation_ratio = 0.0
+    num_post_projection_audits_per_step: List[int] = []
+    projection_event_count_per_step: List[int] = []
+    post_projection_rejection_count_per_step: List[int] = []
+    max_projection_delta_inf_per_step: List[float] = []
+    max_post_projection_constraint_violation_per_step: List[float] = []
+    max_post_projection_violation_ratio_per_step: List[float] = []
 
     for step in range(max_steps):
         try:
@@ -521,6 +557,41 @@ def run_trial(
             qp_feasible_counts.append(
                 float(step_metrics["num_qp_feasible_candidates"])
             )
+        step_audits = int(step_metrics.get("num_post_projection_audits", 0) or 0)
+        step_projection_events = int(
+            step_metrics.get("projection_event_count", 0) or 0
+        )
+        step_projection_rejections = int(
+            step_metrics.get("post_projection_rejection_count", 0) or 0
+        )
+        step_max_delta = float(
+            step_metrics.get("max_projection_delta_inf", 0.0) or 0.0
+        )
+        step_max_violation = float(
+            step_metrics.get(
+                "max_post_projection_constraint_violation", 0.0
+            )
+            or 0.0
+        )
+        step_max_ratio = float(
+            step_metrics.get("max_post_projection_violation_ratio", 0.0) or 0.0
+        )
+        num_post_projection_audits += step_audits
+        projection_event_count += step_projection_events
+        post_projection_rejection_count += step_projection_rejections
+        max_projection_delta_inf = max(max_projection_delta_inf, step_max_delta)
+        max_post_projection_constraint_violation = max(
+            max_post_projection_constraint_violation, step_max_violation
+        )
+        max_post_projection_violation_ratio = max(
+            max_post_projection_violation_ratio, step_max_ratio
+        )
+        num_post_projection_audits_per_step.append(step_audits)
+        projection_event_count_per_step.append(step_projection_events)
+        post_projection_rejection_count_per_step.append(step_projection_rejections)
+        max_projection_delta_inf_per_step.append(step_max_delta)
+        max_post_projection_constraint_violation_per_step.append(step_max_violation)
+        max_post_projection_violation_ratio_per_step.append(step_max_ratio)
 
         intervention_l2_values.append(float(np.linalg.norm(u_safe_vec - u_nom)))
         if np.linalg.norm(u_safe_vec - u_nom) < tracking_tol:
@@ -652,6 +723,29 @@ def run_trial(
         num_qp_feasible_candidates_per_step=[
             int(value) for value in qp_feasible_counts
         ],
+        projection_occurred=bool(projection_event_count > 0),
+        num_post_projection_audits=num_post_projection_audits,
+        projection_event_count=projection_event_count,
+        post_projection_rejection_count=post_projection_rejection_count,
+        max_projection_delta_inf=max_projection_delta_inf,
+        max_post_projection_constraint_violation=(
+            max_post_projection_constraint_violation
+        ),
+        max_post_projection_violation_ratio=(
+            max_post_projection_violation_ratio
+        ),
+        num_post_projection_audits_per_step=num_post_projection_audits_per_step,
+        projection_event_count_per_step=projection_event_count_per_step,
+        post_projection_rejection_count_per_step=(
+            post_projection_rejection_count_per_step
+        ),
+        max_projection_delta_inf_per_step=max_projection_delta_inf_per_step,
+        max_post_projection_constraint_violation_per_step=(
+            max_post_projection_constraint_violation_per_step
+        ),
+        max_post_projection_violation_ratio_per_step=(
+            max_post_projection_violation_ratio_per_step
+        ),
     )
 
 
@@ -669,6 +763,23 @@ def summarize_trials(algo_spec: AlgoSpec, trials: List[TrialResult]) -> SummaryR
     horizon_survivals = sum(int(t.survived_horizon) for t in trials)
     successful_outcomes = sum(int(t.completed_or_survived) for t in trials)
     filter_failures = sum(int(t.filter_failure) for t in trials)
+    projection_trial_count = sum(int(t.projection_occurred) for t in trials)
+    num_post_projection_audits = sum(
+        t.num_post_projection_audits for t in trials
+    )
+    projection_event_count = sum(t.projection_event_count for t in trials)
+    post_projection_rejection_count = sum(
+        t.post_projection_rejection_count for t in trials
+    )
+    max_projection_delta_inf = max(
+        (t.max_projection_delta_inf for t in trials), default=0.0
+    )
+    max_post_projection_constraint_violation = max(
+        (t.max_post_projection_constraint_violation for t in trials), default=0.0
+    )
+    max_post_projection_violation_ratio = max(
+        (t.max_post_projection_violation_ratio for t in trials), default=0.0
+    )
 
     nominal_vals = [t.nominal_tracking_pct for t in trials]
     avg_nominal = float(np.mean(nominal_vals)) if nominal_vals else 0.0
@@ -708,6 +819,17 @@ def summarize_trials(algo_spec: AlgoSpec, trials: List[TrialResult]) -> SummaryR
         avg_nominal_tracking_pct=avg_nominal,
         avg_compute_ms=avg_compute_ms,
         total_timed_steps=total_timed_steps,
+        projection_trial_count=projection_trial_count,
+        num_post_projection_audits=num_post_projection_audits,
+        projection_event_count=projection_event_count,
+        post_projection_rejection_count=post_projection_rejection_count,
+        max_projection_delta_inf=max_projection_delta_inf,
+        max_post_projection_constraint_violation=(
+            max_post_projection_constraint_violation
+        ),
+        max_post_projection_violation_ratio=(
+            max_post_projection_violation_ratio
+        ),
         library_size=max((t.p_or_library_size for t in trials), default=0),
     )
 
@@ -859,6 +981,38 @@ def format_markdown(
             f"{summary.avg_compute_ms:.3f} |"
         )
     lines.append("")
+    lines.extend(
+        [
+            "## Post-projection QP audit",
+            "",
+            (
+                "Every finite, actuator-tolerance-valid successful-status candidate "
+                "is checked against its original QP inequalities after actuator-bound "
+                "projection. A residual above the declared post-projection audit "
+                "tolerance rejects that candidate before minimum-intervention "
+                "selection."
+            ),
+            "",
+            (
+                "| Algorithm | Audited candidates | Trials with projection | "
+                "Projection events (candidates) | Audit rejections | Max "
+                "$\\|\\Delta u\\|_\\infty$ (native units) | Max violation | Max "
+                "violation/tolerance |"
+            ),
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for summary in summaries:
+        lines.append(
+            f"| {summary.label} | {summary.num_post_projection_audits} | "
+            f"{summary.projection_trial_count}/{summary.n_trials} | "
+            f"{summary.projection_event_count} | "
+            f"{summary.post_projection_rejection_count} | "
+            f"{summary.max_projection_delta_inf:.9g} | "
+            f"{summary.max_post_projection_constraint_violation:.9g} | "
+            f"{summary.max_post_projection_violation_ratio:.9g} |"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -992,6 +1146,20 @@ def main(argv=None):
             "warmup_calls_excluded": args.jit_warmup_steps,
             "scope": "solve_control_problem wall-clock time",
         },
+        "projection_audit": {
+            "scope": (
+                "every finite, actuator-tolerance-valid successful-status candidate QP"
+            ),
+            "action": (
+                "project to exact actuator bounds, evaluate every original affine "
+                "QP inequality, and reject the candidate if any scale-aware "
+                "residual exceeds its declared tolerance"
+            ),
+            "osqp_absolute_tolerance": 1e-5,
+            "osqp_relative_tolerance": 1e-5,
+            "multi_backup_scs_fallback_absolute_tolerance": 1e-4,
+            "multi_backup_scs_fallback_relative_tolerance": 1e-4,
+        },
         "summaries": [asdict(summary) for summary in summaries],
         "trials": {
             key: [asdict(trial) for trial in trials]
@@ -1015,7 +1183,11 @@ def main(argv=None):
             rows.append(row)
     if rows:
         with output_csv.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=list(rows[0].keys()),
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(rows)
 

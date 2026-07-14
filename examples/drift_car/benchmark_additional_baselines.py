@@ -149,6 +149,23 @@ class EpisodeResult:
     qp_infeasible_steps: int = 0
     fallback_steps: int = 0
     candidate_qp_failure_count: int = 0
+    projection_occurred: bool = False
+    num_post_projection_audits: int = 0
+    projection_event_count: int = 0
+    post_projection_rejection_count: int = 0
+    max_projection_delta_inf: float = 0.0
+    max_post_projection_constraint_violation: float = 0.0
+    max_post_projection_violation_ratio: float = 0.0
+    num_post_projection_audits_per_step: List[int] = field(default_factory=list)
+    projection_event_count_per_step: List[int] = field(default_factory=list)
+    post_projection_rejection_count_per_step: List[int] = field(default_factory=list)
+    max_projection_delta_inf_per_step: List[float] = field(default_factory=list)
+    max_post_projection_constraint_violation_per_step: List[float] = field(
+        default_factory=list
+    )
+    max_post_projection_violation_ratio_per_step: List[float] = field(
+        default_factory=list
+    )
 
     @property
     def nominal_tracking_pct(self) -> float:
@@ -731,6 +748,51 @@ def run_episode(
                 controller_metrics.get("candidate_qp_failure_count", 0),
             )
         ),
+        projection_occurred=bool(
+            controller_metrics.get("projection_occurred", False)
+        ),
+        num_post_projection_audits=int(
+            controller_metrics.get("num_post_projection_audits", 0)
+        ),
+        projection_event_count=int(
+            controller_metrics.get("projection_event_count", 0)
+        ),
+        post_projection_rejection_count=int(
+            controller_metrics.get("post_projection_rejection_count", 0)
+        ),
+        max_projection_delta_inf=float(
+            controller_metrics.get("max_projection_delta_inf", 0.0)
+        ),
+        max_post_projection_constraint_violation=float(
+            controller_metrics.get(
+                "max_post_projection_constraint_violation", 0.0
+            )
+        ),
+        max_post_projection_violation_ratio=float(
+            controller_metrics.get("max_post_projection_violation_ratio", 0.0)
+        ),
+        num_post_projection_audits_per_step=list(
+            controller_metrics.get("num_post_projection_audits_per_step", [])
+        ),
+        projection_event_count_per_step=list(
+            controller_metrics.get("projection_event_count_per_step", [])
+        ),
+        post_projection_rejection_count_per_step=list(
+            controller_metrics.get("post_projection_rejection_count_per_step", [])
+        ),
+        max_projection_delta_inf_per_step=list(
+            controller_metrics.get("max_projection_delta_inf_per_step", [])
+        ),
+        max_post_projection_constraint_violation_per_step=list(
+            controller_metrics.get(
+                "max_post_projection_constraint_violation_per_step", []
+            )
+        ),
+        max_post_projection_violation_ratio_per_step=list(
+            controller_metrics.get(
+                "max_post_projection_violation_ratio_per_step", []
+            )
+        ),
     )
 
 
@@ -784,6 +846,38 @@ def aggregate_results(
         successful_outcome_count = sum(1 for r in rows if r.completed_or_survived)
         filter_failure_count = sum(1 for r in rows if r.filter_failure)
         union_failure_count = sum(1 for r in rows if r.union_failure)
+        projection_trial_count = sum(
+            1 for r in rows if getattr(r, "projection_occurred", False)
+        )
+        num_post_projection_audits = sum(
+            int(getattr(r, "num_post_projection_audits", 0)) for r in rows
+        )
+        projection_event_count = sum(
+            int(getattr(r, "projection_event_count", 0)) for r in rows
+        )
+        post_projection_rejection_count = sum(
+            int(getattr(r, "post_projection_rejection_count", 0)) for r in rows
+        )
+        max_projection_delta_inf = max(
+            (float(getattr(r, "max_projection_delta_inf", 0.0)) for r in rows),
+            default=0.0,
+        )
+        max_post_projection_constraint_violation = max(
+            (
+                float(
+                    getattr(r, "max_post_projection_constraint_violation", 0.0)
+                )
+                for r in rows
+            ),
+            default=0.0,
+        )
+        max_post_projection_violation_ratio = max(
+            (
+                float(getattr(r, "max_post_projection_violation_ratio", 0.0))
+                for r in rows
+            ),
+            default=0.0,
+        )
         nominal_avg = float(np.mean([r.nominal_tracking_pct for r in rows])) if rows else 0.0
         timed_rows = [
             r for r in rows
@@ -824,6 +918,19 @@ def aggregate_results(
                 "filter_failure_rate": 100.0 * filter_failure_count / max(n, 1),
                 "union_failure_count": union_failure_count,
                 "union_failure_rate": 100.0 * union_failure_count / max(n, 1),
+                "projection_trial_count": projection_trial_count,
+                "num_post_projection_audits": num_post_projection_audits,
+                "projection_event_count": projection_event_count,
+                "post_projection_rejection_count": (
+                    post_projection_rejection_count
+                ),
+                "max_projection_delta_inf": max_projection_delta_inf,
+                "max_post_projection_constraint_violation": (
+                    max_post_projection_constraint_violation
+                ),
+                "max_post_projection_violation_ratio": (
+                    max_post_projection_violation_ratio
+                ),
                 "nominal_avg": nominal_avg,
                 "mean_compute_ms": mean_compute_ms,
             }
@@ -886,6 +993,33 @@ def format_markdown_table(
             f"{_fmt_count_rate(row['task_completed_count'], row['n'], row['task_completed_rate'])} | "
             f"{_fmt_count_rate(row['survived_horizon_count'], row['n'], row['survived_horizon_rate'])} | "
             f"{row['mean_compute_ms']:.2f} |"
+        )
+    lines.append("")
+    lines.append("## Post-projection QP audit")
+    lines.append("")
+    lines.append(
+        "Every finite, actuator-tolerance-valid successful-status candidate is "
+        "checked against its original QP inequalities after actuator-bound "
+        "projection. A residual above the declared post-projection audit tolerance "
+        "rejects that candidate before minimum-intervention selection."
+    )
+    lines.append("")
+    lines.append(
+        "| Algorithm | Audited candidates | Trials with projection | Projection "
+        "events (candidates) | Audit rejections | Max "
+        "$\\|\\Delta u\\|_\\infty$ (native units) | Max violation | Max "
+        "violation/tolerance |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for row in summary_rows:
+        lines.append(
+            f"| {row['label']} | {row['num_post_projection_audits']} | "
+            f"{row['projection_trial_count']}/{row['n']} | "
+            f"{row['projection_event_count']} | "
+            f"{row['post_projection_rejection_count']} | "
+            f"{row['max_projection_delta_inf']:.9g} | "
+            f"{row['max_post_projection_constraint_violation']:.9g} | "
+            f"{row['max_post_projection_violation_ratio']:.9g} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -998,6 +1132,23 @@ def main(argv=None):
             "union_failure_definition": UNION_FAILURE_DEFINITION,
             "unrecoverable_infeasible_definition": UNRECOVERABLE_INFEASIBLE_DEFINITION,
             "post_diagnostic_action": "exact control returned by selected baseline",
+            "projection_audit": {
+                "scope": (
+                    "every finite, actuator-tolerance-valid successful-status "
+                    "candidate QP"
+                ),
+                "action": (
+                    "project to exact actuator bounds, evaluate every original "
+                    "affine QP inequality, and reject the candidate if any "
+                    "scale-aware residual exceeds its declared tolerance"
+                ),
+                "osqp_absolute_tolerance": 1e-5,
+                "osqp_relative_tolerance": 1e-5,
+                "multi_backup_scs_fallback_absolute_tolerance": 1e-4,
+                "multi_backup_scs_fallback_relative_tolerance": 1e-4,
+                "drift_library_scs_absolute_tolerance": 1e-4,
+                "drift_library_scs_relative_tolerance": 1e-4,
+            },
             "config": asdict(cfg),
             "summary": summary_rows,
             "trials": {
@@ -1029,7 +1180,11 @@ def main(argv=None):
                 rows.append(row)
         if rows:
             with csv_path.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=list(rows[0].keys()),
+                    lineterminator="\n",
+                )
                 writer.writeheader()
                 writer.writerows(rows)
 
