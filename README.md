@@ -20,7 +20,8 @@ This repository implements **Policy Library CBF (PL-CBF)**. `PL-CBF` is motivate
 - Implemented baseline safety filters such as [Model Predictive Shielding (MPS)](https://ieeexplore.ieee.org/document/9483182), [gatekeeper](https://ieeexplore.ieee.org/abstract/document/10665919), [Backup CBF](https://ieeexplore.ieee.org/document/9683111), [Policy PCBF](https://ieeexplore.ieee.org/document/11122656), Multi-Backup CBF with minimum-intervention selection (`multi_backup_cbf_mi`), and Library PCBF with minimum-intervention selection (`library_pcbf_mi`).
 - Integration with the [safe_control](https://github.com/tkkim-robot/safe_control) repository for simulating robotic navigation, offering various robot dynamics and controllers.
 - Unified base abstractions in `plcbf/plcbf.py`
-- Script-level tests and benchmarks for both `drift_car` and `warehouse` cases
+- Script-level tests and benchmarks for `drift_car`, `warehouse`, nonlinear
+  `nl_quad3d`, and the hospital room-refuge case
 - Optional safe-region plotting utilities in `safe_region_plot/`
 
 ## Installation
@@ -59,6 +60,88 @@ uv run python examples/drift_car/test_drift_pcbf.py \
 uv run python examples/warehouse/test_warehouse_quad.py \
   --algo plcbf 
 ```
+
+### 3) Full nonlinear Quad3D with 3-D obstacle avoidance
+
+```bash
+uv run python -m examples.nl_quad3d \
+  --scenario playground_stress --seed 0
+```
+
+Add `--visualize` to open Rerun, or use `--save-rrd results/quad3d.rrd`
+for a headless recording containing the vehicle, obstacles, and every
+candidate policy rollout. This case is deliberately named `nl_quad3d`; the
+existing linear, XY-avoidance warehouse model is unchanged.
+
+### 4) Hospital room-refuge case
+
+```bash
+uv run python -m examples.hospital.run \
+  --stretchers 3 --steps 1100
+```
+
+The crowded case contains 50 moving humans, 15 ordinary randomized
+stretchers, and two or three guaranteed full-width main-hall blockers.
+PL-CBF continuously selects from the complete fallback library. There is no
+latched room state machine or timed hold/exit rule.
+
+## New Case-study Benchmarks
+
+Both new benchmarks use the same eight-method comparison set:
+`pcbf`, `plcbf`, `mps`, `gatekeeper`, `backup_cbf`, `mi_mpc`,
+`multi_backup_cbf_mi`, and `library_pcbf_mi`.
+
+The baselines preserve the roles used by the warehouse study instead of
+reducing every method to a common policy selector. Policy-PCBF, Backup-CBF,
+MPS, and Gatekeeper each use one fixed retrace-waypoint backup. MPS and
+Gatekeeper own and execute committed trajectories, while Backup-CBF imposes
+path-wise flow-sensitivity and terminal constraints. Multi-Backup-CBF-MI and
+Library-PCBF-MI evaluate the complete case-study policy library. `mi_mpc`
+solves a full Big-M mixed-integer trajectory MPC with continuous state and
+input trajectories and a binary policy disjunction; it is not a one-hot
+selector over precomputed policy costs.
+
+The nonlinear dynamics, collision geometry, and fallback feedback laws remain
+case-specific. In particular, the nonlinear Quad3D PL-CBF library matches the
+playground's radial/stop/nominal library, and the hospital library adds nearby
+room-entry policies. No baseline receives a hospital blockage flag, room
+state machine, timed hold, or guarded-exit rule.
+
+```bash
+# One seeded 48-obstacle nonlinear Quad3D stress scenario, all eight methods
+uv run python -m examples.nl_quad3d.benchmark \
+  --output results/nl_quad3d_benchmark
+
+# Both strict hospital blockages, all eight methods
+uv run python -m examples.hospital.benchmark \
+  --output results/hospital_benchmark
+```
+
+Each command runs headlessly and writes raw CSV/JSON plus an aggregate
+Markdown table. Add `--quick` for a short plumbing smoke test. Every seed
+generates a deterministic crowded world shared by every method: the default
+nonlinear Quad3D stress protocol has 48 moving spheres (24 coordinated
+six-axis streams and 24 corridor-random hazards), and the hospital cases have
+50 humans plus 17/18 total stretchers.
+
+Optuna setup is included but tuning is never started by the benchmark:
+
+```bash
+# Inspect the ready-to-run nonlinear Quad3D tuning configuration
+uv run python -m examples.nl_quad3d.tune --quick
+
+# Explicit examples that start optimization
+uv run python -m examples.nl_quad3d.tune --run --trials 50
+uv run python -m examples.hospital.tune --run --trials 50
+```
+
+The hospital tuning summary can be replayed directly by the all-method
+benchmark with `--config-json results/hospital_optuna_summary.json`; the tuned
+full policy library is preserved and certificates are still recomputed at
+every plant step. Nonlinear Quad3D tuning atomically exports its audited winner
+to `examples/nl_quad3d/configs/plcbf_optuna_best.yaml`; both its benchmark and
+single-run entry point load that file by default, while `--config` can replay a
+different YAML/JSON artifact explicitly.
 
 ## Useful Options
 
