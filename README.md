@@ -77,13 +77,31 @@ existing linear, XY-avoidance warehouse model is unchanged.
 
 ```bash
 uv run python -m examples.hospital.run \
-  --stretchers 3 --steps 1100
+  --story main_eastbound --seed 0 --steps 3000
 ```
 
-The crowded case contains 50 moving humans, 15 ordinary randomized
-stretchers, and two or three guaranteed full-width main-hall blockers.
-PL-CBF continuously selects from the complete fallback library. There is no
-latched room state machine or timed hold/exit rule.
+Hospital protocol `hospital_fixed_refuge_v3` gives every canonical story 50
+seeded moving humans and a fixed two- or three-stretcher convoy traveling at
+3.0 m/s across the complete hallway width. Human placement is independent of
+the diagnostic refuge: only the start-room and goal-room door routes are
+protected during sampling. Publication sensing uses a 24 m line-of-sight range
+and capacity 53 so all 50 humans and three blockers can be represented without
+obstacle-ID priority.
+
+PL-CBF rebuilds and certifies its complete fallback library at every plant
+step. The default retains all 12 directional and up to seven reachable-room
+policies; room rollouts use the calibrated 0.24 s step and the PL-CBF value
+buffer is 0.9. These are continuous numerical/controller parameters. The QP
+can naturally select a reachable-room policy when that is the safest branch,
+with no blockage flag, latched room state machine, timed hold, or guarded exit
+rule. The permitted memoryless numerical fallback is reported separately.
+When the robot is physically inside a non-goal room, the nominal planner adds
+the room center, inside-door, doorway-center, and outside-door waypoints, then
+rejoins the unvisited nominal suffix. It therefore exits through the opening
+after the blockage clears instead of cutting a wall corner or waiting for a
+release state. Hospital certificates run in fixed-shape, horizon-grouped JAX
+kernels; obstacle buckets are warmed before decision timing, and raw reports
+record any runtime compilation miss.
 
 ## New Case-study Benchmarks
 
@@ -103,26 +121,43 @@ selector over precomputed policy costs.
 
 The nonlinear dynamics, collision geometry, and fallback feedback laws remain
 case-specific. In particular, the nonlinear Quad3D PL-CBF library matches the
-playground's radial/stop/nominal library, and the hospital library adds nearby
-room-entry policies. No baseline receives a hospital blockage flag, room
-state machine, timed hold, or guarded-exit rule.
+playground's radial/stop/nominal library, and the full Hospital default keeps
+12 directional and up to seven nearby room-entry policies. No baseline
+receives a hospital blockage flag, room state machine, timed hold, or guarded-
+exit rule.
 
 ```bash
 # One seeded 48-obstacle nonlinear Quad3D stress scenario, all eight methods
 uv run python -m examples.nl_quad3d.benchmark \
   --output results/nl_quad3d_benchmark
 
-# Both strict hospital blockages, all eight methods
+# Five fixed Hospital stories x 20 human-traffic seeds, all eight methods
 uv run python -m examples.hospital.benchmark \
   --output results/hospital_benchmark
 ```
 
 Each command runs headlessly and writes raw CSV/JSON plus an aggregate
 Markdown table. Add `--quick` for a short plumbing smoke test. Every seed
-generates a deterministic crowded world shared by every method: the default
+generates a deterministic paired world shared by every method: the default
 nonlinear Quad3D stress protocol has 48 moving spheres (24 coordinated
-six-axis streams and 24 corridor-random hazards), and the hospital cases have
-50 humans plus 17/18 total stretchers.
+six-axis streams and 24 corridor-random hazards). The Hospital publication
+protocol `hospital_fixed_refuge_v3` has five immutable start/goal/convoy
+stories and seeds `0..19`; only the 50 circular humans are randomized, while
+each story's mandatory two- or three-stretcher, 3.0 m/s full-width blockage is
+fixed. The diagnostic refuge does not influence human placement; only the
+start and goal door routes are protected. This gives 100 worlds per method and
+800 executions for the eight-method comparison.
+
+Hospital task outcomes are exclusively goal success, physical collision, or
+timeout. The default benchmark horizon is 180 simulated seconds (3000 plant
+steps), rather than the earlier 66 seconds. Negative operational safety
+clearance and solver infeasibility are retained as safety/numerical diagnostics
+but do not stop or relabel a collision-free run. A post-convoy rolling deadlock
+checker is observation-only and never changes control or stops simulation, so
+a controller that later recovers can still reach the goal. Post-departure room
+entry, occupancy during the fixed blockage window, goal completion after the
+convoy clears, and normal-QP versus permitted memoryless numerical-fallback
+room selection remain narrative diagnostics.
 
 Optuna setup is included but tuning is never started by the benchmark:
 
@@ -134,6 +169,16 @@ uv run python -m examples.nl_quad3d.tune --quick
 uv run python -m examples.nl_quad3d.tune --run --trials 50
 uv run python -m examples.hospital.tune --run --trials 50
 ```
+
+Hospital phase-one tuning keeps the publication safe set, 24 m/53-obstacle
+perception envelope, full 12-direction/seven-room library, refuge geometry,
+7.2 s room horizon, and 0.24 s room rollout step fixed. It tunes nine
+controller-only numerical parameters. Every completed trial covers the full
+five-story × ten-training-seed grid in seed-major story-balanced order; the
+untuned controller is trial zero, pruning occurs only between complete worlds,
+and the selected winner is evaluated on the disjoint ten-seed validation grid.
+Running `python -m examples.hospital.tune` without `--run` only prints this
+resolved protocol and does not create an Optuna study.
 
 The hospital tuning summary can be replayed directly by the all-method
 benchmark with `--config-json results/hospital_optuna_summary.json`; the tuned
