@@ -410,8 +410,17 @@ class HospitalEnvironment:
         robot_radius: float,
         inside_offset: float = 2.3,
         outside_offset: float = 1.75,
+        *,
+        segment_clearance_buffer: float = 0.06,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return outside, door, inside, and a room-center diagnostic point."""
+        """Return a collision-free outside/door/inside room path.
+
+        This mirrors the hospital playground's ``roomDoorPath`` geometry.  A
+        centered doorway route is preferred, with the same two small tangent
+        offsets tried when the centered line is unavailable.  The final point
+        is a diagnostic room-center projection and is not part of the backup
+        path.
+        """
 
         door = room.door.center
         if room.door.side == "bottom":
@@ -423,15 +432,58 @@ class HospitalEnvironment:
         else:
             outward = np.array([1.0, 0.0])
 
-        outside = door + outward * (robot_radius + outside_offset)
-        inside = door - outward * (robot_radius + inside_offset)
-        terminal_center = room.center.copy()
-        # Preserve a direct line through the door for narrow rooms.
-        if room.door.side in {"top", "bottom"}:
-            terminal_center[0] = door[0]
-        else:
-            terminal_center[1] = door[1]
-        return outside, door.copy(), inside, terminal_center
+        horizontal_door = room.door.rect.width >= room.door.rect.height
+        tangent = (
+            np.array([1.0, 0.0])
+            if horizontal_door
+            else np.array([0.0, 1.0])
+        )
+        span = (
+            room.door.rect.width
+            if horizontal_door
+            else room.door.rect.height
+        )
+        point_radius = robot_radius + 0.08
+        segment_radius = robot_radius + segment_clearance_buffer
+        for tangent_offset in (0.0, -0.28 * span, 0.28 * span):
+            candidate_door = door + tangent * tangent_offset
+            outside = candidate_door + outward * (
+                robot_radius + outside_offset
+            )
+            inside = candidate_door - outward * (
+                robot_radius + inside_offset
+            )
+            if self.is_collision(inside, point_radius) or self.is_collision(
+                outside, point_radius
+            ):
+                continue
+            if not self.segment_is_free(
+                outside,
+                candidate_door,
+                segment_radius,
+                step=0.55,
+            ) or not self.segment_is_free(
+                candidate_door,
+                inside,
+                segment_radius,
+                step=0.55,
+            ):
+                continue
+
+            terminal_center = room.center.copy()
+            # Preserve a direct line through the selected door for narrow
+            # rooms, as in the playground diagnostic rendering.
+            if horizontal_door:
+                terminal_center[0] = candidate_door[0]
+            else:
+                terminal_center[1] = candidate_door[1]
+            return (
+                outside,
+                candidate_door.copy(),
+                inside,
+                terminal_center,
+            )
+        raise ValueError(f"no collision-free doorway route for {room.label}")
 
     def segment_is_free(
         self,
