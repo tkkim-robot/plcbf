@@ -40,7 +40,11 @@ class PolicyConfig:
     reverse_horizon: float = 12.0
     stop_horizon: float = 12.0
     room_horizon: float = 7.2
-    room_rollout_dt: float = 0.36
+    # Full-width blocker encounters need the same rollout resolution for room
+    # branches as for the other feedback policies.  The coarser playground
+    # preview (0.36 s) can skip the narrow doorway/convoy margin and make a
+    # valid multi-room certificate numerically disappear between plant steps.
+    room_rollout_dt: float = 0.24
     num_angle_policies: int = 12
     angle_arc: float = 3.141592653589793
     angle_preview_distance: float = 5.2
@@ -59,7 +63,11 @@ class PolicyConfig:
     component_temperature: float = 36.0
     time_temperature: float = 30.0
     cbf_alpha: float = 0.85
-    cbf_value_buffer: float = 0.45
+    # Calibrated conservatism for the fixed-story convoy: the QP begins
+    # preserving a viable room-backup set before its smoothed value reaches
+    # the zero admissibility boundary.  This changes no policy-selection mode
+    # or room behavior logic.
+    cbf_value_buffer: float = 0.9
     gradient_steps: tuple[float, float, float, float] = (
         0.06,
         0.06,
@@ -152,7 +160,16 @@ def _replace_group(
             f"unknown {name} configuration fields: "
             + ", ".join(sorted(unknown))
         )
-    return replace(group, **dict(values))
+    normalized = dict(values)
+    # JSON has no tuple type.  Preserve tuple-valued dataclass fields when a
+    # configuration is replayed from an exported tuning summary so the loaded
+    # frozen configuration remains equal to, and as hashable as, the original.
+    for field_name, value in tuple(normalized.items()):
+        if isinstance(getattr(group, field_name), tuple) and isinstance(
+            value, list
+        ):
+            normalized[field_name] = tuple(value)
+    return replace(group, **normalized)
 
 
 def hospital_config_from_mapping(

@@ -40,20 +40,18 @@ def test_strict_blockage_naturally_selects_room_backup_without_mode_state() -> N
 
     assert result.selected_policy.startswith("room_")
     assert result.inside_refuge is False
-    assert result.decision.diagnostics.used_fallback is True
-    assert (
-        result.decision.diagnostics.fallback_reason
-        == "no_positive_input_volume_policy"
-    )
+    assert result.decision.diagnostics.used_fallback is False
+    assert result.decision.diagnostics.fallback_reason is None
     selected = next(
         evaluation
         for evaluation in result.decision.diagnostics.evaluations
         if evaluation.policy_id == result.decision.policy_id
     )
     assert selected.safe_value is True
+    assert selected.feasible is True
     assert (
         selected.input_volume
-        <= simulation.config.policies.constraint_tolerance
+        > simulation.config.policies.constraint_tolerance
     )
     safe_policy_ids = {
         evaluation.policy_id
@@ -65,7 +63,8 @@ def test_strict_blockage_naturally_selects_room_backup_without_mode_state() -> N
         policy_id.startswith("room_")
         for policy_id in safe_policy_ids
     )
-    assert set(vars(simulation.controller)) == {
+    state_names = set(vars(simulation.controller))
+    assert {
         "environment",
         "planner",
         "config",
@@ -73,4 +72,16 @@ def test_strict_blockage_naturally_selects_room_backup_without_mode_state() -> N
         "goal",
         "navigation_path",
         "navigation_index",
-    }
+        "_jax_geometry",
+        "_jax_parameters",
+        "_jax_obstacle_buckets",
+    } == state_names
+    for forbidden in (
+        "refuge_state",
+        "phase",
+        "hold",
+        "guard",
+        "committed_room",
+        "selected_room",
+    ):
+        assert all(forbidden not in name for name in state_names)

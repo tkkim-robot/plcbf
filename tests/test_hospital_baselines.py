@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import inspect
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from examples.hospital.obstacles import (
     Stretcher,
     obstacle_clearance,
 )
+from examples.hospital.policies import HospitalPolicy, rollout_policy
 from examples.hospital.simulation import build_blocked_main_hall_scenario
 from plcbf.baselines import BenchmarkMethod
 from plcbf.big_m_mpc import build_big_m_trajectory_milp
@@ -49,6 +51,20 @@ def _short_suite():
         algorithm_config=algorithm_config,
     )
     return simulation, suite
+
+
+def test_default_backup_horizon_matches_warehouse_rounding() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    suite = HospitalBaselineSuite(
+        simulation.controller,
+        simulation.environment,
+        simulation.config,
+    )
+
+    assert suite._backup_steps == round(
+        HospitalBaselineConfig().backup_horizon_s / simulation.config.dt
+    )
+    assert suite._backup_steps == 67
 
 
 @pytest.mark.parametrize(
@@ -510,6 +526,77 @@ def test_fixed_warehouse_baselines_share_one_nonroom_retrace_backup() -> None:
     )
 
 
+def test_retrace_waypoint_progress_is_monotone_and_rollout_local() -> None:
+    simulation, suite = _short_suite()
+    policy = HospitalPolicy(
+        name="synthetic_retrace",
+        kind="retrace",
+        horizon=8.0,
+        rollout_dt=simulation.config.dt,
+        target_speed=2.8,
+        waypoints=[
+            np.array([20.0, 0.0]),
+            np.array([10.0, 0.0]),
+            np.array([0.0, 0.0]),
+        ],
+        feedback_gain=suite.algorithm_config.fixed_backup_gain,
+    )
+    state = np.array([20.0, 0.0, 0.0, 0.0])
+
+    _, cursor = policy.control_with_cursor(state, simulation.config, 0)
+    assert cursor == 1
+    _, cursor = policy.control_with_cursor(
+        np.array([18.0, 0.0, -1.0, 0.0]),
+        simulation.config,
+        cursor,
+    )
+    assert cursor == 1
+    _, cursor = policy.control_with_cursor(
+        np.array([10.0, 0.0, -1.0, 0.0]),
+        simulation.config,
+        cursor,
+    )
+    assert cursor == 2
+
+    first = rollout_policy(policy, state, simulation.config)
+    second = rollout_policy(policy, state, simulation.config)
+    np.testing.assert_allclose(first, second)
+    assert first[-1, 0] < 1.0
+    assert np.all(np.diff(first[:, 0]) <= 1e-12)
+
+
+def test_mps_and_gatekeeper_reset_retrace_before_each_candidate() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    simulation.controller.navigation_path = [
+        np.array([0.0, 0.0]),
+        np.array([1.5, 0.0]),
+        np.array([3.0, 0.0]),
+        np.array([4.5, 0.0]),
+    ]
+    simulation.controller.navigation_index = 3
+    algorithm_config = replace(
+        HospitalBaselineConfig(),
+        backup_horizon_s=2.0,
+        multi_backup_maneuver_s=1.0,
+        gatekeeper_nominal_steps=2,
+    )
+    suite = HospitalBaselineSuite(
+        simulation.controller,
+        simulation.environment,
+        simulation.config,
+        algorithm_config=algorithm_config,
+    )
+    state = np.array([3.0, 0.0, 0.0, 0.0])
+
+    for shield in (suite.mps, suite.gatekeeper):
+        first = shield._candidate(state, 0)
+        suite._retrace_rollout_index = 2
+        repeated = shield._candidate(state, 0)
+        np.testing.assert_allclose(first.states, repeated.states)
+        np.testing.assert_allclose(first.controls, repeated.controls)
+        assert suite._retrace_rollout_index > 0
+
+
 def test_pcbf_backup_cbf_mps_and_gatekeeper_execute_retrace_only() -> None:
     simulation, suite = _short_suite()
     state = simulation.state.copy()
@@ -839,11 +926,22 @@ def test_mi_mpc_has_directional_only_branches_and_full_x_u_milp() -> None:
     } & {policy.kind for policy in policies}
 
     nominal = _nominal(simulation)
-    problem, _ = suite.build_mi_mpc_problem(
+    problem, fallback_index = suite.build_mi_mpc_problem(
         simulation.state,
         nominal,
         policies,
     )
+    branch_control = policies[fallback_index].control(
+        simulation.state,
+        simulation.config,
+    )
+    expected_fallback = np.clip(
+        0.75 * branch_control + 0.25 * nominal,
+        -simulation.config.robot.a_max,
+        simulation.config.robot.a_max,
+    )
+    np.testing.assert_allclose(problem.fallback_control, expected_fallback)
+    assert not np.allclose(problem.fallback_control, branch_control)
     mi_config = suite._mi_mpc_config()
     model = build_big_m_trajectory_milp(problem, mi_config)
 
@@ -876,3 +974,37 @@ def test_mi_mpc_has_directional_only_branches_and_full_x_u_milp() -> None:
     np.testing.assert_allclose(model.position_big_m, 400.0)
     np.testing.assert_allclose(model.control_big_m, 60.0)
     np.testing.assert_allclose(model.safety_big_m, 50.0)
+
+
+def test_plcbf_numerical_fallback_does_not_erase_hocbf_feasibility(
+    monkeypatch,
+) -> None:
+    simulation, suite = _short_suite()
+    nominal = _nominal(simulation)
+    policy_decision = SimpleNamespace(
+        diagnostics=SimpleNamespace(
+            used_fallback=True,
+            fallback_reason="numerical_solver_failure",
+        )
+    )
+    monkeypatch.setattr(
+        suite.controller,
+        "compute",
+        lambda state, obstacles, time, **kwargs: SimpleNamespace(
+            control=np.array([-0.3, 0.1]),
+            selected_policy="room_0",
+            feasible=True,
+            decision=policy_decision,
+        ),
+    )
+
+    decision = suite.solve(
+        BenchmarkMethod.PLCBF,
+        simulation.state,
+        (),
+        nominal,
+    )
+
+    assert decision.used_fallback is True
+    assert decision.feasible is True
+    assert decision.status == "fallback:numerical_solver_failure"

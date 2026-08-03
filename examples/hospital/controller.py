@@ -24,6 +24,23 @@ from plcbf.policy_library import (
 from .config import HospitalConfig
 from .dynamics import step_double_integrator, waypoint_control
 from .environment import HospitalEnvironment, Rect, Room
+from .jax_rollout import (
+    DEFAULT_OBSTACLE_BUCKETS,
+    HospitalJaxCapacities,
+    compiled_evaluator_cache_info,
+    compiled_grouped_evaluator_cache_info,
+    evaluate_policy_batch,
+    evaluate_policy_groups,
+    grouped_capacities_for_obstacle_count,
+    pack_obstacle_batch,
+    pack_parameters,
+    pack_policy_batch,
+    pack_policy_groups,
+    pack_static_geometry,
+    select_obstacle_bucket,
+    warmup_policy_batch,
+    warmup_policy_groups,
+)
 from .obstacles import DynamicObstacle, Human, Stretcher, obstacle_clearance
 from .planner import HospitalGridPlanner
 from .policies import (
@@ -62,6 +79,7 @@ class ControllerResult:
     decision: PolicyDecision
     certificates: tuple[PolicyCertificate, ...]
     policy_evaluations: tuple["PolicyCbfEvaluation", ...]
+    candidate_policy_count: int
 
 
 @dataclass(frozen=True)
@@ -514,6 +532,25 @@ class RoomPolicyProvider:
         self.environment = environment
         self.planner = planner
         self.config = config
+        door_paths: list[
+            tuple[Room, np.ndarray, np.ndarray, np.ndarray]
+        ] = []
+        for room in environment.rooms:
+            try:
+                outside, door, inside, _terminal_center = (
+                    environment.room_door_path(
+                        room,
+                        config.robot.radius,
+                        config.refuge.inside_door_offset,
+                        config.refuge.outside_door_offset,
+                    )
+                )
+            except ValueError:
+                continue
+            door_paths.append((room, outside, door, inside))
+        # Door geometry is immutable.  Caching it avoids rediscovering every
+        # room's centered doorway on every 60 ms controller decision.
+        self._door_paths = tuple(door_paths)
 
     @staticmethod
     def _distinct_path(
@@ -540,31 +577,42 @@ class RoomPolicyProvider:
         # decide whether to remain or leave through their QP certificates.
         if self.environment.room_containing(start) is not None:
             return []
-        candidates = []
-        for room in self.environment.rooms:
-            outside, door, inside, _terminal_center = (
-                self.environment.room_door_path(
-                    room,
-                    self.config.robot.radius,
-                    self.config.refuge.inside_door_offset,
-                    self.config.refuge.outside_door_offset,
-                )
-            )
-            sensing_range = self.config.robot.sensing_range
+        sensing_range = self.config.robot.sensing_range
+        geometries = [
+            item
+            for item in self._door_paths
             if (
-                np.linalg.norm(door - start) > sensing_range
-                or np.linalg.norm(inside - start) > sensing_range
-            ):
-                continue
-            path_radius = self.config.robot.radius + 0.06
-            outside_reachable = self.environment.segment_is_free(
-                start, outside, path_radius, step=0.65
+                np.linalg.norm(item[2] - start) <= sensing_range
+                and np.linalg.norm(item[3] - start) <= sensing_range
             )
-            door_reachable = self.environment.segment_is_free(
-                start, door, path_radius, step=0.65
-            )
-            entry_reachable = self.environment.segment_is_free(
-                start, inside, path_radius, step=0.65
+        ]
+        if not geometries:
+            return []
+
+        path_radius = self.config.robot.radius + 0.06
+        direct_targets = np.asarray(
+            [
+                point
+                for _room, outside, door, inside in geometries
+                for point in (outside, door, inside)
+            ],
+            dtype=float,
+        )
+        direct_free = self.environment.segments_are_free(
+            np.repeat(start[None, :], len(direct_targets), axis=0),
+            direct_targets,
+            path_radius,
+            step=0.65,
+        ).reshape(len(geometries), 3)
+
+        raw_candidates: list[tuple[Room, list[np.ndarray]]] = []
+        for (room, outside, door, inside), reachable in zip(
+            geometries,
+            direct_free,
+            strict=True,
+        ):
+            outside_reachable, door_reachable, entry_reachable = (
+                bool(value) for value in reachable
             )
             try:
                 if door_reachable:
@@ -581,15 +629,38 @@ class RoomPolicyProvider:
             path = self._distinct_path(raw_path)
             if any(np.linalg.norm(point - start) > sensing_range for point in path):
                 continue
-            if not all(
-                self.environment.segment_is_free(
-                    path[index - 1],
-                    path[index],
-                    path_radius,
-                    step=0.65,
-                )
-                for index in range(1, len(path))
+            raw_candidates.append((room, path))
+
+        segment_starts: list[np.ndarray] = []
+        segment_ends: list[np.ndarray] = []
+        segment_owners: list[int] = []
+        for owner, (_room, path) in enumerate(raw_candidates):
+            for first, second in zip(path, path[1:], strict=False):
+                segment_starts.append(first)
+                segment_ends.append(second)
+                segment_owners.append(owner)
+        valid = np.ones(len(raw_candidates), dtype=bool)
+        if segment_starts:
+            segment_free = self.environment.segments_are_free(
+                np.asarray(segment_starts),
+                np.asarray(segment_ends),
+                path_radius,
+                step=0.65,
+            )
+            for owner, free in zip(
+                segment_owners,
+                segment_free,
+                strict=True,
             ):
+                valid[owner] &= bool(free)
+
+        candidates = []
+        for (room, path), path_is_valid in zip(
+            raw_candidates,
+            valid,
+            strict=True,
+        ):
+            if not path_is_valid:
                 continue
             cost = sum(
                 float(np.linalg.norm(path[index] - path[index - 1]))
@@ -625,21 +696,210 @@ class HospitalController:
             environment, planner, config
         )
         self.goal = np.asarray(goal, dtype=float)
-        self.navigation_path = planner.plan(
+        self.navigation_path = self._plan_navigation_path(
             np.asarray(initial_state, dtype=float)[:2], self.goal
         )
         self.navigation_index = min(1, len(self.navigation_path) - 1)
+        self._jax_geometry = pack_static_geometry(environment)
+        self._jax_parameters = pack_parameters(config)
+        maximum_obstacles = max(1, int(config.safety.max_obstacles))
+        self._jax_obstacle_buckets = tuple(
+            sorted(
+                {
+                    *(
+                        bucket
+                        for bucket in DEFAULT_OBSTACLE_BUCKETS
+                        if bucket < maximum_obstacles
+                    ),
+                    maximum_obstacles,
+                }
+            )
+        )
 
     def set_goal(
         self, state: Sequence[float], goal: Sequence[float]
     ) -> None:
         self.goal = np.asarray(goal, dtype=float)
-        self.navigation_path = self.planner.plan(
+        self.navigation_path = self._plan_navigation_path(
             np.asarray(state, dtype=float)[:2], self.goal
         )
         self.navigation_index = min(1, len(self.navigation_path) - 1)
 
+    @staticmethod
+    def _append_distinct(
+        points: list[np.ndarray],
+        point: Sequence[float],
+        *,
+        threshold: float = 0.35,
+    ) -> None:
+        candidate = np.asarray(point, dtype=float)
+        if not points or np.linalg.norm(candidate - points[-1]) > threshold:
+            points.append(candidate.copy())
+
+    def _room_exit_route(self, room: Room) -> list[np.ndarray]:
+        """Return the centered room -> inside -> door -> outside route.
+
+        The room center is an ordinary nominal waypoint, not a refuge mode or
+        hold target.  Including it makes an unscheduled room entry geometrically
+        well posed from either side of the doorway before the route is aligned
+        with the centered door and resumed outside.
+        """
+
+        try:
+            outside, door, inside, _terminal_center = (
+                self.environment.room_door_path(
+                    room,
+                    self.config.robot.radius,
+                    self.config.refuge.inside_door_offset,
+                    self.config.refuge.outside_door_offset,
+                    # The playground nominal route uses radius + 0.08 for
+                    # both its point and segment checks.
+                    segment_clearance_buffer=0.08,
+                )
+            )
+        except ValueError:
+            return []
+        route: list[np.ndarray] = []
+        for point in (room.center, inside, door, outside):
+            self._append_distinct(route, point)
+        return route
+
+    @staticmethod
+    def _remaining_route_has_exit_suffix(
+        remaining: Sequence[Sequence[float]],
+        exit_route: Sequence[Sequence[float]],
+        *,
+        tolerance: float = 0.45,
+    ) -> bool:
+        """Return whether the active route starts with an exact exit suffix.
+
+        A consumed center/inside/door waypoint is allowed, because the
+        navigation index advances normally.  Unlike the old loose proximity
+        test, unrelated corridor waypoints near a doorway cannot masquerade as
+        an ordered room-exit route.
+        """
+
+        active = [np.asarray(point, dtype=float) for point in remaining]
+        expected = [np.asarray(point, dtype=float) for point in exit_route]
+        for consumed in range(len(expected)):
+            suffix = expected[consumed:]
+            if len(active) < len(suffix):
+                continue
+            if all(
+                np.linalg.norm(active[index] - point) <= tolerance
+                for index, point in enumerate(suffix)
+            ):
+                return True
+        return False
+
+    def _preserved_route_after_exit(
+        self,
+        room: Room,
+        outside: np.ndarray,
+        remaining: Sequence[Sequence[float]],
+    ) -> list[np.ndarray]:
+        """Bridge back to the first usable waypoint in the previous suffix."""
+
+        old_suffix = [np.asarray(point, dtype=float).copy() for point in remaining]
+        route_radius = self.config.robot.radius + 0.08
+        for resume_index, candidate in enumerate(old_suffix):
+            if room.contains(candidate, margin=-0.05):
+                continue
+            try:
+                connector = self.planner.plan(outside, candidate)
+            except ValueError:
+                continue
+            if not all(
+                self.environment.segment_is_free(
+                    start,
+                    end,
+                    route_radius,
+                    step=0.55,
+                )
+                for start, end in zip(
+                    connector,
+                    connector[1:],
+                    strict=False,
+                )
+            ):
+                continue
+            preserved: list[np.ndarray] = []
+            for point in connector[1:]:
+                self._append_distinct(preserved, point)
+            for point in old_suffix[resume_index:]:
+                self._append_distinct(preserved, point)
+            return preserved
+
+        try:
+            fallback = self.planner.plan(outside, self.goal)
+        except ValueError:
+            return [self.goal.copy()]
+        return [np.asarray(point, dtype=float).copy() for point in fallback[1:]]
+
+    def _plan_navigation_path(
+        self,
+        start: Sequence[float],
+        goal: Sequence[float],
+    ) -> list[np.ndarray]:
+        """Plan a nominal path with the playground's room-door alignment."""
+
+        start_point = np.asarray(start, dtype=float)
+        goal_point = np.asarray(goal, dtype=float)
+        current_room = self.environment.room_containing(start_point)
+        goal_room = self.environment.room_containing(goal_point)
+        if current_room is not None and current_room is not goal_room:
+            exit_route = self._room_exit_route(current_room)
+            if exit_route:
+                exit_plan = self.planner.plan(exit_route[-1], goal_point)
+                path = [start_point.copy()]
+                for point in exit_route:
+                    self._append_distinct(path, point)
+                for point in exit_plan[1:]:
+                    if current_room.contains(point, margin=-0.05):
+                        continue
+                    self._append_distinct(path, point)
+                return path
+        return self.planner.plan(start_point, goal_point)
+
+    def _ensure_room_exit_waypoints(self, state: Sequence[float]) -> bool:
+        """Repair a stale nominal route after an unscheduled room entry.
+
+        This is a geometry-only planner consistency operation, equivalent to
+        ``_ensureRoomExitWaypoint`` in the playground.  It is not a refuge
+        state, controller switch, or obstacle-dependent guard.
+        """
+
+        point = np.asarray(state, dtype=float)[:2]
+        room = self.environment.room_containing(point)
+        goal_room = self.environment.room_containing(self.goal)
+        if room is None or room is goal_room:
+            return False
+        exit_route = self._room_exit_route(room)
+        if not exit_route:
+            return False
+        start_index = min(
+            self.navigation_index,
+            max(0, len(self.navigation_path) - 1),
+        )
+        remaining = self.navigation_path[start_index:]
+        if self._remaining_route_has_exit_suffix(remaining, exit_route):
+            return False
+
+        repaired: list[np.ndarray] = [point.copy()]
+        for waypoint in exit_route:
+            self._append_distinct(repaired, waypoint)
+        for waypoint in self._preserved_route_after_exit(
+            room,
+            np.asarray(exit_route[-1], dtype=float),
+            remaining,
+        ):
+            self._append_distinct(repaired, waypoint)
+        self.navigation_path = repaired
+        self.navigation_index = min(1, len(self.navigation_path) - 1)
+        return True
+
     def _navigation_target(self, state: np.ndarray) -> np.ndarray:
+        self._ensure_room_exit_waypoints(state)
         while (
             self.navigation_index < len(self.navigation_path) - 1
             and np.linalg.norm(
@@ -654,6 +914,7 @@ class HospitalController:
         self, state: Sequence[float]
     ) -> list[HospitalPolicy]:
         value = np.asarray(state, dtype=float)
+        self._ensure_room_exit_waypoints(value)
         room_paths = self.room_policy_provider.room_paths(value[:2])
         return build_policy_library(
             value,
@@ -727,6 +988,274 @@ class HospitalController:
                 for obstacle in obstacles
             )
         return min(values, default=float("inf"))
+
+    @staticmethod
+    def jax_cache_info() -> dict[str, dict[str, int | None]]:
+        """Return process-wide compile-cache counters for benchmark audits."""
+
+        def normalize(info: object) -> dict[str, int | None]:
+            return {
+                name: getattr(info, name, None)
+                for name in ("hits", "misses", "maxsize", "currsize")
+            }
+
+        return {
+            "batch": normalize(compiled_evaluator_cache_info()),
+            "grouped": normalize(compiled_grouped_evaluator_cache_info()),
+        }
+
+    def _uses_retrace_policy(
+        self,
+        policies: Sequence[HospitalPolicy],
+    ) -> bool:
+        return any(policy.kind == "retrace" for policy in policies)
+
+    def _jax_batch_capacity(
+        self,
+        policies: Sequence[HospitalPolicy],
+        obstacle_bucket: int,
+    ) -> HospitalJaxCapacities:
+        """Return the exact fixed shape for a retrace-containing batch."""
+
+        step_counts = tuple(
+            max(1, int(policy.horizon / policy.rollout_dt))
+            for policy in policies
+        )
+        prediction_time = max(
+            steps * policy.rollout_dt
+            for steps, policy in zip(step_counts, policies, strict=True)
+        ) + max(
+            self.config.dt,
+            self.config.policies.time_derivative_step,
+        )
+        return HospitalJaxCapacities(
+            max_policies=max(1, len(policies)),
+            max_obstacles=obstacle_bucket,
+            max_horizon_steps=max(step_counts),
+            max_swept_samples=(
+                3 if any(policy.kind == "room" for policy in policies) else 2
+            ),
+            human_prediction_steps=max(1, int(np.ceil(prediction_time / 0.05))),
+        )
+
+    def _jax_policy_evaluation(
+        self,
+        state: np.ndarray,
+        nominal_control: np.ndarray,
+        policies: Sequence[HospitalPolicy],
+        obstacles: Sequence[DynamicObstacle],
+        *,
+        include_diagnostics: bool,
+    ):
+        """Run the smallest precompiled fixed-shape numerical backend."""
+
+        obstacle_bucket = select_obstacle_bucket(
+            len(obstacles), self._jax_obstacle_buckets
+        )
+        if self._uses_retrace_policy(policies):
+            capacity = self._jax_batch_capacity(
+                policies,
+                obstacle_bucket,
+            )
+            packed_policies = pack_policy_batch(
+                policies, self.config, capacity
+            )
+            packed_obstacles = pack_obstacle_batch(obstacles, capacity)
+            return evaluate_policy_batch(
+                state,
+                nominal_control,
+                packed_policies,
+                packed_obstacles,
+                self._jax_geometry,
+                self._jax_parameters,
+                include_diagnostics=include_diagnostics,
+            )
+
+        capacities = grouped_capacities_for_obstacle_count(
+            self.config,
+            len(obstacles),
+            buckets=self._jax_obstacle_buckets,
+        )
+        packed_policies = pack_policy_groups(
+            policies, self.config, capacities
+        )
+        packed_obstacles = pack_obstacle_batch(obstacles, capacities)
+        return evaluate_policy_groups(
+            state,
+            nominal_control,
+            packed_policies,
+            packed_obstacles,
+            self._jax_geometry,
+            self._jax_parameters,
+            include_diagnostics=include_diagnostics,
+        )
+
+    def warmup_certificate_oracle(
+        self,
+        state: Sequence[float],
+        *,
+        policies: Sequence[HospitalPolicy] | None = None,
+        nominal_control: Sequence[float] | None = None,
+        include_diagnostics: bool = False,
+    ) -> dict[str, dict[str, int | None]]:
+        """Compile every obstacle bucket without changing navigation state."""
+
+        saved_path = [point.copy() for point in self.navigation_path]
+        saved_index = int(self.navigation_index)
+        saved_goal = self.goal.copy()
+        try:
+            value = np.asarray(state, dtype=float)
+            candidates = (
+                self.candidate_policies(value)
+                if policies is None
+                else list(policies)
+            )
+            if not candidates:
+                return self.jax_cache_info()
+            if nominal_control is None:
+                nominal = candidates[0].control(value, self.config)
+            else:
+                nominal = np.asarray(nominal_control, dtype=float)
+            retrace = self._uses_retrace_policy(candidates)
+            for obstacle_bucket in self._jax_obstacle_buckets:
+                if retrace:
+                    capacity = self._jax_batch_capacity(
+                        candidates,
+                        obstacle_bucket,
+                    )
+                    packed_policies = pack_policy_batch(
+                        candidates, self.config, capacity
+                    )
+                    packed_obstacles = pack_obstacle_batch((), capacity)
+                    warmup_policy_batch(
+                        value,
+                        nominal,
+                        packed_policies,
+                        packed_obstacles,
+                        self._jax_geometry,
+                        self._jax_parameters,
+                        include_diagnostics=include_diagnostics,
+                    )
+                else:
+                    capacities = grouped_capacities_for_obstacle_count(
+                        self.config,
+                        obstacle_bucket,
+                        buckets=(obstacle_bucket,),
+                    )
+                    packed_policies = pack_policy_groups(
+                        candidates, self.config, capacities
+                    )
+                    packed_obstacles = pack_obstacle_batch((), capacities)
+                    warmup_policy_groups(
+                        value,
+                        nominal,
+                        packed_policies,
+                        packed_obstacles,
+                        self._jax_geometry,
+                        self._jax_parameters,
+                        include_diagnostics=include_diagnostics,
+                    )
+            return self.jax_cache_info()
+        finally:
+            self.navigation_path = saved_path
+            self.navigation_index = saved_index
+            self.goal = saved_goal
+
+    def _certificate_from_jax(
+        self,
+        state: np.ndarray,
+        policy: HospitalPolicy,
+        value: float,
+        trajectory: np.ndarray,
+        gradient: np.ndarray,
+        value_time_derivative: float,
+        nominal_prefix_value: float,
+        terminal_clearance: float,
+        diagnostics_available: bool,
+        hocbf_constraints: Sequence[HocbfConstraint],
+    ) -> PolicyCbfEvaluation:
+        """Build the public certificate object from one batched JAX row."""
+
+        clipped_gradient = np.asarray(gradient, dtype=float).copy()
+        gradient_norm = float(np.linalg.norm(clipped_gradient))
+        if gradient_norm > self.config.policies.max_gradient_norm:
+            clipped_gradient *= (
+                self.config.policies.max_gradient_norm / gradient_norm
+            )
+        drift = np.array([state[2], state[3], 0.0, 0.0])
+        control_matrix = np.array(
+            [[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        )
+        backup_control = policy.control(state, self.config)
+        terminal_safe: bool | None
+        prefix_safe: bool | None
+        prefix_value: float | None
+        if diagnostics_available:
+            terminal_safe = bool(terminal_clearance >= 0.0)
+            if policy.kind == "room" and policy.target_room is not None:
+                terminal = trajectory[-1]
+                terminal_safe = bool(
+                    terminal_safe
+                    and policy.target_room.contains(terminal[:2])
+                    and policy.target_room.interior_margin(terminal[:2])
+                    >= self.config.refuge.terminal_interior_margin
+                    and np.linalg.norm(terminal[2:4])
+                    <= self.config.refuge.terminal_speed_max
+                )
+            prefix_safe = bool(nominal_prefix_value >= 0.0)
+            prefix_value = float(nominal_prefix_value)
+        else:
+            terminal_safe = None
+            prefix_safe = None
+            prefix_value = None
+        metadata = {
+            "rollout_safe": bool(value >= 0.0),
+            "terminal_safe": terminal_safe,
+            "nominal_prefix_safe": prefix_safe,
+            "nominal_prefix_value": prefix_value,
+            "rollout_diagnostics_available": diagnostics_available,
+            "terminal_cost": float(
+                np.linalg.norm(trajectory[-1, :2] - self.goal)
+                + 0.1 * np.linalg.norm(trajectory[-1, 2:4])
+            ),
+        }
+        base_certificate = PolicyCertificate.from_cbf(
+            policy.name,
+            value=value,
+            gradient=clipped_gradient,
+            drift=drift,
+            control_matrix=control_matrix,
+            value_time_derivative=value_time_derivative,
+            alpha=self.config.policies.cbf_alpha,
+            buffer=self.config.policies.cbf_value_buffer,
+            backup_control=backup_control,
+            metadata=metadata,
+        )
+        certificate = PolicyCertificate(
+            policy_id=base_certificate.policy_id,
+            value=base_certificate.value,
+            halfspaces=(
+                *base_certificate.halfspaces,
+                *(
+                    CBFHalfspace(
+                        constraint.a,
+                        constraint.b,
+                        constraint.label,
+                    )
+                    for constraint in hocbf_constraints
+                ),
+            ),
+            backup_control=base_certificate.backup_control,
+            metadata=metadata,
+        )
+        return PolicyCbfEvaluation(
+            policy=policy,
+            value=float(value),
+            trajectory=np.asarray(trajectory, dtype=float),
+            gradient=clipped_gradient,
+            value_time_derivative=float(value_time_derivative),
+            certificate=certificate,
+        )
 
     def _certificate_for_policy(
         self,
@@ -883,43 +1412,91 @@ class HospitalController:
         obstacles: Sequence[DynamicObstacle],
         policies: Sequence[HospitalPolicy] | None = None,
         nominal_control: Sequence[float] | None = None,
+        *,
+        obstacles_are_sensed: bool = False,
+        include_diagnostics: bool = True,
+        hocbf_constraints: Sequence[HocbfConstraint] | None = None,
     ) -> tuple[tuple[PolicyCertificate, ...], tuple[PolicyCbfEvaluation, ...]]:
         """Build rollout-derived PL-CBF certificates for benchmark adapters."""
 
         value = np.asarray(state, dtype=float)
-        active_obstacles = sensed_obstacles(
-            value,
-            obstacles,
-            self.config,
-            environment=self.environment,
+        active_obstacles = (
+            tuple(obstacles)
+            if obstacles_are_sensed
+            else sensed_obstacles(
+                value,
+                obstacles,
+                self.config,
+                environment=self.environment,
+            )
         )
-        hocbf = current_hocbf_constraints(
-            value,
-            active_obstacles,
-            self.environment,
-            self.config,
+        hocbf = list(
+            current_hocbf_constraints(
+                value,
+                active_obstacles,
+                self.environment,
+                self.config,
+            )
+            if hocbf_constraints is None
+            else hocbf_constraints
         )
         candidates = (
             self._active_policy_candidates(value, obstacles)
             if policies is None
             else list(policies)
         )
+        if not candidates:
+            return (), ()
         if nominal_control is None:
             nominal = candidates[0].control(value, self.config)
         else:
             nominal = np.asarray(nominal_control, dtype=float)
-        prediction_cache: dict[tuple[int, float], DynamicObstacle] = {}
-        evaluations = tuple(
-            self._certificate_for_policy(
+        if all(
+            isinstance(obstacle, (Human, Stretcher))
+            for obstacle in active_obstacles
+        ):
+            batched = self._jax_policy_evaluation(
                 value,
-                policy,
-                active_obstacles,
-                hocbf,
                 nominal,
-                prediction_cache,
+                candidates,
+                active_obstacles,
+                include_diagnostics=include_diagnostics,
             )
-            for policy in candidates
-        )
+            if batched.names != tuple(policy.name for policy in candidates):
+                raise RuntimeError("JAX policy order does not match the library")
+            evaluations = tuple(
+                self._certificate_from_jax(
+                    value,
+                    policy,
+                    float(batched.values[index]),
+                    batched.trajectories[index][
+                        batched.trajectory_mask[index]
+                    ],
+                    batched.gradients[index],
+                    float(batched.time_derivatives[index]),
+                    float(batched.nominal_prefix_values[index]),
+                    float(batched.terminal_clearances[index]),
+                    batched.diagnostics_available,
+                    hocbf,
+                )
+                for index, policy in enumerate(candidates)
+            )
+        else:
+            # Preserve the public DynamicObstacle protocol for custom user
+            # objects; benchmark Humans and Stretchers always take the JIT
+            # path above.
+            prediction_cache: dict[tuple[int, float], DynamicObstacle] = {}
+            evaluations = tuple(
+                self._certificate_for_policy(
+                    value,
+                    policy,
+                    active_obstacles,
+                    hocbf,
+                    nominal,
+                    prediction_cache,
+                )
+                for policy in candidates
+            )
         return (
             tuple(evaluation.certificate for evaluation in evaluations),
             evaluations,
@@ -943,6 +1520,9 @@ class HospitalController:
         state: Sequence[float],
         obstacles: Sequence[DynamicObstacle],
         time: float,
+        *,
+        obstacles_are_sensed: bool = False,
+        include_rollout_diagnostics: bool = True,
     ) -> ControllerResult:
         del time
         value = np.asarray(state, dtype=float)
@@ -955,11 +1535,15 @@ class HospitalController:
         )
         selected = "nominal"
 
-        active_obstacles = sensed_obstacles(
-            value,
-            obstacles,
-            self.config,
-            environment=self.environment,
+        active_obstacles = (
+            tuple(obstacles)
+            if obstacles_are_sensed
+            else sensed_obstacles(
+                value,
+                obstacles,
+                self.config,
+                environment=self.environment,
+            )
         )
         constraints = current_hocbf_constraints(
             value,
@@ -968,12 +1552,36 @@ class HospitalController:
             self.config,
         )
         policies = self._active_policy_candidates(value, obstacles)
-        certificates, evaluations = self.build_policy_certificates(
-            value,
-            obstacles,
-            policies,
-            nominal_control=nominal,
-        )
+        if active_obstacles or constraints or include_rollout_diagnostics:
+            certificates, evaluations = self.build_policy_certificates(
+                value,
+                active_obstacles,
+                policies,
+                nominal_control=nominal,
+                obstacles_are_sensed=True,
+                include_diagnostics=include_rollout_diagnostics,
+                hocbf_constraints=constraints,
+            )
+        else:
+            # Headless benchmarks do not need rollout drawings at a step where
+            # the playground applies the nominal tracker without any active
+            # safety row.  Keep one finite diagnostic certificate so the
+            # public decision object remains well formed.
+            nominal_certificate = PolicyCertificate(
+                policy_id="nominal",
+                value=0.0,
+                backup_control=np.clip(
+                    nominal,
+                    -self.config.robot.a_max,
+                    self.config.robot.a_max,
+                ),
+                metadata={
+                    "rollout_diagnostics_available": False,
+                    "inactive_safety_filter": True,
+                },
+            )
+            certificates = (nominal_certificate,)
+            evaluations = ()
         limit = self.config.robot.a_max
         emergency_hocbf_feasible: bool | None = None
         if active_obstacles or constraints:
@@ -1156,4 +1764,5 @@ class HospitalController:
             decision=decision,
             certificates=certificates,
             policy_evaluations=evaluations,
+            candidate_policy_count=len(policies),
         )
