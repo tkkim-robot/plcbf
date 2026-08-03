@@ -12,10 +12,11 @@ import matplotlib.pyplot as plt
 from examples.hospital.config import DEFAULT_CONFIG
 from examples.hospital.dynamics import step_double_integrator
 from examples.hospital.environment import build_hospital_environment
-from examples.hospital.obstacles import Stretcher
+from examples.hospital.obstacles import Human, Stretcher
 from examples.hospital.planner import HospitalGridPlanner
 from examples.hospital.simulation import (
     STRICT_WEST_JUNCTION_X,
+    SweptTransitionSafety,
     build_blocked_main_hall_scenario,
     evaluate_swept_transition,
 )
@@ -259,6 +260,87 @@ def test_stretcher_corner_clearance_is_exact_circle_rectangle_distance() -> None
     assert np.isclose(obstacle.signed_clearance(tangent, 0.5), 0.0)
     assert obstacle.signed_clearance(tangent, 0.49) > 0.0
     assert obstacle.signed_clearance(tangent, 0.51) < 0.0
+
+
+def test_swept_clearance_witness_attributes_synchronized_human_sample() -> None:
+    environment = build_hospital_environment()
+    human = Human(
+        identifier="witness-human",
+        x=51.4,
+        y=47.5,
+        vx=0.0,
+        vy=0.0,
+    )
+    start = np.array([50.0, 47.5, 0.0, 0.0])
+    end = np.array([50.2, 47.5, 0.0, 0.0])
+
+    transition = evaluate_swept_transition(
+        environment,
+        (human,),
+        start,
+        end,
+        DEFAULT_CONFIG.dt,
+        DEFAULT_CONFIG,
+    )
+
+    physical = transition.minimum_clearance_witness
+    operational = transition.minimum_safety_clearance_witness
+    assert physical is not None and operational is not None
+    assert physical.source_kind == operational.source_kind == "human"
+    assert physical.obstacle_identifier == "witness-human"
+    assert operational.obstacle_identifier == "witness-human"
+    assert physical.sample_index == operational.sample_index == 8
+    assert physical.sample_fraction == operational.sample_fraction == 1.0
+    assert physical.elapsed_s == operational.elapsed_s == DEFAULT_CONFIG.dt
+    assert physical.robot_position == operational.robot_position == (50.2, 47.5)
+    assert physical.value == transition.minimum_clearance
+    assert operational.value == transition.minimum_safety_clearance
+
+
+def test_swept_clearance_witness_distinguishes_stretcher_and_static() -> None:
+    environment = build_hospital_environment()
+    state = np.array([50.0, 47.5, 0.0, 0.0])
+    stretcher = Stretcher(
+        identifier="witness-stretcher",
+        coordinate=47.5,
+        lateral=51.5,
+        speed=0.0,
+        axis="y",
+        route_min=40.0,
+        route_max=55.0,
+    )
+    dynamic = evaluate_swept_transition(
+        environment,
+        (stretcher,),
+        state,
+        state,
+        0.0,
+        DEFAULT_CONFIG,
+    )
+    static = evaluate_swept_transition(
+        environment,
+        (),
+        state,
+        state,
+        0.0,
+        DEFAULT_CONFIG,
+    )
+
+    assert dynamic.minimum_safety_clearance_witness is not None
+    assert dynamic.minimum_safety_clearance_witness.source_kind == "stretcher"
+    assert (
+        dynamic.minimum_safety_clearance_witness.obstacle_identifier
+        == "witness-stretcher"
+    )
+    assert static.minimum_safety_clearance_witness is not None
+    assert static.minimum_safety_clearance_witness.source_kind == "static"
+    assert static.minimum_safety_clearance_witness.obstacle_identifier is None
+
+
+def test_swept_transition_result_remains_backward_constructible() -> None:
+    transition = SweptTransitionSafety(False, 1.0, 0.5)
+    assert transition.minimum_clearance_witness is None
+    assert transition.minimum_safety_clearance_witness is None
 
 
 def test_hospital_matplotlib_visualization_renders_headlessly() -> None:
