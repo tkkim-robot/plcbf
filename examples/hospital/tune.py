@@ -2,8 +2,9 @@
 
 Importing this module creates no study and runs no trials. The CLI prints its
 resolved configuration by default and requires ``--run`` before optimization.
-Every completed study evaluates its best configuration on disjoint held-out
-seeds and writes raw CSV/JSON plus an aggregate Markdown report.
+Every completed trial covers the same canonical 100-world benchmark used for
+selection and reporting.  The selected trial's exact archived rows are
+reported directly; there is no held-out split or post-selection simulation.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ import argparse
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -21,6 +24,8 @@ from plcbf.benchmarking import (
     BenchmarkOutcome,
     BenchmarkReportPaths,
     BenchmarkResult,
+    benchmark_report_from_json,
+    results_to_json,
     write_benchmark_reports,
 )
 
@@ -42,6 +47,7 @@ from .scenarios import (
     get_hospital_publication_trial,
     hospital_story_protocol_metadata,
 )
+from .reporting import write_hospital_benchmark_markdown
 from .simulation import validate_strict_refuge_protocol
 
 if TYPE_CHECKING:
@@ -50,9 +56,11 @@ if TYPE_CHECKING:
 
 _STUDY_FINGERPRINT_ATTRIBUTE = "objective_configuration_fingerprint"
 _BASE_REFERENCE_ATTRIBUTE = "base_controller_reference_enqueued"
-_SEARCH_SPACE_VERSION = "hospital_plcbf_v9_fixed_envelope_balanced_prefix"
-_CANONICAL_TRAIN_SEEDS = tuple(range(10))
-_CANONICAL_VALIDATION_SEEDS = tuple(range(10, 20))
+_RESULT_ARCHIVE_ATTRIBUTE = "exact_benchmark_result_archive"
+_RESULT_ARCHIVE_SCHEMA = "hospital_optuna_benchmark_results_v1"
+_OBJECTIVE_SCORE_VERSION = "success_first_lexicographic_v1"
+_SEARCH_SPACE_VERSION = "hospital_plcbf_v10_100world_no_holdout_success_first"
+_CANONICAL_BENCHMARK_SEEDS = tuple(DEFAULT_HOSPITAL_TRAFFIC_SEEDS)
 
 
 def hospital_tuning_base_config(
@@ -106,12 +114,14 @@ DEFAULT_PRUNER_SETTINGS: dict[str, object] = {
     "type": "exact_world_prefix_patient_median",
     "direction": "minimize",
     "reference_trials": "complete_only",
-    "prefix_metric": "safety_task_score_without_runtime",
+    "prefix_metric": "success_first_task_score_without_runtime",
+    "checkpoint_unit": "one_complete_five_story_seed_block",
     "n_startup_trials": 5,
-    "n_warmup_world_steps": 10,
+    "n_warmup_world_steps": 20,
     "interval_world_steps": 5,
-    "n_min_trials": 3,
+    "n_min_trials": 5,
     "patience_reports": 3,
+    "earliest_prune_world": 30,
 }
 _TUNABLE_NAMES = frozenset(
     {
@@ -175,18 +185,17 @@ def ordered_hospital_tuning_worlds(
 
 @dataclass(frozen=True)
 class HospitalTuningConfig:
-    """Fixed train/validation split and Optuna execution settings."""
+    """One fixed optimization/reporting grid and Optuna execution settings."""
 
     cases: tuple[str, ...] = tuple(HOSPITAL_BENCHMARK_STORIES)
-    train_seeds: tuple[int, ...] = _CANONICAL_TRAIN_SEEDS
-    validation_seeds: tuple[int, ...] = _CANONICAL_VALIDATION_SEEDS
+    benchmark_seeds: tuple[int, ...] = _CANONICAL_BENCHMARK_SEEDS
     steps: int = _DEFAULT_TUNING_STEPS
     n_trials: int = 50
     timeout_s: float | None = None
     sampler_seed: int = 0
-    study_name: str = "hospital_plcbf"
-    storage: str | None = "sqlite:///results/hospital_optuna.db"
-    output_prefix: Path = Path("results/hospital_optuna")
+    study_name: str = "hospital_plcbf_100"
+    storage: str | None = "sqlite:///results/hospital_optuna_100.db"
+    output_prefix: Path = Path("results/hospital_optuna_100")
     quick: bool = False
     base_config: HospitalConfig = field(
         default_factory=lambda: _PUBLICATION_BASE_CONFIG
@@ -196,17 +205,15 @@ class HospitalTuningConfig:
         base_config = hospital_tuning_base_config(self.base_config)
         validate_strict_refuge_protocol(base_config)
         cases = tuple(str(case) for case in self.cases)
-        raw_train_seeds = tuple(self.train_seeds)
-        raw_validation_seeds = tuple(self.validation_seeds)
+        raw_benchmark_seeds = tuple(self.benchmark_seeds)
         if any(
             isinstance(seed, bool) or int(seed) != seed
-            for seed in (*raw_train_seeds, *raw_validation_seeds)
+            for seed in raw_benchmark_seeds
         ):
             raise ValueError(
                 "hospital traffic seeds must be integers from 0 to 19"
             )
-        train_seeds = tuple(int(seed) for seed in raw_train_seeds)
-        validation_seeds = tuple(int(seed) for seed in raw_validation_seeds)
+        benchmark_seeds = tuple(int(seed) for seed in raw_benchmark_seeds)
         if not cases:
             raise ValueError("at least one hospital tuning case is required")
         unknown = set(cases) - set(HOSPITAL_BENCHMARK_STORIES)
@@ -218,27 +225,17 @@ class HospitalTuningConfig:
             raise ValueError(
                 "hospital tuning stories must not contain duplicates"
             )
-        if not train_seeds:
-            raise ValueError("at least one training seed is required")
-        if not validation_seeds:
-            raise ValueError("at least one held-out validation seed is required")
+        if not benchmark_seeds:
+            raise ValueError("at least one benchmark seed is required")
         allowed_seeds = set(DEFAULT_HOSPITAL_TRAFFIC_SEEDS)
-        invalid_seeds = (
-            set(train_seeds) | set(validation_seeds)
-        ) - allowed_seeds
+        invalid_seeds = set(benchmark_seeds) - allowed_seeds
         if invalid_seeds:
             raise ValueError(
                 "hospital traffic seeds must be integers from 0 to 19; got "
                 + ", ".join(str(seed) for seed in sorted(invalid_seeds))
             )
-        if len(set(train_seeds)) != len(train_seeds) or len(
-            set(validation_seeds)
-        ) != len(validation_seeds):
-            raise ValueError(
-                "hospital tuning seed splits must not contain duplicates"
-            )
-        if set(train_seeds) & set(validation_seeds):
-            raise ValueError("training and validation seeds must be disjoint")
+        if len(set(benchmark_seeds)) != len(benchmark_seeds):
+            raise ValueError("hospital benchmark seeds must not contain duplicates")
         if self.steps < 1 or self.n_trials < 1:
             raise ValueError("steps and n_trials must be positive")
         if self.timeout_s is not None and self.timeout_s <= 0.0:
@@ -250,8 +247,7 @@ class HospitalTuningConfig:
         if output_prefix.suffix:
             output_prefix = output_prefix.with_suffix("")
         object.__setattr__(self, "cases", cases)
-        object.__setattr__(self, "train_seeds", train_seeds)
-        object.__setattr__(self, "validation_seeds", validation_seeds)
+        object.__setattr__(self, "benchmark_seeds", benchmark_seeds)
         object.__setattr__(self, "sampler_seed", int(self.sampler_seed))
         object.__setattr__(self, "study_name", study_name)
         object.__setattr__(self, "output_prefix", output_prefix)
@@ -264,8 +260,7 @@ class HospitalTuningConfig:
             "case_study": "hospital_refuge",
             "method": "plcbf",
             "cases": list(self.cases),
-            "train_seeds": list(self.train_seeds),
-            "validation_seeds": list(self.validation_seeds),
+            "benchmark_seeds": list(self.benchmark_seeds),
             "steps": self.steps,
             "n_trials": self.n_trials,
             "target_terminal_trial_count": self.n_trials,
@@ -280,7 +275,8 @@ class HospitalTuningConfig:
             "storage": self.storage,
             "quick": self.quick,
             "policy_library": "full",
-            "training_world_order": "seed_major_story_round_robin",
+            "benchmark_world_order": "seed_major_story_round_robin",
+            "objective_score_version": _OBJECTIVE_SCORE_VERSION,
             "search_space_version": _SEARCH_SPACE_VERSION,
             "tunable_parameters": hospital_tuning_search_space(),
             "fixed_tuning_envelope": {
@@ -311,21 +307,23 @@ class HospitalTuningConfig:
             "seed_zero_is_exact_reference": False,
             "external_refuge_state_machine": False,
             "protocol_kind": (
-                "canonical_fixed_story_split"
+                "canonical_full_100_world_optimization_and_reporting_grid"
                 if self.cases == tuple(HOSPITAL_BENCHMARK_STORIES)
-                and self.train_seeds == _CANONICAL_TRAIN_SEEDS
-                and self.validation_seeds == _CANONICAL_VALIDATION_SEEDS
+                and self.benchmark_seeds == _CANONICAL_BENCHMARK_SEEDS
                 and not self.quick
-                else "explicit_custom_split"
+                else "explicit_custom_optimization_and_reporting_grid"
+            ),
+            "held_out_validation": False,
+            "post_selection_simulation": False,
+            "selection_grid_is_reported_grid": True,
+            "reported_results_source": (
+                "selected_complete_trial_exact_archive_no_rerun"
             ),
             "hospital_story_protocol": protocol,
             "source_content_sha256": _relevant_source_content_sha256(),
             "scenario_grid_sha256": {
-                "training": scenario_grid_fingerprint(
-                    self.cases, self.train_seeds
-                ),
-                "held_out_validation": scenario_grid_fingerprint(
-                    self.cases, self.validation_seeds
+                "benchmark": scenario_grid_fingerprint(
+                    self.cases, self.benchmark_seeds
                 ),
             },
             "publication_sensor_capacity": (
@@ -334,10 +332,10 @@ class HospitalTuningConfig:
             "publication_sensing_range_m": (
                 self.base_config.robot.sensing_range
             ),
-            "expected_training_world_count": (
-                len(self.cases) * len(self.train_seeds)
+            "expected_benchmark_world_count": (
+                len(self.cases) * len(self.benchmark_seeds)
             ),
-            "completed_trial_requires_full_training_grid": True,
+            "completed_trial_requires_full_benchmark_grid": True,
             "optimization_objective_includes_runtime": False,
             "pruner": (
                 {"type": "none"}
@@ -467,11 +465,13 @@ def hospital_config_from_params(
 
 
 def score_results(results: Iterable[BenchmarkResult]) -> float:
-    """Return a deterministic safety-first task score; lower is better.
+    """Return a deterministic success-first task score; lower is better.
 
     Wall-clock timing is intentionally excluded.  It remains available in the
     raw benchmark rows and trial diagnostics, but JIT warm-up and host load must
-    never change the selected controller.
+    never change the selected controller.  The integer portion is
+    lexicographic: maximize success count first, then minimize errors,
+    collisions, timeouts, operational violations, and terminal deadlock.
     """
 
     trials = tuple(results)
@@ -502,8 +502,12 @@ def score_results(results: Iterable[BenchmarkResult]) -> float:
         for result in trials
     )
     base = len(trials) + 1
+    non_successes = (
+        errors + invalid_legacy_outcomes + collisions + timeouts
+    )
     failure_rank = (
-        (errors + invalid_legacy_outcomes) * base**4
+        non_successes * base**5
+        + (errors + invalid_legacy_outcomes) * base**4
         + collisions * base**3
         + timeouts * base**2
         + operational_violations * base
@@ -570,7 +574,7 @@ def evaluate_plcbf_config(
     config: HospitalConfig,
     *,
     cases: Sequence[str] = tuple(HOSPITAL_BENCHMARK_STORIES),
-    seeds: Sequence[int] = _CANONICAL_TRAIN_SEEDS,
+    seeds: Sequence[int] = _CANONICAL_BENCHMARK_SEEDS,
     steps: int = _DEFAULT_TUNING_STEPS,
 ) -> tuple[float, tuple[BenchmarkResult, ...]]:
     """Evaluate a proposed full-library configuration without creating a study."""
@@ -594,8 +598,9 @@ def objective(
     *,
     base: HospitalConfig = _PUBLICATION_BASE_CONFIG,
     cases: Sequence[str] = tuple(HOSPITAL_BENCHMARK_STORIES),
-    seeds: Sequence[int] = _CANONICAL_TRAIN_SEEDS,
+    seeds: Sequence[int] = _CANONICAL_BENCHMARK_SEEDS,
     steps: int = _DEFAULT_TUNING_STEPS,
+    result_archive_dir: str | Path | None = None,
 ) -> float:
     """Evaluate ordered worlds, allowing pruning only between complete worlds.
 
@@ -603,6 +608,11 @@ def objective(
     :func:`score_results` value over the complete Cartesian grid.
     """
 
+    if result_archive_dir is None:
+        raise ValueError(
+            "result_archive_dir is required so a completed Optuna trial can "
+            "be reported without rerunning the benchmark"
+        )
     config = suggest_hospital_config(trial, base)
     case_values = tuple(str(case) for case in cases)
     seed_values = tuple(int(seed) for seed in seeds)
@@ -617,12 +627,12 @@ def objective(
         f"{case}/seed-{seed}"
         for case, seed in ordered_worlds
     ]
-    training_grid_sha256 = scenario_grid_fingerprint(
+    benchmark_grid_sha256 = scenario_grid_fingerprint(
         case_values,
         seed_values,
     )
     _set_trial_attr(
-        trial, "training_grid_sha256", training_grid_sha256
+        trial, "benchmark_grid_sha256", benchmark_grid_sha256
     )
     _set_trial_attr(
         trial, "expected_case_ids", expected_case_ids
@@ -659,11 +669,13 @@ def objective(
         _set_trial_attr(
             trial, "evaluated_world_count", world_index
         )
+        completed_story_block = world_index % len(case_values) == 0
         prefix_score = _deterministic_prefix_score(results)
-        if callable(report):
+        if completed_story_block and callable(report):
             report(prefix_score, step=world_index)
         if (
             world_index < expected_world_count
+            and completed_story_block
             and callable(should_prune)
             and should_prune()
         ):
@@ -688,8 +700,23 @@ def objective(
     score = score_results(completed)
     _set_trial_attr(
         trial,
+        "success_count",
+        sum(result.success for result in completed),
+    )
+    _set_trial_attr(
+        trial,
         "collision_count",
         sum(result.collision for result in completed),
+    )
+    _set_trial_attr(
+        trial,
+        "timeout_count",
+        sum(result.timeout for result in completed),
+    )
+    _set_trial_attr(
+        trial,
+        "error_count",
+        sum(result.outcome is BenchmarkOutcome.ERROR for result in completed),
     )
     _set_trial_attr(
         trial,
@@ -716,7 +743,17 @@ def objective(
     _set_trial_attr(
         trial, "expected_complete_world_count", expected_world_count
     )
-    _set_trial_attr(trial, "completed_full_training_grid", True)
+    archive = _write_exact_result_archive(
+        result_archive_dir,
+        trial=trial,
+        config=config,
+        results=completed,
+        expected_case_ids=expected_case_ids,
+        benchmark_grid_sha256=benchmark_grid_sha256,
+        score=score,
+    )
+    _set_trial_attr(trial, _RESULT_ARCHIVE_ATTRIBUTE, archive)
+    _set_trial_attr(trial, "completed_full_benchmark_grid", True)
     _set_trial_attr(trial, "final_full_grid_score", float(score))
     timing_totals = [
         float(
@@ -744,6 +781,157 @@ def _set_trial_attr(trial: Any, name: str, value: object) -> None:
     setter = getattr(trial, "set_user_attr", None)
     if callable(setter):
         setter(name, value)
+
+
+def _write_exact_result_archive(
+    directory: str | Path,
+    *,
+    trial: Any,
+    config: HospitalConfig,
+    results: Sequence[BenchmarkResult],
+    expected_case_ids: Sequence[str],
+    benchmark_grid_sha256: str,
+    score: float,
+) -> dict[str, object]:
+    """Atomically archive one completed trial's exact benchmark rows."""
+
+    try:
+        trial_number = int(trial.number)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "completed Optuna trials require an integer trial number for "
+            "their exact result archive"
+        ) from error
+    rows = tuple(results)
+    identities = [result.case_id for result in rows]
+    if identities != list(expected_case_ids):
+        raise RuntimeError(
+            "cannot archive a completed trial whose rows are not in the "
+            "declared seed-major benchmark order"
+        )
+    metadata = {
+        "archive_schema": _RESULT_ARCHIVE_SCHEMA,
+        "benchmark_grid_sha256": str(benchmark_grid_sha256),
+        "config": asdict(config),
+        "objective_score": float(score),
+        "objective_score_version": _OBJECTIVE_SCORE_VERSION,
+        "ordered_case_ids": list(expected_case_ids),
+        "params": dict(sorted(getattr(trial, "params", {}).items())),
+        "trial_number": trial_number,
+    }
+    document = results_to_json(rows, metadata=metadata, indent=0).encode(
+        "utf-8"
+    )
+    digest = hashlib.sha256(document).hexdigest()
+    destination_directory = Path(directory).expanduser().resolve()
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    destination = destination_directory / f"trial-{trial_number:04d}.json"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination_directory,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(document)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if destination.exists():
+            if destination.read_bytes() != document:
+                raise RuntimeError(
+                    f"refusing to overwrite conflicting trial archive "
+                    f"{destination}"
+                )
+            temporary_path.unlink()
+            temporary_path = None
+        else:
+            os.replace(temporary_path, destination)
+            temporary_path = None
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return {
+        "byte_count": len(document),
+        "path": str(destination),
+        "result_count": len(rows),
+        "schema": _RESULT_ARCHIVE_SCHEMA,
+        "sha256": digest,
+    }
+
+
+def _load_exact_result_archive(
+    trial: Any,
+    *,
+    expected_case_ids: Sequence[str],
+    expected_grid_sha256: str,
+    expected_config: HospitalConfig,
+) -> tuple[BenchmarkResult, ...]:
+    """Load and strictly verify a completed trial's immutable result rows."""
+
+    attrs = dict(getattr(trial, "user_attrs", {}))
+    descriptor = attrs.get(_RESULT_ARCHIVE_ATTRIBUTE)
+    expected_descriptor_keys = {
+        "byte_count",
+        "path",
+        "result_count",
+        "schema",
+        "sha256",
+    }
+    if not isinstance(descriptor, Mapping) or set(descriptor) != (
+        expected_descriptor_keys
+    ):
+        raise RuntimeError("trial lacks a complete exact-result archive descriptor")
+    if descriptor.get("schema") != _RESULT_ARCHIVE_SCHEMA:
+        raise RuntimeError("trial result archive uses an unknown schema")
+    path = Path(str(descriptor.get("path")))
+    try:
+        document = path.read_bytes()
+    except OSError as error:
+        raise RuntimeError(f"cannot read trial result archive {path}") from error
+    if len(document) != descriptor.get("byte_count"):
+        raise RuntimeError("trial result archive byte count does not match")
+    if hashlib.sha256(document).hexdigest() != descriptor.get("sha256"):
+        raise RuntimeError("trial result archive SHA-256 does not match")
+    report = benchmark_report_from_json(document, source=str(path))
+    metadata = dict(report.metadata)
+    expected_metadata = {
+        "archive_schema": _RESULT_ARCHIVE_SCHEMA,
+        "benchmark_grid_sha256": expected_grid_sha256,
+        "config": asdict(expected_config),
+        "objective_score": float(trial.value),
+        "objective_score_version": _OBJECTIVE_SCORE_VERSION,
+        "ordered_case_ids": list(expected_case_ids),
+        "params": dict(sorted(getattr(trial, "params", {}).items())),
+        "trial_number": int(trial.number),
+    }
+    if _json_compatible(metadata) != _json_compatible(expected_metadata):
+        raise RuntimeError("trial result archive metadata does not match the trial")
+    rows_by_case_id: dict[str, BenchmarkResult] = {}
+    for result in report.results:
+        if result.algorithm != "plcbf" or result.case_id in rows_by_case_id:
+            raise RuntimeError(
+                "trial result archive has a wrong method or duplicate world"
+            )
+        rows_by_case_id[result.case_id] = result
+    if set(rows_by_case_id) != set(expected_case_ids):
+        raise RuntimeError("trial result archive does not cover the exact grid")
+    ordered = tuple(rows_by_case_id[case_id] for case_id in expected_case_ids)
+    if len(ordered) != descriptor.get("result_count"):
+        raise RuntimeError("trial result archive row count does not match")
+    if [result.outcome.value for result in ordered] != attrs.get("outcomes"):
+        raise RuntimeError("trial result archive outcomes do not match")
+    recomputed_score = score_results(ordered)
+    if not np.isclose(
+        recomputed_score,
+        float(trial.value),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise RuntimeError("trial result archive score does not match")
+    return ordered
 
 
 def _validate_single_world_result(
@@ -878,14 +1066,14 @@ class ExactWorldPrefixPatientMedianPruner:
             return False
 
         candidate_attrs = dict(getattr(trial, "user_attrs", {}))
-        grid_sha256 = candidate_attrs.get("training_grid_sha256")
+        grid_sha256 = candidate_attrs.get("benchmark_grid_sha256")
         expected_case_ids = candidate_attrs.get("expected_case_ids")
         evaluated_case_ids = candidate_attrs.get("evaluated_case_ids")
         study_attrs = dict(getattr(study, "user_attrs", {}))
-        bound_case_ids = study_attrs.get("ordered_training_case_ids")
+        bound_case_ids = study_attrs.get("ordered_benchmark_case_ids")
         bound_grid_hashes = study_attrs.get("scenario_grid_sha256", {})
         bound_grid_sha256 = (
-            bound_grid_hashes.get("training")
+            bound_grid_hashes.get("benchmark")
             if isinstance(bound_grid_hashes, Mapping)
             else None
         )
@@ -909,8 +1097,8 @@ class ExactWorldPrefixPatientMedianPruner:
             attrs = dict(getattr(item, "user_attrs", {}))
             return bool(
                 self._state_name(item) == "COMPLETE"
-                and attrs.get("completed_full_training_grid") is True
-                and attrs.get("training_grid_sha256") == grid_sha256
+                and attrs.get("completed_full_benchmark_grid") is True
+                and attrs.get("benchmark_grid_sha256") == grid_sha256
                 and attrs.get("expected_case_ids") == expected_case_ids
                 and attrs.get("evaluated_case_ids") == expected_case_ids
                 and attrs.get("evaluated_world_count")
@@ -1098,23 +1286,20 @@ def _relevant_source_content_sha256() -> dict[str, str]:
 def study_configuration_fingerprint(
     config: HospitalTuningConfig,
 ) -> str:
-    """Hash every setting that changes the training objective/search space."""
+    """Hash every setting that changes the benchmark objective/search space."""
 
     metadata = config.metadata()
     payload = {
         "search_space_version": _SEARCH_SPACE_VERSION,
+        "objective_score_version": _OBJECTIVE_SCORE_VERSION,
         "search_space": metadata["tunable_parameters"],
         "fixed_tuning_envelope": metadata["fixed_tuning_envelope"],
-        "training_world_order": metadata["training_world_order"],
+        "benchmark_world_order": metadata["benchmark_world_order"],
         "cases": list(config.cases),
-        "train_seeds": list(config.train_seeds),
-        "validation_seeds": list(config.validation_seeds),
+        "benchmark_seeds": list(config.benchmark_seeds),
         "hospital_story_protocol": metadata["hospital_story_protocol"],
-        "training_scenario_grid_sha256": scenario_grid_fingerprint(
-            config.cases, config.train_seeds
-        ),
-        "validation_scenario_grid_sha256": scenario_grid_fingerprint(
-            config.cases, config.validation_seeds
+        "benchmark_scenario_grid_sha256": scenario_grid_fingerprint(
+            config.cases, config.benchmark_seeds
         ),
         "steps": config.steps,
         "sampler_seed": config.sampler_seed,
@@ -1147,9 +1332,10 @@ def bind_study_configuration(
     metadata = config.metadata()
     audit_attributes = {
         "search_space_version": _SEARCH_SPACE_VERSION,
+        "objective_score_version": _OBJECTIVE_SCORE_VERSION,
         "search_space": metadata["tunable_parameters"],
         "fixed_tuning_envelope": metadata["fixed_tuning_envelope"],
-        "training_world_order": metadata["training_world_order"],
+        "benchmark_world_order": metadata["benchmark_world_order"],
         "hospital_story_protocol_sha256": metadata[
             "hospital_story_protocol"
         ]["protocol_sha256"],
@@ -1157,11 +1343,11 @@ def bind_study_configuration(
         "pruner": metadata["pruner"],
         "sampler": metadata["sampler"],
         "source_content_sha256": metadata["source_content_sha256"],
-        "ordered_training_case_ids": [
+        "ordered_benchmark_case_ids": [
             f"{case}/seed-{seed}"
             for case, seed in ordered_hospital_tuning_worlds(
                 config.cases,
-                config.train_seeds,
+                config.benchmark_seeds,
             )
         ],
     }
@@ -1190,6 +1376,17 @@ def bind_study_configuration(
     return fingerprint
 
 
+def _trial_archive_directory(
+    config: HospitalTuningConfig,
+    fingerprint: str,
+) -> Path:
+    """Return the fingerprint-namespaced exact-result archive directory."""
+
+    return config.output_prefix.with_name(
+        f"{config.output_prefix.name}_trials_{fingerprint[:16]}"
+    )
+
+
 def _prepare_storage(storage: str | None) -> None:
     if storage is None or not storage.startswith("sqlite:///"):
         return
@@ -1200,7 +1397,7 @@ def _prepare_storage(storage: str | None) -> None:
 
 def create_study(
     *,
-    study_name: str = "hospital_plcbf",
+    study_name: str = "hospital_plcbf_100",
     storage: str | None = None,
     seed: int = 0,
     load_if_exists: bool = True,
@@ -1324,29 +1521,29 @@ def _select_audited_best_trial(
     study: Any,
     config: HospitalTuningConfig | None = None,
 ) -> Any:
-    """Select only COMPLETE trials proving the exact training grid finished."""
+    """Select only COMPLETE trials proving the exact benchmark grid finished."""
 
     if config is None:
         expected_case_ids = list(
-            study.user_attrs.get("ordered_training_case_ids", ())
+            study.user_attrs.get("ordered_benchmark_case_ids", ())
         )
         scenario_hashes = study.user_attrs.get("scenario_grid_sha256", {})
-        expected_grid_sha256 = scenario_hashes.get("training")
+        expected_grid_sha256 = scenario_hashes.get("benchmark")
     else:
         expected_case_ids = [
             f"{case}/seed-{seed}"
             for case, seed in ordered_hospital_tuning_worlds(
                 config.cases,
-                config.train_seeds,
+                config.benchmark_seeds,
             )
         ]
         expected_grid_sha256 = scenario_grid_fingerprint(
             config.cases,
-            config.train_seeds,
+            config.benchmark_seeds,
         )
     if not expected_case_ids or not isinstance(expected_grid_sha256, str):
         raise RuntimeError(
-            "study lacks the ordered training-grid audit metadata"
+            "study lacks the ordered benchmark-grid audit metadata"
         )
     expected_world_count = len(expected_case_ids)
     audited: list[Any] = []
@@ -1370,13 +1567,19 @@ def _select_audited_best_trial(
             ) == _json_compatible(asdict(reconstructed))
             value = float(trial.value)
             recorded_score = float(attrs.get("final_full_grid_score"))
-        except (TypeError, ValueError):
+            archived_results = _load_exact_result_archive(
+                trial,
+                expected_case_ids=expected_case_ids,
+                expected_grid_sha256=expected_grid_sha256,
+                expected_config=reconstructed,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
             continue
         outcomes = attrs.get("outcomes")
         if not (
             set(params) == _TUNABLE_NAMES
-            and attrs.get("completed_full_training_grid") is True
-            and attrs.get("training_grid_sha256") == expected_grid_sha256
+            and attrs.get("completed_full_benchmark_grid") is True
+            and attrs.get("benchmark_grid_sha256") == expected_grid_sha256
             and attrs.get("expected_case_ids") == expected_case_ids
             and attrs.get("evaluated_case_ids") == expected_case_ids
             and attrs.get("evaluated_world_count") == expected_world_count
@@ -1389,6 +1592,7 @@ def _select_audited_best_trial(
             and np.isfinite(value)
             and np.isfinite(recorded_score)
             and np.isclose(value, recorded_score, rtol=0.0, atol=1e-12)
+            and len(archived_results) == expected_world_count
         ):
             continue
         audited.append(trial)
@@ -1406,40 +1610,30 @@ def run_tuning(
     *,
     n_trials: int,
     timeout_s: float | None = None,
-    study_name: str = "hospital_plcbf",
+    study_name: str = "hospital_plcbf_100",
     storage: str | None = None,
     sampler_seed: int = 0,
     cases: Sequence[str] = tuple(HOSPITAL_BENCHMARK_STORIES),
-    seeds: Sequence[int] = _CANONICAL_TRAIN_SEEDS,
+    seeds: Sequence[int] = _CANONICAL_BENCHMARK_SEEDS,
     steps: int = _DEFAULT_TUNING_STEPS,
     base: HospitalConfig = _PUBLICATION_BASE_CONFIG,
+    output_prefix: str | Path = Path("results/hospital_optuna_100"),
 ) -> "optuna.Study":
     """Compatibility API that explicitly optimizes and returns a study."""
 
     if n_trials <= 0:
         raise ValueError("n_trials must be positive")
-    training_seeds = tuple(int(seed) for seed in seeds)
-    training_seed_set = set(training_seeds)
-    validation_seeds = tuple(
-        seed
-        for seed in DEFAULT_HOSPITAL_TRAFFIC_SEEDS
-        if seed not in training_seed_set
-    )
-    if not validation_seeds:
-        raise ValueError(
-            "training seeds leave no canonical Hospital traffic seed for "
-            "held-out validation"
-        )
+    benchmark_seeds = tuple(int(seed) for seed in seeds)
     config = HospitalTuningConfig(
         cases=tuple(cases),
-        train_seeds=training_seeds,
-        validation_seeds=validation_seeds,
+        benchmark_seeds=benchmark_seeds,
         steps=steps,
         n_trials=n_trials,
         timeout_s=timeout_s,
         sampler_seed=sampler_seed,
         study_name=study_name,
         storage=storage,
+        output_prefix=Path(output_prefix),
         base_config=base,
     )
     study = create_study(
@@ -1448,7 +1642,8 @@ def run_tuning(
         seed=config.sampler_seed,
         quick=config.quick,
     )
-    bind_study_configuration(study, config)
+    fingerprint = bind_study_configuration(study, config)
+    result_archive_dir = _trial_archive_directory(config, fingerprint)
     enqueue_base_controller_reference(study, config)
     remaining_trials = _remaining_target_trials(study, config)
     if remaining_trials:
@@ -1457,8 +1652,9 @@ def run_tuning(
                 trial,
                 base=config.base_config,
                 cases=config.cases,
-                seeds=config.train_seeds,
+                seeds=config.benchmark_seeds,
                 steps=config.steps,
+                result_archive_dir=result_archive_dir,
             ),
             n_trials=remaining_trials,
             timeout=config.timeout_s,
@@ -1477,13 +1673,13 @@ def run_tuning(
 
 @dataclass(frozen=True)
 class TuningRunResult:
-    """Artifacts from an explicitly executed tuning and validation run."""
+    """Artifacts reported directly from the selected completed trial."""
 
     study: Any
     best_trial: Any
     best_config: HospitalConfig
-    validation_results: tuple[BenchmarkResult, ...]
-    validation_reports: BenchmarkReportPaths
+    benchmark_results: tuple[BenchmarkResult, ...]
+    benchmark_reports: BenchmarkReportPaths
     summary_path: Path
 
 
@@ -1494,7 +1690,7 @@ def _write_run_summary(
     study: Any,
     best_trial: Any,
     best_config: HospitalConfig,
-    validation_results: tuple[BenchmarkResult, ...],
+    benchmark_results: tuple[BenchmarkResult, ...],
     reports: BenchmarkReportPaths,
 ) -> Path:
     state_counts: dict[str, int] = {}
@@ -1532,11 +1728,20 @@ def _write_run_summary(
         },
         "configuration": config.metadata(),
         "best_config": asdict(best_config),
-        "validation_score": score_results(validation_results),
-        "validation_outcomes": [
-            result.outcome.value for result in validation_results
+        "benchmark_score": score_results(benchmark_results),
+        "benchmark_outcomes": [
+            result.outcome.value for result in benchmark_results
         ],
-        "validation_reports": {
+        "benchmark_outcome_counts": {
+            outcome.value: sum(
+                result.outcome is outcome for result in benchmark_results
+            )
+            for outcome in BenchmarkOutcome
+        },
+        "benchmark_results_source": (
+            "selected_complete_trial_exact_archive_no_rerun"
+        ),
+        "benchmark_reports": {
             "csv": str(reports.csv),
             "json": str(reports.json),
             "markdown": str(reports.markdown),
@@ -1552,7 +1757,7 @@ def _write_run_summary(
 
 
 def run_study(config: HospitalTuningConfig) -> TuningRunResult:
-    """Create/resume, optimize, reconstruct, and validate one study."""
+    """Optimize and report the selected trial without another simulation."""
 
     study = create_study(
         study_name=config.study_name,
@@ -1560,7 +1765,8 @@ def run_study(config: HospitalTuningConfig) -> TuningRunResult:
         seed=config.sampler_seed,
         quick=config.quick,
     )
-    bind_study_configuration(study, config)
+    fingerprint = bind_study_configuration(study, config)
+    result_archive_dir = _trial_archive_directory(config, fingerprint)
     enqueue_base_controller_reference(study, config)
     remaining_trials = _remaining_target_trials(study, config)
     if remaining_trials:
@@ -1569,8 +1775,9 @@ def run_study(config: HospitalTuningConfig) -> TuningRunResult:
                 trial,
                 base=config.base_config,
                 cases=config.cases,
-                seeds=config.train_seeds,
+                seeds=config.benchmark_seeds,
                 steps=config.steps,
+                result_archive_dir=result_archive_dir,
             ),
             n_trials=remaining_trials,
             timeout=config.timeout_s,
@@ -1591,26 +1798,40 @@ def run_study(config: HospitalTuningConfig) -> TuningRunResult:
         best_trial.params,
         base=config.base_config,
     )
-    _, validation_results = evaluate_plcbf_config(
-        best_config,
-        cases=config.cases,
-        seeds=config.validation_seeds,
-        steps=config.steps,
+    expected_case_ids = [
+        f"{case}/seed-{seed}"
+        for case, seed in ordered_hospital_tuning_worlds(
+            config.cases,
+            config.benchmark_seeds,
+        )
+    ]
+    benchmark_results = _load_exact_result_archive(
+        best_trial,
+        expected_case_ids=expected_case_ids,
+        expected_grid_sha256=scenario_grid_fingerprint(
+            config.cases,
+            config.benchmark_seeds,
+        ),
+        expected_config=best_config,
     )
-    validation_prefix = config.output_prefix.with_name(
-        config.output_prefix.name + "_validation"
-    )
-    validation_reports = write_benchmark_reports(
-        validation_prefix,
-        validation_results,
+    benchmark_reports = write_benchmark_reports(
+        config.output_prefix,
+        benchmark_results,
         metadata={
             **config.metadata(),
-            "split": "held_out_validation",
+            "split": "optimization_and_reporting_full_100_world_grid",
             "best_params": dict(sorted(best_trial.params.items())),
             "best_trial_number": int(best_trial.number),
             "best_config": asdict(best_config),
+            "post_selection_simulation": False,
+            "results_source": "selected_trial_exact_archive",
         },
-        title="Hospital tuned PL-CBF held-out validation",
+        title="Hospital tuned PL-CBF 100-world benchmark",
+    )
+    write_hospital_benchmark_markdown(
+        benchmark_reports.markdown,
+        benchmark_results,
+        title="Hospital tuned PL-CBF 100-world benchmark",
     )
     summary_path = config.output_prefix.with_name(
         config.output_prefix.name + "_summary.json"
@@ -1621,15 +1842,15 @@ def run_study(config: HospitalTuningConfig) -> TuningRunResult:
         study=study,
         best_trial=best_trial,
         best_config=best_config,
-        validation_results=validation_results,
-        reports=validation_reports,
+        benchmark_results=benchmark_results,
+        reports=benchmark_reports,
     )
     return TuningRunResult(
         study=study,
         best_trial=best_trial,
         best_config=best_config,
-        validation_results=validation_results,
-        validation_reports=validation_reports,
+        benchmark_results=benchmark_results,
+        benchmark_reports=benchmark_reports,
         summary_path=summary_path,
     )
 
@@ -1675,7 +1896,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--study-name")
     parser.add_argument(
         "--storage",
-        default="sqlite:///results/hospital_optuna.db",
+        default="sqlite:///results/hospital_optuna_100.db",
     )
     parser.add_argument("--sampler-seed", type=int, default=0)
     parser.add_argument(
@@ -1685,17 +1906,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(HOSPITAL_BENCHMARK_STORIES),
     )
     parser.add_argument("--seeds", nargs="+", type=int)
-    parser.add_argument("--validation-seeds", nargs="+", type=int)
     parser.add_argument("--steps", type=int)
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/hospital_optuna"),
+        default=Path("results/hospital_optuna_100"),
     )
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="one trial, one step, one case, and disjoint single-seed splits",
+        help="one trial, one step, one case, and one benchmark seed",
     )
     return parser
 
@@ -1703,21 +1923,15 @@ def build_parser() -> argparse.ArgumentParser:
 def _config_from_args(arguments: argparse.Namespace) -> HospitalTuningConfig:
     quick = bool(arguments.quick)
     cases = tuple(arguments.cases[:1] if quick else arguments.cases)
-    train_seeds = tuple(
+    benchmark_seeds = tuple(
         arguments.seeds
         if arguments.seeds
-        else ((0,) if quick else _CANONICAL_TRAIN_SEEDS)
-    )
-    validation_seeds = tuple(
-        arguments.validation_seeds
-        if arguments.validation_seeds
-        else ((10,) if quick else _CANONICAL_VALIDATION_SEEDS)
+        else ((0,) if quick else _CANONICAL_BENCHMARK_SEEDS)
     )
     base = _PUBLICATION_BASE_CONFIG
     return HospitalTuningConfig(
         cases=cases,
-        train_seeds=train_seeds,
-        validation_seeds=validation_seeds,
+        benchmark_seeds=benchmark_seeds,
         steps=(
             arguments.steps
             if arguments.steps is not None
@@ -1732,7 +1946,11 @@ def _config_from_args(arguments: argparse.Namespace) -> HospitalTuningConfig:
         sampler_seed=arguments.sampler_seed,
         study_name=(
             arguments.study_name
-            or ("hospital_plcbf_quick" if quick else "hospital_plcbf")
+            or (
+                "hospital_plcbf_100_quick"
+                if quick
+                else "hospital_plcbf_100"
+            )
         ),
         storage=None if arguments.storage == "none" else arguments.storage,
         output_prefix=arguments.output,
@@ -1765,11 +1983,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "best_value": result.best_trial.value,
                 "best_trial_number": result.best_trial.number,
                 "summary": str(result.summary_path.resolve()),
-                "validation_reports": {
-                    "csv": str(result.validation_reports.csv.resolve()),
-                    "json": str(result.validation_reports.json.resolve()),
+                "benchmark_reports": {
+                    "csv": str(result.benchmark_reports.csv.resolve()),
+                    "json": str(result.benchmark_reports.json.resolve()),
                     "markdown": str(
-                        result.validation_reports.markdown.resolve()
+                        result.benchmark_reports.markdown.resolve()
                     ),
                 },
             },
@@ -1780,7 +1998,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return int(
         any(
             item.outcome is BenchmarkOutcome.ERROR
-            for item in result.validation_results
+            for item in result.benchmark_results
         )
     )
 

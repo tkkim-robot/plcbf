@@ -174,14 +174,18 @@ Hospital phase-one tuning keeps the publication safe set, 24 m/53-obstacle
 perception envelope, full 12-direction/seven-room library, refuge geometry,
 7.2 s room horizon, and 0.24 s room rollout step fixed. It tunes nine
 controller-only numerical parameters. Every completed trial covers the full
-five-story × ten-training-seed grid in seed-major story-balanced order; the
-untuned controller is trial zero, pruning occurs only between complete worlds,
-and the selected winner is evaluated on the disjoint ten-seed validation grid.
+five-story × 20-seed publication benchmark (100 worlds) in seed-major,
+story-balanced order. The untuned controller is trial zero. Pruning can occur
+only after a complete five-story seed block and only against audited completed
+trials. Success count is the primary objective; errors, collisions, timeouts,
+and continuous diagnostics are deterministic tie-breakers. The winner's exact
+archived 100 rows become the paper report directly, with no held-out split and
+no post-selection simulation rerun.
 Running `python -m examples.hospital.tune` without `--run` only prints this
 resolved protocol and does not create an Optuna study.
 
 The hospital tuning summary can be replayed directly by the all-method
-benchmark with `--config-json results/hospital_optuna_summary.json`; the tuned
+benchmark with `--config-json results/hospital_optuna_100_summary.json`; the tuned
 full policy library is preserved and certificates are still recomputed at
 every plant step. Nonlinear Quad3D tuning atomically exports its audited winner
 to `examples/nl_quad3d/configs/plcbf_optuna_best.yaml`; both its benchmark and

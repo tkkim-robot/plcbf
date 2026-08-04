@@ -203,8 +203,8 @@ exact oriented-rectangle geometry.
 
 ## Optional Optuna tuning
 
-Inspect the resolved disjoint train/validation protocol without starting a
-study:
+Inspect the resolved 100-world optimization/reporting protocol without
+starting a study:
 
 ```bash
 uv run python -m examples.hospital.tune
@@ -220,14 +220,21 @@ and 0.24 s room rollout step. Refuge geometry is also fixed. Consequently,
 Optuna cannot improve its score by weakening the benchmark or shrinking the
 fallback library.
 
-Each completed trial evaluates all five stories on training seeds `0..9`
-(50 full worlds, each with the 180 s horizon). Worlds are ordered seed-major,
-so every five-world pruning checkpoint contains every story once. Pruning is
-allowed only after a complete world and compares the exact same prefix against
-audited complete trials. The untuned publication controller is enqueued once
-as trial zero. Only after the target trial count finishes is the audited winner
-evaluated on disjoint seeds `10..19` (50 held-out worlds). Runtime is recorded
-but excluded from the objective.
+Each completed trial evaluates all five stories on all publication seeds
+`0..19`: exactly 100 worlds, each with the 180 s horizon. Worlds are ordered
+seed-major, and Optuna reports or checks pruning only after a complete
+five-story seed block. Five audited complete trials are required as references;
+the 20-world warmup and three-checkpoint patience make world 30 the earliest
+possible prune. Every comparison therefore uses the same balanced prefix.
+
+Success count is the primary objective. Errors, collisions, timeouts,
+operational violations, deadlock, and continuous task metrics are ordered
+tie-breakers; measured runtime is recorded but excluded. The untuned
+publication controller is enqueued once as trial zero. Every completed trial's
+exact raw `BenchmarkResult` rows are atomically archived and SHA-256 audited.
+After the target trial count finishes, the selected trial's original 100 rows
+are written directly to CSV, JSON, and the publication Markdown table. There
+is no held-out validation split and no post-selection benchmark rerun.
 
 For a one-world/one-step plumbing inspection that still retains the same full
 library and fixed envelope, add `--quick`. Neither inspection form creates a
@@ -240,11 +247,16 @@ incompatible resume:
 uv run python -m examples.hospital.tune --run --trials 50
 ```
 
+The fresh 100-world study uses `results/hospital_optuna_100.db`; final paper
+artifacts use the `results/hospital_optuna_100` prefix. The earlier 50/50 study
+has a different fingerprint, name, and storage and cannot be resumed into this
+protocol.
+
 Replay an exported best configuration across the complete eight-method
 comparison without compacting its policy library:
 
 ```bash
 uv run python -m examples.hospital.benchmark \
-  --config-json results/hospital_optuna_summary.json \
+  --config-json results/hospital_optuna_100_summary.json \
   --output results/hospital_benchmark_tuned
 ```

@@ -14,10 +14,12 @@ from examples.hospital.benchmark import (
 from examples.hospital.config import DEFAULT_CONFIG, load_hospital_config
 from examples.hospital.scenarios import hospital_story_protocol_metadata
 from plcbf.benchmarking import BenchmarkOutcome, BenchmarkResult
+from plcbf.benchmarking import load_benchmark_report
 
 
 class FakeTrial:
     def __init__(self) -> None:
+        self.number = 0
         self.params: dict[str, object] = {}
         self.float_ranges: dict[str, tuple[float, float, object, bool]] = {}
 
@@ -91,11 +93,13 @@ def _story_result(
         BenchmarkOutcome.SUCCESS,
         min_clearance=0.2,
         intervention=0.1,
+        solve_times_s=(0.001, 0.002),
         case_metrics={
             "progress": 1.0,
             "solver_fallback_count": 0,
             "steps": 10,
             "oracle_and_solver_time_total_s": runtime_s,
+            "world_sha256": "a" * 64,
         },
     )
 
@@ -170,17 +174,22 @@ def test_tuning_score_uses_safety_and_task_metrics_not_fixed_dwell() -> None:
     assert tune.score_results((timeout,)) < tune.score_results((collision,))
 
 
-def test_tuning_split_and_fingerprint_are_stable() -> None:
-    with pytest.raises(ValueError, match="disjoint"):
-        tune.HospitalTuningConfig(
-            train_seeds=(1, 2),
-            validation_seeds=(2, 3),
-        )
+def test_tuning_score_maximizes_success_before_failure_type() -> None:
+    success = _result(BenchmarkOutcome.SUCCESS, progress=1.0)
+    timeout = _result(BenchmarkOutcome.TIMEOUT, progress=0.5)
+    collision = _result(BenchmarkOutcome.COLLISION, progress=0.2)
+    higher_success_with_collision = (success, success, collision)
+    lower_success_without_collision = (success, timeout, timeout)
+    assert tune.score_results(higher_success_with_collision) < (
+        tune.score_results(lower_success_without_collision)
+    )
+
+
+def test_full_benchmark_grid_and_fingerprint_are_stable() -> None:
     first = tune.HospitalTuningConfig()
     second = replace(first)
     assert first.cases == tuple(HOSPITAL_BENCHMARK_STORIES)
-    assert first.train_seeds == tuple(range(10))
-    assert first.validation_seeds == tuple(range(10, 20))
+    assert first.benchmark_seeds == tuple(range(20))
     assert first.base_config.safety.max_obstacles == (
         PUBLICATION_MAX_SENSED_OBSTACLES
     )
@@ -204,16 +213,20 @@ def test_tuning_split_and_fingerprint_are_stable() -> None:
     assert metadata["external_refuge_state_machine"] is False
     assert metadata["oracle_period"] == "every_plant_step"
     assert metadata["oracle_period_s"] == first.base_config.dt
-    assert metadata["protocol_kind"] == "canonical_fixed_story_split"
+    assert metadata["protocol_kind"] == (
+        "canonical_full_100_world_optimization_and_reporting_grid"
+    )
     assert metadata["hospital_story_protocol"]["protocol_sha256"] == (
         hospital_story_protocol_metadata()["protocol_sha256"]
     )
-    assert metadata["scenario_grid_sha256"]["training"] != (
-        metadata["scenario_grid_sha256"]["held_out_validation"]
-    )
-    assert metadata["training_world_order"] == (
+    assert set(metadata["scenario_grid_sha256"]) == {"benchmark"}
+    assert metadata["benchmark_world_order"] == (
         "seed_major_story_round_robin"
     )
+    assert metadata["expected_benchmark_world_count"] == 100
+    assert metadata["held_out_validation"] is False
+    assert metadata["post_selection_simulation"] is False
+    assert metadata["selection_grid_is_reported_grid"] is True
     assert set(metadata["tunable_parameters"]) == set(
         tune.base_controller_reference_params(first)
     )
@@ -236,22 +249,21 @@ def test_tuning_split_and_fingerprint_are_stable() -> None:
 def test_tuning_rejects_seeds_outside_fixed_story_protocol(seed) -> None:
     with pytest.raises(ValueError, match="traffic seeds"):
         tune.HospitalTuningConfig(
-            train_seeds=(seed,),
-            validation_seeds=(10,),
+            benchmark_seeds=(seed,),
         )
 
 
-def test_cli_defaults_resolve_exact_five_story_split() -> None:
+def test_cli_defaults_resolve_exact_five_by_twenty_grid() -> None:
     arguments = tune.build_parser().parse_args([])
     config = tune._config_from_args(arguments)
     assert config.cases == tuple(HOSPITAL_BENCHMARK_STORIES)
-    assert config.train_seeds == tuple(range(10))
-    assert config.validation_seeds == tuple(range(10, 20))
+    assert config.benchmark_seeds == tuple(range(20))
+    assert config.study_name == "hospital_plcbf_100"
+    assert config.storage == "sqlite:///results/hospital_optuna_100.db"
 
     quick = tune._config_from_args(tune.build_parser().parse_args(["--quick"]))
     assert quick.cases == (HOSPITAL_BENCHMARK_STORIES[0],)
-    assert quick.train_seeds == (0,)
-    assert quick.validation_seeds == (10,)
+    assert quick.benchmark_seeds == (0,)
     assert quick.base_config.safety.max_obstacles == (
         PUBLICATION_MAX_SENSED_OBSTACLES
     )
@@ -351,12 +363,12 @@ def test_study_binding_records_protocol_and_scenario_fingerprints() -> None:
     assert study.user_attrs["pruner"] == config.metadata()["pruner"]
     assert study.user_attrs["sampler"] == config.metadata()["sampler"]
     assert study.user_attrs["source_content_sha256"]
-    ordered = study.user_attrs["ordered_training_case_ids"]
-    assert len(ordered) == 50
+    ordered = study.user_attrs["ordered_benchmark_case_ids"]
+    assert len(ordered) == 100
     assert ordered[:5] == [
         f"{story}/seed-0" for story in HOSPITAL_BENCHMARK_STORIES
     ]
-    assert study.user_attrs["training_world_order"] == (
+    assert study.user_attrs["benchmark_world_order"] == (
         "seed_major_story_round_robin"
     )
     assert set(study.user_attrs["search_space"]) == set(
@@ -376,8 +388,8 @@ def test_study_binding_rejects_incompatible_and_legacy_resume() -> None:
     config = tune.HospitalTuningConfig()
     incompatible = FakeStudy()
     tune.bind_study_configuration(incompatible, config)
-    incompatible.user_attrs["training_world_order"] = "case_major"
-    with pytest.raises(ValueError, match="training_world_order"):
+    incompatible.user_attrs["benchmark_world_order"] = "case_major"
+    with pytest.raises(ValueError, match="benchmark_world_order"):
         tune.bind_study_configuration(incompatible, config)
 
     legacy = FakeStudy()
@@ -386,8 +398,9 @@ def test_study_binding_rejects_incompatible_and_legacy_resume() -> None:
         tune.bind_study_configuration(legacy, config)
 
 
-def test_objective_reports_ordered_complete_five_by_ten_grid(
+def test_objective_reports_ordered_complete_five_by_twenty_grid(
     monkeypatch,
+    tmp_path,
 ) -> None:
     observed: list[tuple[str, int]] = []
     rows: list[BenchmarkResult] = []
@@ -402,27 +415,77 @@ def test_objective_reports_ordered_complete_five_by_ten_grid(
 
     monkeypatch.setattr(tune, "run_hospital_benchmark", fake_benchmark)
     trial = ReportingTrial()
-    value = tune.objective(trial)
+    value = tune.objective(trial, result_archive_dir=tmp_path)
 
     expected = [
         (story, seed)
-        for seed in range(10)
+        for seed in range(20)
         for story in HOSPITAL_BENCHMARK_STORIES
     ]
     assert observed == expected
-    assert [step for step, _value in trial.reports] == list(range(1, 51))
+    assert [step for step, _value in trial.reports] == list(
+        range(5, 101, 5)
+    )
     assert value == tune.score_results(rows)
-    assert trial.user_attrs["evaluated_world_count"] == 50
-    assert trial.user_attrs["completed_world_count"] == 50
-    assert trial.user_attrs["expected_complete_world_count"] == 50
-    assert trial.user_attrs["completed_full_training_grid"] is True
+    assert trial.user_attrs["evaluated_world_count"] == 100
+    assert trial.user_attrs["completed_world_count"] == 100
+    assert trial.user_attrs["expected_complete_world_count"] == 100
+    assert trial.user_attrs["completed_full_benchmark_grid"] is True
+    descriptor = trial.user_attrs["exact_benchmark_result_archive"]
+    assert descriptor["result_count"] == 100
+    assert (tmp_path / "trial-0000.json").is_file()
     assert trial.user_attrs["mean_oracle_and_solver_time_total_s"] == (
         pytest.approx(0.1)
     )
 
 
+def test_exact_result_archive_round_trips_and_rejects_tampering(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    story = HOSPITAL_BENCHMARK_STORIES[0]
+
+    def fake_benchmark(**kwargs):
+        return (_story_result(kwargs["cases"][0], kwargs["seeds"][0]),)
+
+    monkeypatch.setattr(tune, "run_hospital_benchmark", fake_benchmark)
+    trial = ReportingTrial()
+    score = tune.objective(
+        trial,
+        cases=(story,),
+        seeds=(0, 1),
+        steps=1,
+        result_archive_dir=tmp_path,
+    )
+    trial.value = score
+    case_ids = [f"{story}/seed-0", f"{story}/seed-1"]
+    config = tune.hospital_config_from_params(trial.params)
+    rows = tune._load_exact_result_archive(
+        trial,
+        expected_case_ids=case_ids,
+        expected_grid_sha256=tune.scenario_grid_fingerprint(
+            (story,), (0, 1)
+        ),
+        expected_config=config,
+    )
+    assert [row.case_id for row in rows] == case_ids
+    assert rows[0].solve_times_s == (0.001, 0.002)
+    archive_path = tmp_path / "trial-0000.json"
+    archive_path.write_bytes(archive_path.read_bytes() + b" ")
+    with pytest.raises(RuntimeError, match="byte count"):
+        tune._load_exact_result_archive(
+            trial,
+            expected_case_ids=case_ids,
+            expected_grid_sha256=tune.scenario_grid_fingerprint(
+                (story,), (0, 1)
+            ),
+            expected_config=config,
+        )
+
+
 def test_objective_prunes_only_after_complete_world_checkpoint(
     monkeypatch,
+    tmp_path,
 ) -> None:
     optuna = pytest.importorskip("optuna")
     observed: list[tuple[str, int]] = []
@@ -434,7 +497,7 @@ def test_objective_prunes_only_after_complete_world_checkpoint(
         return (_story_result(story, seed),)
 
     monkeypatch.setattr(tune, "run_hospital_benchmark", fake_benchmark)
-    trial = ReportingTrial(prune_after=2)
+    trial = ReportingTrial(prune_after=1)
     stories = tuple(HOSPITAL_BENCHMARK_STORIES[:2])
 
     with pytest.raises(optuna.TrialPruned):
@@ -443,17 +506,19 @@ def test_objective_prunes_only_after_complete_world_checkpoint(
             cases=stories,
             seeds=(0, 1),
             steps=1,
+            result_archive_dir=tmp_path,
         )
 
     assert observed == [(stories[0], 0), (stories[1], 0)]
-    assert [step for step, _value in trial.reports] == [1, 2]
+    assert [step for step, _value in trial.reports] == [2]
     assert trial.user_attrs["evaluated_world_count"] == 2
     assert trial.user_attrs["expected_complete_world_count"] == 4
-    assert "completed_full_training_grid" not in trial.user_attrs
+    assert "completed_full_benchmark_grid" not in trial.user_attrs
 
 
 def test_final_completed_world_is_not_reclassified_as_pruned(
     monkeypatch,
+    tmp_path,
 ) -> None:
     def fake_benchmark(**kwargs):
         return (
@@ -467,8 +532,9 @@ def test_final_completed_world_is_not_reclassified_as_pruned(
         cases=(HOSPITAL_BENCHMARK_STORIES[0],),
         seeds=(0, 1),
         steps=1,
+        result_archive_dir=tmp_path,
     )
-    assert trial.user_attrs["completed_full_training_grid"] is True
+    assert trial.user_attrs["completed_full_benchmark_grid"] is True
 
 
 def test_prefix_metric_neutralizes_runtime_measurement() -> None:
@@ -488,9 +554,9 @@ def test_create_study_wires_deterministic_exact_prefix_pruner() -> None:
         study.pruner, tune.ExactWorldPrefixPatientMedianPruner
     )
     assert study.pruner.n_startup_trials == 5
-    assert study.pruner.n_warmup_steps == 10
+    assert study.pruner.n_warmup_steps == 20
     assert study.pruner.interval_steps == 5
-    assert study.pruner.n_min_trials == 3
+    assert study.pruner.n_min_trials == 5
     assert study.pruner.patience == 3
 
     quick = tune.create_study(
@@ -501,12 +567,50 @@ def test_create_study_wires_deterministic_exact_prefix_pruner() -> None:
     assert isinstance(quick.pruner, optuna.pruners.NopPruner)
 
 
+def test_default_pruner_cannot_prune_before_thirty_balanced_worlds() -> None:
+    optuna = pytest.importorskip("optuna")
+    pruner = tune.build_pruner()
+    study = optuna.create_study(direction="minimize", pruner=pruner)
+    expected_case_ids = [f"story-{index}" for index in range(100)]
+    study.set_user_attr("ordered_benchmark_case_ids", expected_case_ids)
+    study.set_user_attr(
+        "scenario_grid_sha256", {"benchmark": "fixed-grid"}
+    )
+
+    def set_attrs(trial, evaluated, *, complete=False):
+        trial.set_user_attr("benchmark_grid_sha256", "fixed-grid")
+        trial.set_user_attr("expected_case_ids", expected_case_ids)
+        trial.set_user_attr(
+            "evaluated_case_ids", expected_case_ids[:evaluated]
+        )
+        trial.set_user_attr("evaluated_world_count", evaluated)
+        trial.set_user_attr("expected_complete_world_count", 100)
+        if complete:
+            trial.set_user_attr("completed_full_benchmark_grid", True)
+            trial.set_user_attr("completed_world_count", 100)
+
+    for _ in range(5):
+        reference = study.ask()
+        set_attrs(reference, 100, complete=True)
+        for checkpoint in (20, 25, 30):
+            reference.report(1.0, checkpoint)
+        study.tell(reference, 1.0)
+
+    candidate = study.ask()
+    for checkpoint in (20, 25):
+        set_attrs(candidate, checkpoint)
+        candidate.report(2.0, checkpoint)
+        assert candidate.should_prune() is False
+    set_attrs(candidate, 30)
+    candidate.report(2.0, 30)
+    assert candidate.should_prune() is True
+
+
 def test_base_controller_is_enqueued_once_as_trial_zero() -> None:
     pytest.importorskip("optuna")
     config = tune.HospitalTuningConfig(
         cases=(HOSPITAL_BENCHMARK_STORIES[0],),
-        train_seeds=(0,),
-        validation_seeds=(10,),
+        benchmark_seeds=(0,),
         storage=None,
     )
     study = tune.create_study(
@@ -547,14 +651,14 @@ def test_real_optuna_pruner_uses_exact_prefix_and_patience() -> None:
     )
     study = optuna.create_study(direction="minimize", pruner=pruner)
     expected_case_ids = ["story/seed-0", "story/seed-1"]
-    study.set_user_attr("ordered_training_case_ids", expected_case_ids)
+    study.set_user_attr("ordered_benchmark_case_ids", expected_case_ids)
     study.set_user_attr(
-        "scenario_grid_sha256", {"training": "fixed-grid"}
+        "scenario_grid_sha256", {"benchmark": "fixed-grid"}
     )
 
     def set_attrs(trial, *, complete: bool, evaluated: int) -> None:
         values = {
-            "training_grid_sha256": "fixed-grid",
+            "benchmark_grid_sha256": "fixed-grid",
             "expected_case_ids": expected_case_ids,
             "evaluated_case_ids": expected_case_ids[:evaluated],
             "evaluated_world_count": evaluated,
@@ -563,7 +667,7 @@ def test_real_optuna_pruner_uses_exact_prefix_and_patience() -> None:
         if complete:
             values.update(
                 {
-                    "completed_full_training_grid": True,
+                    "completed_full_benchmark_grid": True,
                     "completed_world_count": 2,
                 }
             )
@@ -596,16 +700,16 @@ def test_pruner_ignores_complete_trials_without_full_grid_audit() -> None:
         patience=1,
     )
     study = optuna.create_study(direction="minimize", pruner=pruner)
-    study.set_user_attr("ordered_training_case_ids", ["story/seed-0"])
+    study.set_user_attr("ordered_benchmark_case_ids", ["story/seed-0"])
     study.set_user_attr(
-        "scenario_grid_sha256", {"training": "fixed-grid"}
+        "scenario_grid_sha256", {"benchmark": "fixed-grid"}
     )
     unaudited = study.ask()
     unaudited.report(1.0, step=1)
     study.tell(unaudited, 1.0)
 
     candidate = study.ask()
-    candidate.set_user_attr("training_grid_sha256", "fixed-grid")
+    candidate.set_user_attr("benchmark_grid_sha256", "fixed-grid")
     candidate.set_user_attr("expected_case_ids", ["story/seed-0"])
     candidate.set_user_attr("evaluated_case_ids", ["story/seed-0"])
     candidate.set_user_attr("evaluated_world_count", 1)
@@ -690,6 +794,7 @@ def test_timeout_does_not_export_an_incomplete_trial_target(
 
 def test_audited_best_ignores_lower_unaudited_complete_trial(
     monkeypatch,
+    tmp_path,
 ) -> None:
     optuna = pytest.importorskip("optuna")
     story = HOSPITAL_BENCHMARK_STORIES[0]
@@ -700,8 +805,7 @@ def test_audited_best_ignores_lower_unaudited_complete_trial(
     monkeypatch.setattr(tune, "run_hospital_benchmark", fake_benchmark)
     config = tune.HospitalTuningConfig(
         cases=(story,),
-        train_seeds=(0,),
-        validation_seeds=(10,),
+        benchmark_seeds=(0,),
         steps=1,
         n_trials=2,
         storage=None,
@@ -719,8 +823,9 @@ def test_audited_best_ignores_lower_unaudited_complete_trial(
             trial,
             base=config.base_config,
             cases=config.cases,
-            seeds=config.train_seeds,
+            seeds=config.benchmark_seeds,
             steps=config.steps,
+            result_archive_dir=tmp_path,
         ),
         n_trials=1,
     )
@@ -731,6 +836,64 @@ def test_audited_best_ignores_lower_unaudited_complete_trial(
     assert tune._select_audited_best_trial(study, config).number == (
         audited.number
     )
+
+
+def test_run_study_reports_selected_archive_without_benchmark_rerun(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    pytest.importorskip("optuna")
+    story = HOSPITAL_BENCHMARK_STORIES[0]
+
+    def fake_benchmark(**kwargs):
+        return (_story_result(kwargs["cases"][0], kwargs["seeds"][0]),)
+
+    monkeypatch.setattr(tune, "run_hospital_benchmark", fake_benchmark)
+    config = tune.HospitalTuningConfig(
+        cases=(story,),
+        benchmark_seeds=(0,),
+        steps=1,
+        n_trials=1,
+        study_name="archive_only_reporting",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        output_prefix=tmp_path / "winner",
+        quick=True,
+    )
+    study = tune.create_study(
+        study_name=config.study_name,
+        storage=config.storage,
+        load_if_exists=False,
+        quick=True,
+    )
+    fingerprint = tune.bind_study_configuration(study, config)
+    archive_dir = tune._trial_archive_directory(config, fingerprint)
+    study.optimize(
+        lambda trial: tune.objective(
+            trial,
+            base=config.base_config,
+            cases=config.cases,
+            seeds=config.benchmark_seeds,
+            steps=config.steps,
+            result_archive_dir=archive_dir,
+        ),
+        n_trials=1,
+    )
+
+    def forbidden(**_kwargs):
+        raise AssertionError("winner reporting must not rerun the benchmark")
+
+    monkeypatch.setattr(tune, "run_hospital_benchmark", forbidden)
+    result = tune.run_study(config)
+    assert len(result.benchmark_results) == 1
+    assert result.benchmark_results[0].case_id == f"{story}/seed-0"
+    assert result.summary_path.is_file()
+    report = load_benchmark_report(result.benchmark_reports.json)
+    assert report.results == result.benchmark_results
+    summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
+    assert summary["benchmark_results_source"] == (
+        "selected_complete_trial_exact_archive_no_rerun"
+    )
+    assert "validation_score" not in summary
 
 
 def test_fingerprint_binds_relevant_source_content(monkeypatch) -> None:
