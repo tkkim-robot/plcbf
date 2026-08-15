@@ -62,8 +62,20 @@ def _mean_metric(
 def _trial_rate(
     rows: Sequence[BenchmarkResult],
     name: str,
+    *,
+    fallback_key: str | None = None,
 ) -> str:
-    values = [bool(row.case_metrics.get(name, False)) for row in rows]
+    values = [
+        bool(
+            row.case_metrics.get(
+                name,
+                False
+                if fallback_key is None
+                else row.case_metrics.get(fallback_key, False),
+            )
+        )
+        for row in rows
+    ]
     return _percent(sum(values), len(values))
 
 
@@ -124,8 +136,14 @@ def _group_summary(rows: Sequence[BenchmarkResult]) -> Mapping[str, str | int]:
         for row in rows
         if row.intervention is not None
     ]
-    fallback_steps = sum(
-        int(row.case_metrics.get("solver_fallback_count", 0)) for row in rows
+    selector_fallback_steps = sum(
+        int(row.case_metrics.get("selector_fallback_count", 0)) for row in rows
+    )
+    infeasible_steps = sum(
+        int(row.case_metrics.get("infeasible_count", 0)) for row in rows
+    )
+    backup_executed_steps = sum(
+        int(row.case_metrics.get("backup_executed_count", 0)) for row in rows
     )
     executed_steps = sum(int(row.case_metrics.get("steps", 0)) for row in rows)
     return {
@@ -156,8 +174,14 @@ def _group_summary(rows: Sequence[BenchmarkResult]) -> Mapping[str, str | int]:
         "safe_block": _trial_rate(rows, "safe_through_blockage"),
         "goal_after": _trial_rate(rows, "goal_reached_after_clear"),
         "normal_room": _trial_rate(rows, "normal_qp_room_selected"),
-        "fallback_room": _trial_rate(rows, "numerical_fallback_room_selected"),
-        "solver_fallback": _percent(fallback_steps, executed_steps),
+        "fallback_room": _trial_rate(
+            rows,
+            "selector_fallback_room_selected",
+            fallback_key="numerical_fallback_room_selected",
+        ),
+        "selector_fallback": _percent(selector_fallback_steps, executed_steps),
+        "infeasible": _percent(infeasible_steps, executed_steps),
+        "backup_executed": _percent(backup_executed_steps, executed_steps),
     }
 
 
@@ -193,9 +217,10 @@ def hospital_benchmark_markdown(
         (
             "| Method | Trials | Success | Collision | Safety violation | "
             "Timeout | Deadlocked at end | Safety clearance mean / min [m] | "
-            "Intervention | Decision mean / p95 [ms] | Solver fallback steps |"
+            "Intervention | Decision mean / p95 [ms] | Selector fallback steps | "
+            "Infeasible decisions | Backup/emergency steps |"
         ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for method in sorted(by_method):
         summary = _group_summary(by_method[method])
@@ -205,7 +230,8 @@ def hospital_benchmark_markdown(
             f"{summary['timeout']} | {summary['deadlock']} | "
             f"{summary['clearance']} | {summary['intervention']} | "
             f"{summary['solve']} | "
-            f"{summary['solver_fallback']} |"
+            f"{summary['selector_fallback']} | {summary['infeasible']} | "
+            f"{summary['backup_executed']} |"
         )
 
     output.extend(
@@ -305,7 +331,7 @@ def hospital_benchmark_markdown(
             (
                 "| Method | Post-departure room entry | Room occupied during "
                 "blockage | Safe through blockage | Goal after clearance | "
-                "Normal-QP room selection | Numerical-fallback room selection |"
+                "Normal-QP room selection | Selector-backup room selection |"
             ),
             "|---|---:|---:|---:|---:|---:|---:|",
         ]
@@ -361,7 +387,11 @@ def hospital_benchmark_markdown(
         ]
     )
     for story in HOSPITAL_STORIES:
-        convoy = "opposes eastbound" if story.travel_direction > 0 else "opposes westbound"
+        convoy = (
+            "opposes eastbound"
+            if story.travel_direction > 0
+            else "opposes westbound"
+        )
         output.append(
             f"| {story.story_id} | {story.start_room} | {story.goal_room} | "
             f"{story.corridor_name} | {story.blocker_count} | {convoy} |"

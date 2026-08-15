@@ -11,11 +11,12 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
+import hashlib
 import json
 import math
 from pathlib import Path
 import time
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -31,7 +32,11 @@ from plcbf.benchmarking import (
     write_benchmark_reports,
 )
 
-from .config import DEFAULT_CONFIG, HospitalConfig, load_hospital_config
+from .config import DEFAULT_CONFIG, HospitalConfig
+from .config_io import (
+    DEFAULT_HOSPITAL_CONFIG_PATH,
+    load_hospital_config_artifact,
+)
 from .baselines import HospitalBaselineSuite
 from .controller import HospitalController, sensed_obstacles
 from .dynamics import step_double_integrator, waypoint_control
@@ -127,9 +132,23 @@ def publication_benchmark_config(
     rule.  Every method receives the same resulting snapshot.
     """
 
+    common_policy_horizon = DEFAULT_CONFIG.policies.room_horizon
+    policy_horizons = (
+        config.policies.nominal_horizon,
+        config.policies.angle_horizon,
+        config.policies.reverse_horizon,
+        config.policies.stop_horizon,
+        config.policies.room_horizon,
+    )
     if (
         config.safety.max_obstacles >= PUBLICATION_MAX_SENSED_OBSTACLES
         and config.robot.sensing_range >= PUBLICATION_SENSING_RANGE_M
+        and config.safety.hocbf_margin >= config.safety.safety_margin
+        and config.safety.static_hocbf_margin >= config.safety.static_margin
+        and all(
+            np.isclose(horizon, common_policy_horizon)
+            for horizon in policy_horizons
+        )
     ):
         return config
     return replace(
@@ -141,14 +160,89 @@ def publication_benchmark_config(
                 PUBLICATION_SENSING_RANGE_M,
             ),
         ),
+        policies=replace(
+            config.policies,
+            # Policy values and feasible-input volumes are comparable only
+            # when every candidate certifies the same future interval.
+            nominal_horizon=common_policy_horizon,
+            angle_horizon=common_policy_horizon,
+            reverse_horizon=common_policy_horizon,
+            stop_horizon=common_policy_horizon,
+            room_horizon=common_policy_horizon,
+        ),
         safety=replace(
             config.safety,
             max_obstacles=max(
                 config.safety.max_obstacles,
                 PUBLICATION_MAX_SENSED_OBSTACLES,
             ),
+            # The emergency projection and the reported operational safe set
+            # must describe the same clearance boundary.  This also prevents
+            # replaying an older tuned JSON from silently restoring the former
+            # smaller HOCBF margins.
+            hocbf_margin=max(
+                config.safety.hocbf_margin,
+                config.safety.safety_margin,
+            ),
+            static_hocbf_margin=max(
+                config.safety.static_hocbf_margin,
+                config.safety.static_margin,
+            ),
         ),
     )
+
+
+_PLCBF_TUNED_POLICY_FIELDS = frozenset(
+    {
+        "cbf_alpha",
+        "cbf_value_buffer",
+        "component_temperature",
+        "max_gradient_norm",
+        "room_target_speed",
+        "stop_gain",
+        "time_temperature",
+    }
+)
+_PLCBF_TUNED_SAFETY_FIELDS = frozenset(
+    {"hocbf_lambda1", "hocbf_lambda2"}
+)
+
+
+def validate_plcbf_configuration_scope(
+    baseline: HospitalConfig,
+    plcbf: HospitalConfig,
+) -> None:
+    """Require a tuned PL-CBF config to preserve the comparison envelope.
+
+    Optuna changes only the nine PL-CBF certificate/QP parameters declared by
+    the Hospital search space.  Dynamics, perception, nominal planning,
+    obstacle geometry, policy-library size, and safety margins must remain
+    identical across methods; otherwise loading a convenient artifact could
+    silently tune the baselines or change the physical experiment.
+    """
+
+    normalized = replace(
+        plcbf,
+        policies=replace(
+            plcbf.policies,
+            **{
+                name: getattr(baseline.policies, name)
+                for name in _PLCBF_TUNED_POLICY_FIELDS
+            },
+        ),
+        safety=replace(
+            plcbf.safety,
+            **{
+                name: getattr(baseline.safety, name)
+                for name in _PLCBF_TUNED_SAFETY_FIELDS
+            },
+        ),
+    )
+    if normalized != baseline:
+        raise ValueError(
+            "PL-CBF configuration changes fields outside the nine audited "
+            "Hospital tuning parameters"
+        )
 
 
 def compact_benchmark_config(
@@ -722,8 +816,14 @@ def _decision_event_flags(
     decision: BaselineDecision,
     *,
     feasible: bool | None = None,
-) -> tuple[bool, bool, bool, bool]:
-    """Split exceptional solver fallback from normal backup execution."""
+) -> tuple[bool, bool, bool, bool, bool]:
+    """Return selector, infeasible, exceptional, backup, and shield flags.
+
+    A selector fallback can still produce a feasible HOCBF-filtered control, so
+    it is not itself evidence of numerical solver failure.  The third flag is
+    retained as the historical union of selector fallback and infeasibility;
+    reports expose its two ingredients separately.
+    """
 
     status = decision.status
     policy_decision = decision.policy_decision
@@ -740,7 +840,8 @@ def _decision_event_flags(
         )
     )
     final_feasible = decision.feasible if feasible is None else bool(feasible)
-    solver_fallback = bool(not final_feasible or selector_fallback)
+    decision_infeasible = not final_feasible
+    exceptional_decision = bool(decision_infeasible or selector_fallback)
     mps_backup = method is BenchmarkMethod.MPS and decision.used_fallback
     gatekeeper_backup = (
         method is BenchmarkMethod.GATEKEEPER and decision.used_fallback
@@ -781,7 +882,8 @@ def _decision_event_flags(
     )
     return (
         selector_fallback,
-        solver_fallback,
+        decision_infeasible,
+        exceptional_decision,
         backup_executed,
         shield_active,
     )
@@ -954,7 +1056,7 @@ def run_hospital_trial(
         solver_time_total = 0.0
         oracle_calls = 0
         selector_fallback_count = 0
-        solver_fallback_count = 0
+        exceptional_decision_count = 0
         backup_executed_count = 0
         shield_active_count = 0
         mi_mpc_result_count = 0
@@ -966,7 +1068,7 @@ def run_hospital_trial(
         policy_count_min = 1_000_000
         room_selection_count = 0
         normal_qp_room_selection_count = 0
-        numerical_fallback_room_selection_count = 0
+        selector_fallback_room_selection_count = 0
         max_raw_sensed_obstacle_count = 0
         max_blocker_range_rank = 0
         blocker_capacity_miss_count = 0
@@ -1113,7 +1215,8 @@ def run_hospital_trial(
             policy_count_min = min(policy_count_min, policy_count)
             (
                 selector_fallback,
-                solver_fallback,
+                decision_infeasible,
+                exceptional_decision,
                 backup_executed,
                 shield_active,
             ) = _decision_event_flags(
@@ -1122,15 +1225,15 @@ def run_hospital_trial(
                 feasible=feasible,
             )
             selector_fallback_count += int(selector_fallback)
-            solver_fallback_count += int(solver_fallback)
+            exceptional_decision_count += int(exceptional_decision)
             backup_executed_count += int(backup_executed)
             shield_active_count += int(shield_active)
-            infeasible_count += int(not feasible)
+            infeasible_count += int(decision_infeasible)
             if parsed_method is BenchmarkMethod.PLCBF and selected_room_policy:
                 normal_qp_room_selection_count += int(
                     feasible and not selector_fallback
                 )
-                numerical_fallback_room_selection_count += int(
+                selector_fallback_room_selection_count += int(
                     selector_fallback
                 )
             last_decision = decision
@@ -1412,9 +1515,16 @@ def run_hospital_trial(
                 "selector_fallback_rate": (
                     selector_fallback_count / max(1, executed_steps)
                 ),
-                "solver_fallback_count": solver_fallback_count,
+                "exceptional_decision_count": exceptional_decision_count,
+                "exceptional_decision_rate": (
+                    exceptional_decision_count / max(1, executed_steps)
+                ),
+                # Deprecated compatibility aliases.  Historical artifacts used
+                # "solver fallback" for the union of selector fallback and
+                # infeasibility even when no numerical solver had failed.
+                "solver_fallback_count": exceptional_decision_count,
                 "solver_fallback_rate": (
-                    solver_fallback_count / max(1, executed_steps)
+                    exceptional_decision_count / max(1, executed_steps)
                 ),
                 "backup_executed_count": backup_executed_count,
                 "backup_executed_rate": (
@@ -1480,15 +1590,26 @@ def run_hospital_trial(
                 "normal_qp_room_selected": (
                     normal_qp_room_selection_count > 0
                 ),
+                "selector_fallback_room_selection_count": (
+                    selector_fallback_room_selection_count
+                ),
+                "selector_fallback_room_selection_rate": (
+                    selector_fallback_room_selection_count
+                    / max(1, executed_steps)
+                ),
+                "selector_fallback_room_selected": (
+                    selector_fallback_room_selection_count > 0
+                ),
+                # Deprecated names retained for old report readers.
                 "numerical_fallback_room_selection_count": (
-                    numerical_fallback_room_selection_count
+                    selector_fallback_room_selection_count
                 ),
                 "numerical_fallback_room_selection_rate": (
-                    numerical_fallback_room_selection_count
+                    selector_fallback_room_selection_count
                     / max(1, executed_steps)
                 ),
                 "numerical_fallback_room_selected": (
-                    numerical_fallback_room_selection_count > 0
+                    selector_fallback_room_selection_count > 0
                 ),
                 "controller_max_sensed_obstacles": (
                     config.safety.max_obstacles
@@ -1581,13 +1702,23 @@ def run_hospital_benchmark(
     seeds: Iterable[int] = DEFAULT_HOSPITAL_TRAFFIC_SEEDS,
     steps: int | None = None,
     config: HospitalConfig = DEFAULT_CONFIG,
+    plcbf_config: HospitalConfig | None = None,
     oracle_period_s: float | None = None,
     compact_policy_library: bool = False,
     progress: bool = False,
 ) -> tuple[BenchmarkResult, ...]:
-    """Materialize the deterministic Cartesian product in stable order."""
+    """Materialize the deterministic Cartesian product in stable order.
+
+    ``config`` remains the comparison-method configuration.  The optional
+    ``plcbf_config`` may change only the nine audited Optuna fields.  Keeping
+    ``None`` as "use config" preserves programmatic tuning/replay behavior;
+    the CLI explicitly supplies the packaged PL-CBF winner.
+    """
 
     validate_strict_refuge_protocol(config)
+    resolved_plcbf_config = config if plcbf_config is None else plcbf_config
+    validate_strict_refuge_protocol(resolved_plcbf_config)
+    validate_plcbf_configuration_scope(config, resolved_plcbf_config)
     if steps is None:
         steps = default_hospital_benchmark_steps(config)
     if steps <= 0:
@@ -1606,6 +1737,11 @@ def run_hospital_benchmark(
         compact_benchmark_config(config)
         if compact_policy_library
         else config
+    )
+    plcbf_benchmark_config = (
+        compact_benchmark_config(resolved_plcbf_config)
+        if compact_policy_library
+        else resolved_plcbf_config
     )
     results = []
     total = len(parsed_methods) * len(case_ids) * len(seed_values)
@@ -1635,7 +1771,11 @@ def run_hospital_benchmark(
                         case_id,
                         seed=seed,
                         steps=steps,
-                        config=benchmark_config,
+                        config=(
+                            plcbf_benchmark_config
+                            if method is BenchmarkMethod.PLCBF
+                            else benchmark_config
+                        ),
                         oracle_period_s=oracle_period_s,
                         _scenario=scenario,
                     )
@@ -1714,11 +1854,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--config",
         "--config-json",
+        dest="config_json",
         type=Path,
         help=(
-            "direct HospitalConfig JSON or a tuning summary containing "
-            "best_config"
+            "PL-CBF HospitalConfig YAML/JSON or tuning summary (default: "
+            "packaged Optuna winner); comparison baselines are unchanged"
         ),
     )
     parser.add_argument(
@@ -1752,30 +1894,59 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _resolve_cli_protocol(
     arguments: argparse.Namespace,
-) -> tuple[HospitalConfig, float, bool]:
-    """Resolve config, oracle cadence, and library mode without hidden overrides."""
+) -> tuple[
+    HospitalConfig,
+    HospitalConfig,
+    float,
+    bool,
+    str,
+    Mapping[str, object],
+]:
+    """Resolve separate baseline/PL-CBF configs and the fixed protocol."""
 
-    config_path = arguments.config_json
-    config = (
-        DEFAULT_CONFIG
-        if config_path is None
-        else load_hospital_config(config_path)
+    config_path = (
+        DEFAULT_HOSPITAL_CONFIG_PATH
+        if arguments.config_json is None
+        else arguments.config_json
     )
+    baseline_config = DEFAULT_CONFIG
+    plcbf_config, artifact = load_hospital_config_artifact(config_path)
     if any(case in HOSPITAL_BENCHMARK_STORIES for case in arguments.cases):
-        config = publication_benchmark_config(config)
+        baseline_config = publication_benchmark_config(baseline_config)
+        plcbf_config = publication_benchmark_config(plcbf_config)
+    validate_plcbf_configuration_scope(baseline_config, plcbf_config)
     mode = arguments.policy_library_mode
     compact = mode == "compact"
     if arguments.oracle_period is not None:
         oracle_period = float(arguments.oracle_period)
-        if not np.isclose(oracle_period, config.dt):
+        if not np.isclose(oracle_period, baseline_config.dt):
             raise ValueError(
                 "--oracle-period must equal the hospital plant dt; stale "
                 "policy certificates are not permitted"
             )
     else:
-        oracle_period = float(config.dt)
-    validate_strict_refuge_protocol(config)
-    return config, oracle_period, compact
+        oracle_period = float(baseline_config.dt)
+    validate_strict_refuge_protocol(baseline_config)
+    validate_strict_refuge_protocol(plcbf_config)
+    configuration_source = (
+        f"packaged_plcbf:{config_path}"
+        if arguments.config_json is None
+        else str(config_path)
+    )
+    artifact_descriptor = {
+        "path": str(config_path),
+        "sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "schema_version": artifact.get("schema_version"),
+        "provenance": artifact.get("provenance", {}),
+    }
+    return (
+        baseline_config,
+        plcbf_config,
+        oracle_period,
+        compact,
+        configuration_source,
+        artifact_descriptor,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1784,9 +1955,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # at shard startup rather than whatever happens to be on disk at the end.
     implementation_source_manifest = hospital_benchmark_source_manifest()
     arguments = build_parser().parse_args(argv)
-    runtime_config, oracle_period, compact_policy_library = (
-        _resolve_cli_protocol(arguments)
-    )
+    (
+        runtime_config,
+        plcbf_runtime_config,
+        oracle_period,
+        compact_policy_library,
+        plcbf_configuration_source,
+        plcbf_config_artifact,
+    ) = _resolve_cli_protocol(arguments)
     methods = arguments.methods
     cases = arguments.cases
     seeds = arguments.seeds
@@ -1805,6 +1981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seeds=seeds,
         steps=steps,
         config=runtime_config,
+        plcbf_config=plcbf_runtime_config,
         oracle_period_s=oracle_period,
         compact_policy_library=compact_policy_library,
         progress=True,
@@ -1836,10 +2013,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "oracle_period_s": oracle_period,
         "plant_dt_s": runtime_config.dt,
         "compact_policy_library": compact_policy_library,
-        "configuration_source": (
-            "defaults"
-            if arguments.config_json is None
-            else str(arguments.config_json)
+        "configuration_source": plcbf_configuration_source,
+        "baseline_configuration_source": "publication_defaults",
+        "plcbf_configuration_source": plcbf_configuration_source,
+        "plcbf_config_artifact": plcbf_config_artifact,
+        "method_scoped_config_compatibility_verified": True,
+        "controller_configuration_scope": {
+            method: (
+                "plcbf_config"
+                if method == BenchmarkMethod.PLCBF.value
+                else "baseline_config"
+            )
+            for method in methods
+        },
+        "controller_scope": (
+            "The packaged/tuned Hospital configuration applies only to "
+            "PL-CBF; all seven comparison methods retain baseline_config."
         ),
         "implementation_source_manifest": (
             implementation_source_manifest
@@ -1886,8 +2075,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "control."
             ),
             "solver_fallback": (
+                "Deprecated compatibility name for exceptional_decision."
+            ),
+            "exceptional_decision": (
                 "The decision was infeasible or a policy selector explicitly "
-                "used its fallback path."
+                "used its fallback path; reports show those causes separately."
             ),
             "backup_executed": (
                 "The method entered an executable backup/emergency path. "
@@ -1920,9 +2112,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "normal_qp_room_selected": (
                 "PL-CBF selected a room policy with used_fallback=False."
             ),
-            "numerical_fallback_room_selected": (
+            "selector_fallback_room_selected": (
                 "PL-CBF selected a room policy through the permitted "
-                "numerical emergency path."
+                "memoryless selector-backup path."
+            ),
+            "numerical_fallback_room_selected": (
+                "Deprecated alias of selector_fallback_room_selected."
             ),
         },
         "current_hocbf_enforcement": (
@@ -1934,6 +2129,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "jit_warmup_excluded_from_decision_timing": True,
         "runtime_jit_compilation_audited_per_trial": True,
         "collision_check": "static_segment_and_9_synchronized_samples",
+        "baseline_config": asdict(
+            compact_benchmark_config(runtime_config)
+            if compact_policy_library
+            else runtime_config
+        ),
+        "plcbf_config": asdict(
+            compact_benchmark_config(plcbf_runtime_config)
+            if compact_policy_library
+            else plcbf_runtime_config
+        ),
+        # Compatibility alias for older report readers.  It now explicitly
+        # names the comparison-method configuration, not a global controller.
         "config": asdict(
             compact_benchmark_config(runtime_config)
             if compact_policy_library

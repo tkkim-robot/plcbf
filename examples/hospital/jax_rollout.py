@@ -328,11 +328,11 @@ class HospitalJaxStaticGeometry(NamedTuple):
     floor_bounds: np.ndarray
     floor_centers: np.ndarray
     floor_half: np.ndarray
+    floor_boundary_starts: np.ndarray
+    floor_boundary_ends: np.ndarray
     wall_bounds: np.ndarray
     wall_centers: np.ndarray
     wall_half: np.ndarray
-    collision_perimeter: np.ndarray
-    clearance_perimeter: np.ndarray
     width: np.ndarray
     height: np.ndarray
 
@@ -395,6 +395,7 @@ class HospitalJaxEvaluation:
 class _EvaluatorStructure:
     capacities: HospitalJaxCapacities
     floor_count: int
+    floor_boundary_count: int
     wall_count: int
     include_diagnostics: bool
 
@@ -403,8 +404,10 @@ class _EvaluatorStructure:
 class _GroupedEvaluatorStructure:
     capacities: HospitalJaxGroupedCapacities
     floor_count: int
+    floor_boundary_count: int
     wall_count: int
     include_diagnostics: bool
+    shared_time_grids: tuple[bool, ...]
 
 
 def select_obstacle_bucket(
@@ -470,15 +473,15 @@ def pack_static_geometry(
         floor_bounds=np.asarray(environment._floor_bounds, dtype=np.float32),
         floor_centers=np.asarray(environment._floor_centers, dtype=np.float32),
         floor_half=np.asarray(environment._floor_half, dtype=np.float32),
+        floor_boundary_starts=np.asarray(
+            environment._floor_boundary_starts, dtype=np.float32
+        ),
+        floor_boundary_ends=np.asarray(
+            environment._floor_boundary_ends, dtype=np.float32
+        ),
         wall_bounds=np.asarray(environment._wall_bounds, dtype=np.float32),
         wall_centers=np.asarray(environment._wall_centers, dtype=np.float32),
         wall_half=np.asarray(environment._wall_half, dtype=np.float32),
-        collision_perimeter=np.asarray(
-            environment._collision_perimeter, dtype=np.float32
-        ),
-        clearance_perimeter=np.asarray(
-            environment._clearance_perimeter, dtype=np.float32
-        ),
         width=np.asarray(environment.width, dtype=np.float32),
         height=np.asarray(environment.height, dtype=np.float32),
     )
@@ -800,20 +803,31 @@ def _static_clearance(
     radius: jax.Array,
     geometry: HospitalJaxStaticGeometry,
 ) -> jax.Array:
-    perimeter = radius * geometry.clearance_perimeter
-    samples = jnp.concatenate((point[None, :], point[None, :] + perimeter), axis=0)
-    floor_q = (
-        jnp.abs(samples[:, None, :] - geometry.floor_centers[None, :, :])
-        - geometry.floor_half[None, :, :]
+    segments = geometry.floor_boundary_ends - geometry.floor_boundary_starts
+    lengths_squared = jnp.sum(jnp.square(segments), axis=1)
+    relative = point[None, :] - geometry.floor_boundary_starts
+    fractions = jnp.clip(
+        jnp.sum(relative * segments, axis=1)
+        / jnp.maximum(lengths_squared, 1.0e-18),
+        0.0,
+        1.0,
     )
-    floor_signed = _safe_norm(jnp.maximum(floor_q, 0.0)) + jnp.minimum(
-        jnp.maximum(floor_q[..., 0], floor_q[..., 1]), 0.0
+    closest = geometry.floor_boundary_starts + fractions[:, None] * segments
+    boundary_distance = jnp.min(_safe_norm(point[None, :] - closest, axis=1))
+    floor_lower = geometry.floor_bounds[:, :2]
+    floor_upper = floor_lower + geometry.floor_bounds[:, 2:]
+    on_floor = jnp.any(
+        jnp.all(
+            (point[None, :] >= floor_lower)
+            & (point[None, :] <= floor_upper),
+            axis=1,
+        )
     )
-    floor_margin = jnp.min(jnp.max(-floor_signed, axis=1))
+    floor_margin = jnp.where(on_floor, boundary_distance, -boundary_distance) - radius
     wall_signed = _rect_signed_distance(
-        point[None, :], geometry.wall_centers, geometry.wall_half + radius
+        point[None, :], geometry.wall_centers, geometry.wall_half
     )
-    wall_margin = jnp.min(wall_signed)
+    wall_margin = jnp.min(wall_signed) - radius
     return jnp.minimum(floor_margin, wall_margin)
 
 
@@ -827,54 +841,10 @@ def _environment_collision(
     original_shape = points.shape[:-1]
     flattened = points.reshape((-1, 2))
     flat_radii = jnp.broadcast_to(radii, original_shape).reshape((-1,))
-    sampled_radii = jnp.where(flat_radii > 1.0e-9, flat_radii, 0.0)
-    outside = (
-        (flattened[:, 0] < 0.0)
-        | (flattened[:, 0] > geometry.width)
-        | (flattened[:, 1] < 0.0)
-        | (flattened[:, 1] > geometry.height)
-    )
-    samples = jnp.concatenate(
-        (
-            flattened[:, None, :],
-            flattened[:, None, :]
-            + sampled_radii[:, None, None]
-            * geometry.collision_perimeter[None, :, :],
-        ),
-        axis=1,
-    )
-    floor_x0 = geometry.floor_bounds[:, 0]
-    floor_y0 = geometry.floor_bounds[:, 1]
-    floor_x1 = floor_x0 + geometry.floor_bounds[:, 2]
-    floor_y1 = floor_y0 + geometry.floor_bounds[:, 3]
-    on_floor = jnp.any(
-        (samples[:, :, None, 0] >= floor_x0)
-        & (samples[:, :, None, 0] <= floor_x1)
-        & (samples[:, :, None, 1] >= floor_y0)
-        & (samples[:, :, None, 1] <= floor_y1),
-        axis=2,
-    )
-    outside_floor = jnp.any(~on_floor, axis=1)
-    wall_x0 = geometry.wall_bounds[:, 0][None, :] - flat_radii[:, None]
-    wall_y0 = geometry.wall_bounds[:, 1][None, :] - flat_radii[:, None]
-    wall_x1 = (
-        geometry.wall_bounds[:, 0][None, :]
-        + geometry.wall_bounds[:, 2][None, :]
-        + flat_radii[:, None]
-    )
-    wall_y1 = (
-        geometry.wall_bounds[:, 1][None, :]
-        + geometry.wall_bounds[:, 3][None, :]
-        + flat_radii[:, None]
-    )
-    in_wall = jnp.any(
-        (flattened[:, None, 0] >= wall_x0)
-        & (flattened[:, None, 0] <= wall_x1)
-        & (flattened[:, None, 1] >= wall_y0)
-        & (flattened[:, None, 1] <= wall_y1),
-        axis=1,
-    )
-    return (outside | outside_floor | in_wall).reshape(original_shape)
+    clearances = jax.vmap(
+        lambda point, radius: _static_clearance(point, radius, geometry)
+    )(flattened, flat_radii)
+    return (clearances <= 0.0).reshape(original_shape)
 
 
 def _advance_bouncing_circles(
@@ -1056,15 +1026,41 @@ def _policy_obstacle_tables(
     horizon_steps: int,
     swept_capacity: int,
 ) -> tuple[jax.Array, jax.Array]:
+    return _obstacle_tables_for_time_grid(
+        policy.rollout_dt,
+        policy.swept_samples,
+        time_offset,
+        obstacles,
+        geometry,
+        checkpoint_positions,
+        checkpoint_velocities,
+        horizon_steps,
+        swept_capacity,
+    )
+
+
+def _obstacle_tables_for_time_grid(
+    rollout_dt: jax.Array,
+    swept_samples: jax.Array,
+    time_offset: jax.Array,
+    obstacles: HospitalJaxObstacleBatch,
+    geometry: HospitalJaxStaticGeometry,
+    checkpoint_positions: jax.Array,
+    checkpoint_velocities: jax.Array,
+    horizon_steps: int,
+    swept_capacity: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Predict obstacles once for one shared policy integration grid."""
+
     vertex_indices = jnp.arange(horizon_steps + 1, dtype=jnp.float32)
-    vertex_times = time_offset + vertex_indices * policy.rollout_dt
+    vertex_times = time_offset + vertex_indices * rollout_dt
     segment_indices = jnp.arange(horizon_steps, dtype=jnp.float32)[:, None]
     sample_indices = jnp.arange(1, swept_capacity + 1, dtype=jnp.float32)[None, :]
-    denominators = policy.swept_samples.astype(jnp.float32) + 1.0
+    denominators = swept_samples.astype(jnp.float32) + 1.0
     alphas = sample_indices / denominators
     swept_times = time_offset + (
         segment_indices + alphas
-    ) * policy.rollout_dt
+    ) * rollout_dt
     return (
         _obstacle_centers_at(
             vertex_times,
@@ -1114,17 +1110,32 @@ def _policy_control(
 ) -> tuple[jax.Array, jax.Array]:
     waypoint_count = jnp.sum(policy.waypoint_mask.astype(jnp.int32))
     last_waypoint = jnp.maximum(waypoint_count - 1, 0)
-    distances = _safe_norm(policy.waypoints - state[:2], axis=1)
-    indices = jnp.arange(policy.waypoints.shape[0])
-    room_radii = jnp.where(indices == 0, ROOM_APPROACH_RADIUS, ROOM_WAYPOINT_RADIUS)
-    radii = jnp.where(
+    waypoint_cursor = jnp.clip(cursor, 0, last_waypoint)
+    waypoint_target = policy.waypoints[waypoint_cursor]
+    waypoint_distance = _safe_norm(waypoint_target - state[:2])
+    waypoint_radius = jnp.where(
         policy.kinds == POLICY_ROOM,
-        room_radii,
+        jnp.where(
+            waypoint_cursor == 0,
+            ROOM_APPROACH_RADIUS,
+            ROOM_WAYPOINT_RADIUS,
+        ),
         NOMINAL_WAYPOINT_RADIUS,
     )
-    usable = policy.waypoint_mask & (distances > radii)
-    selected_waypoint = jnp.where(jnp.any(usable), jnp.argmax(usable), last_waypoint)
-    waypoint_target = policy.waypoints[selected_waypoint]
+    waypoint_kind = (policy.kinds == POLICY_NOMINAL) | (
+        policy.kinds == POLICY_ROOM
+    )
+    waypoint_should_advance = (
+        waypoint_kind
+        & (waypoint_distance < waypoint_radius)
+        & (waypoint_cursor + 1 < waypoint_count)
+    )
+    waypoint_cursor = jnp.where(
+        waypoint_should_advance,
+        waypoint_cursor + 1,
+        waypoint_cursor,
+    )
+    waypoint_target = policy.waypoints[waypoint_cursor]
     waypoint_u = _waypoint_control(
         state, waypoint_target, policy.target_speeds, parameters
     )
@@ -1175,8 +1186,9 @@ def _policy_control(
     )
     control = jnp.where(policy.kinds == POLICY_STOP, stop_u, control)
     control = jnp.where(policy.kinds == POLICY_RETRACE, retrace_u, control)
+    next_cursor = jnp.where(waypoint_kind, waypoint_cursor, cursor)
     next_cursor = jnp.where(
-        policy.kinds == POLICY_RETRACE, retrace_cursor, cursor
+        policy.kinds == POLICY_RETRACE, retrace_cursor, next_cursor
     )
     return control, next_cursor
 
@@ -1197,32 +1209,6 @@ def _step_double_integrator(
     )
     position = state[:2] + velocity * dt
     return jnp.concatenate((position, velocity))
-
-
-def _room_entry_satisfied(
-    state: jax.Array,
-    policy: HospitalJaxPolicyBatch,
-    parameters: HospitalJaxParameters,
-) -> jax.Array:
-    x0, y0, x1, y1 = policy.room_bounds
-    point = state[:2]
-    inside = (
-        (point[0] >= x0)
-        & (point[0] <= x1)
-        & (point[1] >= y0)
-        & (point[1] <= y1)
-    )
-    margin = jnp.min(
-        jnp.array(
-            [point[0] - x0, x1 - point[0], point[1] - y0, y1 - point[1]]
-        )
-    )
-    return (
-        (policy.kinds == POLICY_ROOM)
-        & policy.has_room
-        & inside
-        & (margin >= parameters.terminal_interior_margin)
-    )
 
 
 def _rollout_one(
@@ -1251,11 +1237,8 @@ def _rollout_one(
         accepted = running & within_distance
         following = jnp.where(accepted, candidate, state)
         following_cursor = jnp.where(accepted, following_cursor, cursor)
-        room_done = accepted & _room_entry_satisfied(
-            following, policy, parameters
-        )
         horizon_done = index + 1 >= policy.horizon_steps
-        following_done = done | ~accepted | room_done | horizon_done
+        following_done = done | ~accepted | horizon_done
         return (
             (following, following_cursor, following_done),
             (following, accepted),
@@ -1410,6 +1393,7 @@ def _evaluate_policy_arrays_with_checkpoints(
     horizon_steps: int,
     swept_capacity: int,
     include_diagnostics: bool,
+    share_policy_time_grids: bool = False,
 ) -> tuple[jax.Array, ...]:
     def tables(
         policy: HospitalJaxPolicyBatch, offset: jax.Array
@@ -1429,17 +1413,92 @@ def _evaluate_policy_arrays_with_checkpoints(
     shifted_offsets = jnp.full(
         policies.active.shape, parameters.time_derivative_step, dtype=state.dtype
     )
-    base_vertices, base_swept = jax.vmap(tables)(policies, zero_offsets)
-    shifted_vertices, shifted_swept = jax.vmap(tables)(
-        policies, shifted_offsets
-    )
+    if share_policy_time_grids:
+        # Every ordinary Hospital policy uses the standard rollout grid and
+        # every room policy uses the room grid.  Computing obstacle motion for
+        # each candidate separately repeats the same bouncing-human scan up to
+        # 23 times.  Build the two exact grids once and broadcast them; the
+        # rollout/value/gradient calculation remains independently vmapped.
+        room_mask = policies.active & (policies.kinds == POLICY_ROOM)
+        standard_mask = policies.active & ~room_mask
+        standard_dt = jnp.max(
+            jnp.where(standard_mask, policies.rollout_dt, 0.0)
+        )
+        room_dt = jnp.max(jnp.where(room_mask, policies.rollout_dt, 0.0))
+        standard_dt = jnp.where(standard_dt > 0.0, standard_dt, room_dt)
+        room_dt = jnp.where(room_dt > 0.0, room_dt, standard_dt)
+        standard_samples = jnp.max(
+            jnp.where(standard_mask, policies.swept_samples, 1)
+        )
+        room_samples = jnp.max(
+            jnp.where(room_mask, policies.swept_samples, standard_samples)
+        )
+
+        def shared_tables(offset: jax.Array) -> tuple[jax.Array, jax.Array]:
+            standard_vertices, standard_swept = (
+                _obstacle_tables_for_time_grid(
+                    standard_dt,
+                    standard_samples,
+                    offset,
+                    obstacles,
+                    geometry,
+                    checkpoint_positions,
+                    checkpoint_velocities,
+                    horizon_steps,
+                    swept_capacity,
+                )
+            )
+            room_vertices, room_swept = _obstacle_tables_for_time_grid(
+                room_dt,
+                room_samples,
+                offset,
+                obstacles,
+                geometry,
+                checkpoint_positions,
+                checkpoint_velocities,
+                horizon_steps,
+                swept_capacity,
+            )
+            vertex_selector = room_mask.reshape(
+                (room_mask.shape[0],) + (1,) * standard_vertices.ndim
+            )
+            swept_selector = room_mask.reshape(
+                (room_mask.shape[0],) + (1,) * standard_swept.ndim
+            )
+            return (
+                jnp.where(
+                    vertex_selector,
+                    room_vertices[None, ...],
+                    standard_vertices[None, ...],
+                ),
+                jnp.where(
+                    swept_selector,
+                    room_swept[None, ...],
+                    standard_swept[None, ...],
+                ),
+            )
+
+        base_vertices, base_swept = shared_tables(jnp.asarray(0.0, state.dtype))
+        shifted_vertices, shifted_swept = shared_tables(
+            parameters.time_derivative_step
+        )
+    else:
+        base_vertices, base_swept = jax.vmap(tables)(policies, zero_offsets)
+        shifted_vertices, shifted_swept = jax.vmap(tables)(
+            policies, shifted_offsets
+        )
     if include_diagnostics:
         prefix_offsets = jnp.full(
             policies.active.shape, parameters.plant_dt, dtype=state.dtype
         )
-        prefix_vertices, prefix_swept = jax.vmap(tables)(
-            policies, prefix_offsets
-        )
+        if share_policy_time_grids:
+            prefix_vertices, prefix_swept = shared_tables(
+                parameters.plant_dt
+            )
+        else:
+            prefix_vertices, prefix_swept = jax.vmap(tables)(
+                policies, prefix_offsets
+            )
         prefix_state = _step_double_integrator(
             state, nominal_control, parameters.plant_dt, parameters
         )
@@ -1555,6 +1614,12 @@ def _evaluate_policy_arrays_with_checkpoints(
     )
     values, gradients, shifted, prefix, terminal, trajectories, masks = outputs
     derivatives = (shifted - values) / parameters.time_derivative_step
+    if not include_diagnostics:
+        # Reverse-mode AD still uses each trajectory inside the executable, but
+        # a headless decision does not need to transfer or retain those rollout
+        # arrays on the host.  The diagnostics executable below remains the
+        # visualization/debugging path with identical numerical calculations.
+        return values, gradients, shifted, derivatives
     return (
         values,
         gradients,
@@ -1660,9 +1725,13 @@ def _shared_compiled_grouped_evaluator(
                 horizon_steps=group.max_horizon_steps,
                 swept_capacity=group.max_swept_samples,
                 include_diagnostics=structure.include_diagnostics,
+                share_policy_time_grids=share_time_grid,
             )
-            for group, policies in zip(
-                capacities.groups, policy_groups, strict=True
+            for group, policies, share_time_grid in zip(
+                capacities.groups,
+                policy_groups,
+                structure.shared_time_grids,
+                strict=True,
             )
         )
 
@@ -1671,6 +1740,29 @@ def _shared_compiled_grouped_evaluator(
 
 def _device_tree(value):
     return jax.tree_util.tree_map(jnp.asarray, value)
+
+
+def _can_share_policy_time_grids(policies: PackedHospitalPolicies) -> bool:
+    """Return whether ordinary and room candidates each share one time grid."""
+
+    active = np.asarray(policies.batch.active[: policies.active_count], dtype=bool)
+    kinds = np.asarray(policies.batch.kinds[: policies.active_count])
+    rollout_dt = np.asarray(
+        policies.batch.rollout_dt[: policies.active_count], dtype=float
+    )
+    swept_samples = np.asarray(
+        policies.batch.swept_samples[: policies.active_count], dtype=int
+    )
+    for room_group in (False, True):
+        selected = active & ((kinds == POLICY_ROOM) == room_group)
+        if not np.any(selected):
+            continue
+        if (
+            np.unique(rollout_dt[selected]).size != 1
+            or np.unique(swept_samples[selected]).size != 1
+        ):
+            return False
+    return True
 
 
 def evaluate_policy_batch(
@@ -1693,6 +1785,7 @@ def evaluate_policy_batch(
     structure = _EvaluatorStructure(
         capacities=capacity,
         floor_count=int(geometry.floor_bounds.shape[0]),
+        floor_boundary_count=int(geometry.floor_boundary_starts.shape[0]),
         wall_count=int(geometry.wall_bounds.shape[0]),
         include_diagnostics=bool(include_diagnostics),
     )
@@ -1707,16 +1800,26 @@ def evaluate_policy_batch(
     )
     host = tuple(np.asarray(item) for item in outputs)
     active = policies.active_count
+    if include_diagnostics:
+        prefix = host[4][:active].astype(float)
+        terminal = host[5][:active].astype(float)
+        trajectories = host[6][:active].astype(float)
+        trajectory_mask = host[7][:active].astype(bool)
+    else:
+        prefix = np.full(active, np.nan, dtype=float)
+        terminal = np.full(active, np.nan, dtype=float)
+        trajectories = np.empty((active, 0, state_array.size), dtype=float)
+        trajectory_mask = np.empty((active, 0), dtype=bool)
     return HospitalJaxEvaluation(
         names=policies.names,
         values=host[0][:active].astype(float),
         gradients=host[1][:active].astype(float),
         shifted_values=host[2][:active].astype(float),
         time_derivatives=host[3][:active].astype(float),
-        nominal_prefix_values=host[4][:active].astype(float),
-        terminal_clearances=host[5][:active].astype(float),
-        trajectories=host[6][:active].astype(float),
-        trajectory_mask=host[7][:active].astype(bool),
+        nominal_prefix_values=prefix,
+        terminal_clearances=terminal,
+        trajectories=trajectories,
+        trajectory_mask=trajectory_mask,
         diagnostics_available=bool(include_diagnostics),
     )
 
@@ -1743,8 +1846,12 @@ def evaluate_policy_groups(
     structure = _GroupedEvaluatorStructure(
         capacities=capacities,
         floor_count=int(geometry.floor_bounds.shape[0]),
+        floor_boundary_count=int(geometry.floor_boundary_starts.shape[0]),
         wall_count=int(geometry.wall_bounds.shape[0]),
         include_diagnostics=bool(include_diagnostics),
+        shared_time_grids=tuple(
+            _can_share_policy_time_grids(group) for group in policies.groups
+        ),
     )
     compiled = _shared_compiled_grouped_evaluator(structure)
     outputs = compiled(
@@ -1761,19 +1868,25 @@ def evaluate_policy_groups(
     )
 
     count = policies.active_count
-    maximum_horizon = max(
-        group.max_horizon_steps for group in capacities.groups
-    )
     values = np.empty(count, dtype=float)
     gradients = np.empty((count, state_array.size), dtype=float)
     shifted = np.empty(count, dtype=float)
     derivatives = np.empty(count, dtype=float)
     prefix = np.empty(count, dtype=float)
     terminal = np.empty(count, dtype=float)
-    trajectories = np.empty(
-        (count, maximum_horizon + 1, state_array.size), dtype=float
-    )
-    masks = np.zeros((count, maximum_horizon + 1), dtype=bool)
+    if include_diagnostics:
+        maximum_horizon = max(
+            group.max_horizon_steps for group in capacities.groups
+        )
+        trajectories = np.empty(
+            (count, maximum_horizon + 1, state_array.size), dtype=float
+        )
+        masks = np.zeros((count, maximum_horizon + 1), dtype=bool)
+    else:
+        prefix.fill(np.nan)
+        terminal.fill(np.nan)
+        trajectories = np.empty((count, 0, state_array.size), dtype=float)
+        masks = np.empty((count, 0), dtype=bool)
     for packed_group, original_indices, host in zip(
         policies.groups,
         policies.original_indices,
@@ -1788,14 +1901,15 @@ def evaluate_policy_groups(
         gradients[indices] = host[1][:active]
         shifted[indices] = host[2][:active]
         derivatives[indices] = host[3][:active]
-        prefix[indices] = host[4][:active]
-        terminal[indices] = host[5][:active]
-        group_trajectories = host[6][:active]
-        group_masks = host[7][:active]
-        group_length = group_trajectories.shape[1]
-        trajectories[indices] = group_trajectories[:, -1:, :]
-        trajectories[indices, :group_length] = group_trajectories
-        masks[indices, :group_length] = group_masks
+        if include_diagnostics:
+            prefix[indices] = host[4][:active]
+            terminal[indices] = host[5][:active]
+            group_trajectories = host[6][:active]
+            group_masks = host[7][:active]
+            group_length = group_trajectories.shape[1]
+            trajectories[indices] = group_trajectories[:, -1:, :]
+            trajectories[indices, :group_length] = group_trajectories
+            masks[indices, :group_length] = group_masks
     return HospitalJaxEvaluation(
         names=policies.names,
         values=values,

@@ -6,6 +6,15 @@ from .config import (
     hospital_config_from_mapping,
     load_hospital_config,
 )
+from .config_io import (
+    CONFIG_ARTIFACT_SCHEMA_VERSION,
+    DEFAULT_HOSPITAL_CONFIG_PATH,
+    HOSPITAL_CONFIG_ARTIFACT_SCHEMA_VERSION,
+    hospital_config_from_artifact_mapping,
+    load_default_hospital_config,
+    load_hospital_config_artifact,
+    write_hospital_config_artifact,
+)
 from .controller import (
     ControllerResult,
     HospitalController,
@@ -63,11 +72,14 @@ from .simulation import (
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "DEFAULT_HOSPITAL_CONFIG_PATH",
     "DEFAULT_HUMAN_COUNT",
     "DEFAULT_HOSPITAL_TRAFFIC_SEEDS",
     "DEFAULT_ORDINARY_STRETCHER_COUNT",
     "GeneratedHospitalCrowd",
+    "CONFIG_ARTIFACT_SCHEMA_VERSION",
     "HospitalConfig",
+    "HOSPITAL_CONFIG_ARTIFACT_SCHEMA_VERSION",
     "HospitalController",
     "HospitalEnvironment",
     "HospitalGeometryContract",
@@ -101,13 +113,17 @@ __all__ = [
     "evaluate_swept_transition",
     "generate_hospital_crowd",
     "hospital_config_from_mapping",
+    "hospital_config_from_artifact_mapping",
     "hospital_benchmark_source_manifest",
     "hospital_publication_trial_grid",
     "hospital_geometry_sha256",
     "hospital_story_protocol_metadata",
     "hospital_story_world_sha256",
     "load_hospital_config",
+    "load_default_hospital_config",
+    "load_hospital_config_artifact",
     "strict_refuge_scenario_metadata",
     "validate_hospital_story_necessity",
     "validate_strict_refuge_protocol",
+    "write_hospital_config_artifact",
 ]

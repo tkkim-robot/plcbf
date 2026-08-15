@@ -710,6 +710,119 @@ def solve_weighted_box_halfspaces_qp_2d(
     )
 
 
+def _project_onto_clipped_polygon_2d(
+    reference: FloatArray,
+    lower: FloatArray,
+    upper: FloatArray,
+    halfspaces: tuple[CBFHalfspace, ...],
+    polygon: ClippedPolygon2D,
+    *,
+    weights: ArrayLike | None,
+    tolerance: float,
+) -> QPSolution | None:
+    """Project onto a previously clipped feasible polygon.
+
+    ``select_policy`` ranks two-dimensional certificates by both feasible
+    input area and their minimum-intervention QP.  Reusing the polygon avoids
+    solving the same rectangle/halfspace intersection twice.  ``None`` asks
+    the caller to use the general active-set solver for empty or
+    lower-dimensional intersections, whose feasibility semantics are retained.
+    """
+
+    vertices = np.asarray(polygon.vertices, dtype=float)
+    if (
+        0 < vertices.shape[0] < 3
+        or (vertices.shape[0] > 0 and polygon.area <= tolerance * tolerance)
+    ):
+        return None
+    matrix = _weight_matrix(weights)
+    normals: list[FloatArray] = [
+        np.array([1.0, 0.0]),
+        np.array([-1.0, 0.0]),
+        np.array([0.0, 1.0]),
+        np.array([0.0, -1.0]),
+    ]
+    offsets = [
+        float(lower[0]),
+        float(-upper[0]),
+        float(lower[1]),
+        float(-upper[1]),
+    ]
+    labels = ["lower[0]", "upper[0]", "lower[1]", "upper[1]"]
+    for index, constraint in enumerate(halfspaces):
+        normals.append(np.asarray(constraint.normal, dtype=float))
+        offsets.append(float(constraint.offset))
+        labels.append(constraint.label or f"halfspace[{index}]")
+    constraint_matrix = np.vstack(normals)
+    offset_array = np.asarray(offsets, dtype=float)
+
+    def feasible(point: FloatArray) -> bool:
+        return bool(
+            np.all(constraint_matrix @ point >= offset_array - tolerance)
+        )
+
+    def objective(point: FloatArray) -> float:
+        delta = point - reference
+        return 0.5 * float(delta @ matrix @ delta)
+
+    if vertices.shape[0] == 0:
+        clipped = np.clip(reference, lower, upper)
+        violation = float(
+            np.max(
+                np.maximum(
+                    offset_array - constraint_matrix @ clipped,
+                    0.0,
+                )
+            )
+        )
+        return QPSolution(
+            control=None,
+            objective=float("inf"),
+            feasible=False,
+            status="infeasible",
+            max_violation=violation,
+        )
+
+    candidates: list[FloatArray] = []
+    if feasible(reference):
+        candidates.append(np.asarray(reference, dtype=float).copy())
+    for start, end in zip(vertices, np.roll(vertices, -1, axis=0), strict=True):
+        direction = end - start
+        denominator = float(direction @ matrix @ direction)
+        if denominator <= np.finfo(float).eps:
+            candidate = np.asarray(start, dtype=float).copy()
+        else:
+            fraction = -float(direction @ matrix @ (start - reference)) / denominator
+            candidate = start + np.clip(fraction, 0.0, 1.0) * direction
+        if feasible(candidate):
+            candidates.append(candidate)
+    if not candidates:
+        return None
+
+    solution = min(
+        candidates,
+        key=lambda point: (
+            objective(point),
+            float(point[0]),
+            float(point[1]),
+        ),
+    )
+    residuals = constraint_matrix @ solution - offset_array
+    active = tuple(
+        labels[index]
+        for index, residual in enumerate(residuals)
+        if abs(float(residual)) <= tolerance * 10.0
+    )
+    return QPSolution(
+        control=solution,
+        objective=objective(solution),
+        feasible=True,
+        status="optimal",
+        max_violation=max(0.0, -float(np.min(residuals))),
+        active_constraints=active,
+    )
+
+
 @dataclass(frozen=True)
 class PolicyCertificate:
     """A backup policy's rollout value and affine control certificate(s).
@@ -1019,17 +1132,40 @@ def select_policy(
             )
             continue
 
-        solution = _certificate_qp(
-            certificate,
-            nominal,
-            lower_array,
-            upper_array,
-            weights,
-            tolerance,
-        )
+        clipped_polygon: ClippedPolygon2D | None = None
+        solution: QPSolution | None = None
+        if nominal.size == 2 and len(certificate.halfspaces) > 1:
+            clipped_polygon = clip_rectangle_halfspaces(
+                lower_array,
+                upper_array,
+                certificate.halfspaces,
+                tolerance=tolerance,
+            )
+            solution = _project_onto_clipped_polygon_2d(
+                nominal,
+                lower_array,
+                upper_array,
+                certificate.halfspaces,
+                clipped_polygon,
+                weights=weights,
+                tolerance=tolerance,
+            )
+        if solution is None:
+            solution = _certificate_qp(
+                certificate,
+                nominal,
+                lower_array,
+                upper_array,
+                weights,
+                tolerance,
+            )
         solutions[certificate.policy_id] = solution
-        volume = _certificate_volume(
-            certificate, lower_array, upper_array, tolerance
+        volume = (
+            clipped_polygon.area
+            if clipped_polygon is not None
+            else _certificate_volume(
+                certificate, lower_array, upper_array, tolerance
+            )
         )
         if not safe_value:
             status = "below_safe_value_threshold"

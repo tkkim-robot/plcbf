@@ -14,6 +14,14 @@ from examples.hospital.baselines import (
     HospitalBaselineSuite,
 )
 from examples.hospital.dynamics import waypoint_control
+from examples.hospital.jax_rollout import (
+    HospitalJaxCapacities,
+    evaluate_policy_batch,
+    pack_obstacle_batch,
+    pack_parameters,
+    pack_policy_batch,
+    pack_static_geometry,
+)
 from examples.hospital.obstacles import (
     Human,
     Stretcher,
@@ -563,6 +571,94 @@ def test_retrace_waypoint_progress_is_monotone_and_rollout_local() -> None:
     np.testing.assert_allclose(first, second)
     assert first[-1, 0] < 1.0
     assert np.all(np.diff(first[:, 0]) <= 1e-12)
+
+
+def test_multibackup_and_mi_room_rollouts_match_scalar_and_jax_cursor() -> None:
+    """Every hypothetical room branch gets an independent monotone cursor."""
+
+    simulation = build_blocked_main_hall_scenario(2)
+    horizon = 3.0
+    suite = HospitalBaselineSuite(
+        simulation.controller,
+        simulation.environment,
+        simulation.config,
+        algorithm_config=replace(
+            HospitalBaselineConfig(),
+            backup_horizon_s=horizon,
+            multi_backup_maneuver_s=horizon - simulation.config.dt,
+        ),
+    )
+    state = np.array([50.0, 47.5, 0.0, 0.0])
+    policy = HospitalPolicy(
+        name="synthetic_room_cursor",
+        kind="room",
+        horizon=horizon,
+        rollout_dt=simulation.config.dt,
+        target_speed=simulation.config.robot.v_max,
+        waypoints=[
+            state[:2].copy(),
+            np.array([52.0, 47.5]),
+            np.array([55.0, 47.5]),
+        ],
+    )
+
+    scalar = rollout_policy(policy, state, simulation.config)
+    multibackup = suite._backup_rollout_states(
+        policy,
+        state,
+        maneuver_steps=suite._backup_steps,
+        multi_backup=True,
+    )
+    # Branch safety is irrelevant to this feedback-realization regression.
+    suite._point_margins = lambda points, elapsed: np.ones(len(points))
+    mi_branch, _, _ = suite._branch_rollout(state, policy)
+
+    capacity = HospitalJaxCapacities(
+        max_policies=1,
+        max_obstacles=1,
+        max_horizon_steps=suite._backup_steps,
+        max_swept_samples=3,
+        human_prediction_steps=64,
+    )
+    packed_policy = pack_policy_batch(
+        (policy,), simulation.config, capacity
+    )
+    evaluated = evaluate_policy_batch(
+        state,
+        np.zeros(2),
+        packed_policy,
+        pack_obstacle_batch((), capacity),
+        pack_static_geometry(simulation.environment),
+        pack_parameters(simulation.config),
+    )
+    jax_trajectory = evaluated.trajectories[
+        0, evaluated.trajectory_mask[0]
+    ]
+
+    np.testing.assert_allclose(multibackup, scalar, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(mi_branch, scalar, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        jax_trajectory,
+        scalar,
+        rtol=2.0e-6,
+        atol=8.0e-6,
+    )
+    assert scalar[-1, 0] > 54.0
+    # Repeating either baseline rollout starts a fresh hypothetical cursor;
+    # no waypoint progress survives as controller or policy state.
+    np.testing.assert_allclose(
+        suite._backup_rollout_states(
+            policy,
+            state,
+            maneuver_steps=suite._backup_steps,
+            multi_backup=True,
+        ),
+        multibackup,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    repeated_mi, _, _ = suite._branch_rollout(state, policy)
+    np.testing.assert_allclose(repeated_mi, mi_branch, rtol=0.0, atol=1e-12)
 
 
 def test_mps_and_gatekeeper_reset_retrace_before_each_candidate() -> None:

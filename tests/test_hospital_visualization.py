@@ -280,15 +280,27 @@ def test_cli_defaults_to_canonical_story_and_legacy_mode_is_explicit(
 
     def fake_story(story_id, *, traffic_seed):
         captured.update(story_id=story_id, traffic_seed=traffic_seed)
-        return SimpleNamespace(to_simulation=lambda _config=None: fake_simulation)
+
+        def to_simulation(config=None):
+            captured["config"] = config
+            return fake_simulation
+
+        return SimpleNamespace(to_simulation=to_simulation)
 
     monkeypatch.setattr(run, "build_hospital_story_scenario", fake_story)
     assert run.main(["--steps", "0"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert captured == {"story_id": "main_eastbound", "traffic_seed": 0}
+    assert captured["story_id"] == "main_eastbound"
+    assert captured["traffic_seed"] == 0
+    assert captured["config"].policies.cbf_alpha == pytest.approx(
+        2.1774542113693043
+    )
     assert payload["run_mode"] == "canonical_story"
     assert payload["story"] == "main_eastbound"
     assert payload["world_sha256"] == "a" * 64
+    assert payload["controller_config_provenance"]["study"][
+        "best_trial_number"
+    ] == 42
 
     parser = run.build_parser()
     with pytest.raises(SystemExit):

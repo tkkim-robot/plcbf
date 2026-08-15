@@ -823,15 +823,19 @@ class HospitalBaselineSuite:
         )
         state = np.asarray(initial_state, dtype=float).copy()
         states = [state.copy()]
-        retrace_waypoint_index = 0
+        waypoint_index = 0
         for step_index in range(1, state_count):
             if step_index > maneuver_steps:
                 control = self._terminal_stop_feedback(state)
-            elif policy.kind == "retrace":
-                control, retrace_waypoint_index = policy.control_with_cursor(
+            elif policy.kind in {"nominal", "room", "retrace"}:
+                # This cursor belongs only to this hypothetical backup
+                # rollout.  It is neither stored on the policy nor carried
+                # across controller decisions, so it cannot create a latched
+                # room/refuge mode.
+                control, waypoint_index = policy.control_with_cursor(
                     state,
                     self.config,
-                    retrace_waypoint_index,
+                    waypoint_index,
                 )
             else:
                 control = policy.control(state, self.config)
@@ -945,13 +949,17 @@ class HospitalBaselineSuite:
         current = np.asarray(state, dtype=float).reshape(4).copy()
         states = [current.copy()]
         controls = []
-        retrace_waypoint_index = 0
+        waypoint_index = 0
         for step_index in range(self._backup_steps):
-            if policy.kind == "retrace":
-                control, retrace_waypoint_index = policy.control_with_cursor(
+            if policy.kind in {"nominal", "room", "retrace"}:
+                # MI-MPC branch geometry must use the same rollout-local
+                # feedback realization as the scalar and JAX certificates.
+                # Reinitializing this index on every simulated step would keep
+                # a multi-waypoint room branch pinned to its first waypoint.
+                control, waypoint_index = policy.control_with_cursor(
                     current,
                     self.config,
-                    retrace_waypoint_index,
+                    waypoint_index,
                 )
             else:
                 control = policy.control(current, self.config)

@@ -59,7 +59,7 @@ _BASE_REFERENCE_ATTRIBUTE = "base_controller_reference_enqueued"
 _RESULT_ARCHIVE_ATTRIBUTE = "exact_benchmark_result_archive"
 _RESULT_ARCHIVE_SCHEMA = "hospital_optuna_benchmark_results_v1"
 _OBJECTIVE_SCORE_VERSION = "success_first_lexicographic_v1"
-_SEARCH_SPACE_VERSION = "hospital_plcbf_v10_100world_no_holdout_success_first"
+_SEARCH_SPACE_VERSION = "hospital_plcbf_v11_feasible_100world_common_horizon"
 _CANONICAL_BENCHMARK_SEEDS = tuple(DEFAULT_HOSPITAL_TRAFFIC_SEEDS)
 
 
@@ -86,7 +86,12 @@ def hospital_tuning_base_config(
             published.policies,
             num_angle_policies=reference.policies.num_angle_policies,
             room_policy_count=reference.policies.room_policy_count,
+            rollout_dt=reference.policies.rollout_dt,
             room_rollout_dt=reference.policies.room_rollout_dt,
+            nominal_horizon=reference.policies.nominal_horizon,
+            angle_horizon=reference.policies.angle_horizon,
+            reverse_horizon=reference.policies.reverse_horizon,
+            stop_horizon=reference.policies.stop_horizon,
             room_horizon=reference.policies.room_horizon,
         ),
         safety=replace(
@@ -149,22 +154,22 @@ def hospital_tuning_search_space() -> dict[str, dict[str, object]]:
             "step": 0.05,
         },
         "component_temperature": {
-            "low": 24.0,
-            "high": 80.0,
+            "low": 16.0,
+            "high": 120.0,
             "log": True,
         },
         "hocbf_lambda1": {"low": 0.2, "high": 1.0},
         "hocbf_lambda2": {"low": 0.4, "high": 2.0},
         "max_gradient_norm": {
-            "low": 30.0,
-            "high": 200.0,
+            "low": 20.0,
+            "high": 500.0,
             "log": True,
         },
         "room_target_speed": {"low": 1.4, "high": 2.85},
         "stop_gain": {"low": 1.5, "high": 4.5},
         "time_temperature": {
-            "low": 20.0,
-            "high": 80.0,
+            "low": 10.0,
+            "high": 120.0,
             "log": True,
         },
     }
@@ -299,6 +304,9 @@ class HospitalTuningConfig:
                 "room_rollout_dt_s": (
                     self.base_config.policies.room_rollout_dt
                 ),
+                "common_policy_horizon_s": (
+                    self.base_config.policies.room_horizon
+                ),
                 "room_horizon_s": self.base_config.policies.room_horizon,
                 "refuge_geometry": asdict(self.base_config.refuge),
             },
@@ -393,13 +401,13 @@ def suggest_hospital_config(
             "cbf_value_buffer", 0.25, 1.05, step=0.05
         ),
         component_temperature=trial.suggest_float(
-            "component_temperature", 24.0, 80.0, log=True
+            "component_temperature", 16.0, 120.0, log=True
         ),
         time_temperature=trial.suggest_float(
-            "time_temperature", 20.0, 80.0, log=True
+            "time_temperature", 10.0, 120.0, log=True
         ),
         max_gradient_norm=trial.suggest_float(
-            "max_gradient_norm", 30.0, 200.0, log=True
+            "max_gradient_norm", 20.0, 500.0, log=True
         ),
     )
     safety = replace(
@@ -553,19 +561,24 @@ def score_results(results: Iterable[BenchmarkResult]) -> float:
             or [0.0]
         )
     )
-    solver_fallback_count = sum(
-        int(result.case_metrics.get("solver_fallback_count", 0))
+    exceptional_decision_count = sum(
+        int(
+            result.case_metrics.get(
+                "exceptional_decision_count",
+                result.case_metrics.get("solver_fallback_count", 0),
+            )
+        )
         for result in trials
     )
     control_steps = sum(
         int(result.case_metrics.get("steps", 0)) for result in trials
     )
-    solver_fallback_rate = solver_fallback_count / max(1, control_steps)
+    exceptional_decision_rate = exceptional_decision_count / max(1, control_steps)
     secondary = (
         0.35 * min(progress_shortfall, 1.0)
         + 0.25 * clearance_shortfall / (1.0 + clearance_shortfall)
         + 0.15 * intervention / (1.0 + intervention)
-        + 0.10 * min(solver_fallback_rate, 1.0)
+        + 0.10 * min(exceptional_decision_rate, 1.0)
     )
     return float(failure_rank + secondary)
 
@@ -586,6 +599,7 @@ def evaluate_plcbf_config(
         seeds=seeds,
         steps=steps,
         config=config,
+        plcbf_config=config,
         oracle_period_s=config.dt,
         compact_policy_library=False,
         progress=False,
@@ -651,6 +665,7 @@ def objective(
             seeds=(seed,),
             steps=steps,
             config=config,
+            plcbf_config=config,
             oracle_period_s=config.dt,
             compact_policy_library=False,
             progress=False,
@@ -1264,10 +1279,12 @@ def _relevant_source_content_sha256() -> dict[str, str]:
     sources = {
         "objective": Path(__file__).resolve(),
         "hospital_config": directory / "config.py",
+        "hospital_baselines": directory / "baselines.py",
         "controller": directory / "controller.py",
         "policies": directory / "policies.py",
         "dynamics": directory / "dynamics.py",
         "environment": directory / "environment.py",
+        "feasibility": directory / "feasibility.py",
         "jax_rollout": directory / "jax_rollout.py",
         "obstacles": directory / "obstacles.py",
         "planner": directory / "planner.py",
@@ -1275,6 +1292,8 @@ def _relevant_source_content_sha256() -> dict[str, str]:
         "simulation": directory / "simulation.py",
         "scenario_generation": directory / "scenario_generation.py",
         "scenarios": directory / "scenarios.py",
+        "core_benchmarking": repository / "plcbf" / "benchmarking.py",
+        "core_baselines": repository / "plcbf" / "baselines.py",
         "core_policy_library": repository / "plcbf" / "policy_library.py",
     }
     return {

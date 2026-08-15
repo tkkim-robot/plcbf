@@ -177,7 +177,14 @@ def test_cli_report_metadata_embeds_source_manifest(
 def test_default_benchmark_uses_full_plcbf_policy_library() -> None:
     parser = benchmark.build_parser()
     arguments = parser.parse_args([])
-    config, period, compact = benchmark._resolve_cli_protocol(arguments)
+    (
+        config,
+        plcbf_config,
+        period,
+        compact,
+        config_source,
+        artifact,
+    ) = benchmark._resolve_cli_protocol(arguments)
     assert tuple(arguments.cases) == benchmark.HOSPITAL_BENCHMARK_STORIES
     assert tuple(arguments.seeds) == tuple(range(20))
     assert len(arguments.cases) * len(arguments.seeds) == 100
@@ -193,15 +200,122 @@ def test_default_benchmark_uses_full_plcbf_policy_library() -> None:
     )
     assert compact is False
     assert period == config.dt
+    assert config_source.startswith("packaged_plcbf:")
+    assert artifact["schema_version"] == 1
+    assert artifact["provenance"]["study"]["best_trial_number"] == 42
+    benchmark.validate_plcbf_configuration_scope(config, plcbf_config)
+    assert plcbf_config.policies.cbf_alpha != config.policies.cbf_alpha
+    assert plcbf_config.safety.hocbf_lambda1 != config.safety.hocbf_lambda1
     simulation = benchmark.build_benchmark_scenario(
         "blocked_3_stretchers",
         seed=0,
         config=config,
     )
     policies = simulation.controller.candidate_policies(simulation.state)
-    assert len(policies) == 13
+    assert len(policies) == 15
     assert sum(policy.kind == "angle" for policy in policies) == 7
-    assert sum(policy.kind == "room" for policy in policies) == 3
+    assert sum(policy.kind == "room" for policy in policies) == 5
+
+
+def test_benchmark_applies_tuned_configuration_only_to_plcbf(
+    monkeypatch,
+) -> None:
+    parser = benchmark.build_parser()
+    arguments = parser.parse_args([])
+    baseline, tuned, *_ = benchmark._resolve_cli_protocol(arguments)
+    observed: dict[str, object] = {}
+    frozen_scenario = object()
+
+    monkeypatch.setattr(
+        benchmark,
+        "build_hospital_story_scenario",
+        lambda *args, **kwargs: frozen_scenario,
+    )
+
+    def fake_trial(method, case_id, *, config, _scenario, **kwargs):
+        del case_id, kwargs
+        observed[str(method)] = config
+        assert _scenario is frozen_scenario
+        return SimpleNamespace()
+
+    monkeypatch.setattr(benchmark, "run_hospital_trial", fake_trial)
+
+    benchmark.run_hospital_benchmark(
+        methods=("mps", "plcbf", "library_pcbf_mi"),
+        cases=("main_eastbound",),
+        seeds=(0,),
+        steps=1,
+        config=baseline,
+        plcbf_config=tuned,
+    )
+
+    assert observed["BenchmarkMethod.PLCBF"] is tuned
+    assert observed["BenchmarkMethod.MPS"] is baseline
+    assert observed["BenchmarkMethod.LIBRARY_PCBF_MI"] is baseline
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        lambda config: replace(config, dt=config.dt / 2.0),
+        lambda config: replace(
+            config,
+            robot=replace(config.robot, sensing_range=12.0),
+        ),
+        lambda config: replace(
+            config,
+            policies=replace(
+                config.policies,
+                room_policy_count=config.policies.room_policy_count - 1,
+            ),
+        ),
+        lambda config: replace(
+            config,
+            safety=replace(
+                config.safety,
+                safety_margin=config.safety.safety_margin - 0.1,
+            ),
+        ),
+    ],
+)
+def test_plcbf_configuration_scope_rejects_experiment_changes(
+    changed,
+) -> None:
+    baseline = benchmark.publication_benchmark_config(
+        benchmark.DEFAULT_CONFIG
+    )
+
+    with pytest.raises(ValueError, match="outside the nine audited"):
+        benchmark.validate_plcbf_configuration_scope(
+            baseline,
+            changed(baseline),
+        )
+
+
+def test_plcbf_configuration_scope_accepts_exactly_the_tuning_fields() -> None:
+    baseline = benchmark.publication_benchmark_config(
+        benchmark.DEFAULT_CONFIG
+    )
+    tuned = replace(
+        baseline,
+        policies=replace(
+            baseline.policies,
+            room_target_speed=2.7,
+            stop_gain=2.9,
+            cbf_alpha=1.7,
+            cbf_value_buffer=0.8,
+            component_temperature=31.0,
+            time_temperature=17.0,
+            max_gradient_norm=110.0,
+        ),
+        safety=replace(
+            baseline.safety,
+            hocbf_lambda1=0.6,
+            hocbf_lambda2=1.1,
+        ),
+    )
+
+    benchmark.validate_plcbf_configuration_scope(baseline, tuned)
 
 
 def test_publication_grid_prebuilds_each_world_once_for_all_methods(
@@ -239,6 +353,39 @@ def test_publication_grid_prebuilds_each_world_once_for_all_methods(
     assert len(built) == 100
     for _method, story_id, seed, scenario in observed:
         assert scenario is built[(story_id, seed)]
+
+
+def test_publication_config_aligns_emergency_and_reported_safe_sets() -> None:
+    base = replace(
+        benchmark.DEFAULT_CONFIG,
+        policies=replace(
+            benchmark.DEFAULT_CONFIG.policies,
+            nominal_horizon=2.4,
+            angle_horizon=3.6,
+            reverse_horizon=9.6,
+            stop_horizon=12.0,
+        ),
+        safety=replace(
+            benchmark.DEFAULT_CONFIG.safety,
+            hocbf_margin=0.05,
+            static_hocbf_margin=0.03,
+        ),
+    )
+
+    resolved = benchmark.publication_benchmark_config(base)
+
+    assert resolved.safety.hocbf_margin == resolved.safety.safety_margin
+    assert (
+        resolved.safety.static_hocbf_margin
+        == resolved.safety.static_margin
+    )
+    assert {
+        resolved.policies.nominal_horizon,
+        resolved.policies.angle_horizon,
+        resolved.policies.reverse_horizon,
+        resolved.policies.stop_horizon,
+        resolved.policies.room_horizon,
+    } == {benchmark.DEFAULT_CONFIG.policies.room_horizon}
 
 
 def test_narrative_trace_ignores_initial_room_but_counts_later_reentry() -> None:
@@ -636,12 +783,33 @@ def test_backup_execution_is_not_inferred_from_method_name(
         solve_time_s=0.0,
     )
 
-    _, _, backup, _ = benchmark._decision_event_flags(
+    _, _, _, backup, _ = benchmark._decision_event_flags(
         benchmark.BenchmarkMethod(method),
         decision,
     )
 
     assert backup is expected_backup
+
+
+def test_feasible_selector_backup_is_not_reported_as_infeasible() -> None:
+    decision = BaselineDecision(
+        method="plcbf",
+        control=np.zeros(2),
+        policy_id="room_0",
+        feasible=True,
+        status="fallback:no_positive_input_volume_policy",
+        used_fallback=True,
+        objective=0.0,
+        solve_time_s=0.0,
+        policy_decision=SimpleNamespace(
+            diagnostics=SimpleNamespace(used_fallback=True)
+        ),
+    )
+    flags = benchmark._decision_event_flags(
+        benchmark.BenchmarkMethod.PLCBF,
+        decision,
+    )
+    assert flags == (True, False, True, True, False)
 
 
 def test_mi_mpc_relaxed_admission_is_not_requested_safety_feasible() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import cos, hypot, pi, sin
+from math import hypot
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
@@ -14,6 +14,105 @@ DoorSide = Literal["top", "bottom", "left", "right"]
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return min(hi, max(lo, value))
+
+
+def _floor_union_boundary_segments(
+    rectangles: Sequence["Rect"],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the true exterior segments of an axis-aligned rectangle union.
+
+    Individual room and corridor rectangles overlap at doors and junctions.
+    Treating each rectangle edge as a wall therefore creates fictitious
+    barriers at those internal seams.  Splitting every source edge at all
+    rectangle coordinates and retaining only pieces whose two sides have
+    different union membership gives the exact boundary of this floor plan.
+    """
+
+    if not rectangles:
+        empty = np.empty((0, 2), dtype=float)
+        return empty, empty.copy()
+
+    x_breaks = sorted({value for rect in rectangles for value in (rect.x, rect.x1)})
+    y_breaks = sorted({value for rect in rectangles for value in (rect.y, rect.y1)})
+    scale = max(
+        1.0,
+        max(
+            max(abs(rect.x), abs(rect.x1), abs(rect.y), abs(rect.y1))
+            for rect in rectangles
+        ),
+    )
+    probe = 1.0e-8 * scale
+
+    def inside(x: float, y: float) -> bool:
+        return any(rect.contains((x, y)) for rect in rectangles)
+
+    # Store axis, fixed coordinate, and the increasing interval.  Rounding is
+    # only a deterministic de-duplication key; returned coordinates remain the
+    # original floor-plan values.
+    raw: dict[tuple[str, float, float, float], tuple[str, float, float, float]] = {}
+
+    def retain(axis: str, fixed: float, lower: float, upper: float) -> None:
+        if upper - lower <= 1.0e-12:
+            return
+        midpoint = 0.5 * (lower + upper)
+        if axis == "v":
+            first = inside(fixed - probe, midpoint)
+            second = inside(fixed + probe, midpoint)
+        else:
+            first = inside(midpoint, fixed - probe)
+            second = inside(midpoint, fixed + probe)
+        if first == second:
+            return
+        key = (axis, round(fixed, 10), round(lower, 10), round(upper, 10))
+        raw[key] = (axis, float(fixed), float(lower), float(upper))
+
+    for rect in rectangles:
+        vertical_cuts = [
+            value for value in y_breaks if rect.y <= value <= rect.y1
+        ]
+        horizontal_cuts = [
+            value for value in x_breaks if rect.x <= value <= rect.x1
+        ]
+        for fixed in (rect.x, rect.x1):
+            for lower, upper in zip(
+                vertical_cuts, vertical_cuts[1:], strict=False
+            ):
+                retain("v", fixed, lower, upper)
+        for fixed in (rect.y, rect.y1):
+            for lower, upper in zip(
+                horizontal_cuts, horizontal_cuts[1:], strict=False
+            ):
+                retain("h", fixed, lower, upper)
+
+    grouped: dict[tuple[str, float], list[tuple[float, float]]] = {}
+    coordinates: dict[tuple[str, float], float] = {}
+    for axis, fixed, lower, upper in raw.values():
+        key = (axis, round(fixed, 10))
+        coordinates[key] = fixed
+        grouped.setdefault(key, []).append((lower, upper))
+
+    merged: list[tuple[str, float, float, float]] = []
+    for key in sorted(grouped):
+        intervals = sorted(grouped[key])
+        lower, upper = intervals[0]
+        for following_lower, following_upper in intervals[1:]:
+            if following_lower <= upper + 1.0e-10:
+                upper = max(upper, following_upper)
+            else:
+                merged.append((key[0], coordinates[key], lower, upper))
+                lower, upper = following_lower, following_upper
+        merged.append((key[0], coordinates[key], lower, upper))
+
+    starts: list[tuple[float, float]] = []
+    ends: list[tuple[float, float]] = []
+    for axis, fixed, lower, upper in merged:
+        if axis == "v":
+            starts.append((fixed, lower))
+            ends.append((fixed, upper))
+        else:
+            starts.append((lower, fixed))
+            ends.append((upper, fixed))
+    return np.asarray(starts, dtype=float), np.asarray(ends, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -110,8 +209,8 @@ class HospitalEnvironment:
     _floor_half: np.ndarray = field(init=False, repr=False)
     _wall_centers: np.ndarray = field(init=False, repr=False)
     _wall_half: np.ndarray = field(init=False, repr=False)
-    _collision_perimeter: np.ndarray = field(init=False, repr=False)
-    _clearance_perimeter: np.ndarray = field(init=False, repr=False)
+    _floor_boundary_starts: np.ndarray = field(init=False, repr=False)
+    _floor_boundary_ends: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._floor_bounds = np.asarray(
@@ -132,82 +231,81 @@ class HospitalEnvironment:
             + 0.5 * self._wall_bounds[:, 2:]
         )
         self._wall_half = 0.5 * self._wall_bounds[:, 2:]
-        self._collision_perimeter = np.asarray(
-            [
-                (
-                    cos(index * 2.0 * pi / 16.0),
-                    sin(index * 2.0 * pi / 16.0),
-                )
-                for index in range(16)
-            ],
-            dtype=float,
-        )
-        self._clearance_perimeter = np.asarray(
-            [
-                (
-                    cos(index * 2.0 * pi / 12.0),
-                    sin(index * 2.0 * pi / 12.0),
-                )
-                for index in range(12)
-            ],
-            dtype=float,
-        )
+        (
+            self._floor_boundary_starts,
+            self._floor_boundary_ends,
+        ) = _floor_union_boundary_segments(self.floor_rects)
 
     def is_on_floor(self, point: Sequence[float]) -> bool:
         return any(rect.contains(point) for rect in self.floor_rects)
 
     def is_collision(self, point: Sequence[float], radius: float = 0.0) -> bool:
-        px, py = float(point[0]), float(point[1])
-        if px < 0.0 or px > self.width or py < 0.0 or py > self.height:
-            return True
-
-        samples = [(px, py)]
-        if radius > 1e-9:
-            samples.extend(
-                (
-                    px + radius * cos(index * 2.0 * pi / 16.0),
-                    py + radius * sin(index * 2.0 * pi / 16.0),
-                )
-                for index in range(16)
-            )
-        if any(not self.is_on_floor(sample) for sample in samples):
-            return True
-        return any(wall.contains((px, py), radius) for wall in self.wall_rects)
+        return self.static_clearance(point, radius) <= 0.0
 
     def static_clearance(self, point: Sequence[float], radius: float = 0.0) -> float:
-        """Conservative signed clearance to floor-union and explicit walls."""
+        """Exact signed disc clearance to the floor union and explicit walls."""
 
-        px, py = float(point[0]), float(point[1])
-        sample_points = [(px, py)]
-        if radius > 1e-9:
-            sample_points.extend(
-                (
-                    px + radius * cos(index * 2.0 * pi / 12.0),
-                    py + radius * sin(index * 2.0 * pi / 12.0),
-                )
-                for index in range(12)
-            )
-        samples = np.asarray(sample_points, dtype=float)
-        floor_centers = self._floor_bounds[:, :2] + 0.5 * self._floor_bounds[:, 2:]
-        floor_half = 0.5 * self._floor_bounds[:, 2:]
-        floor_q = np.abs(samples[:, None, :] - floor_centers[None, :, :]) - floor_half[None, :, :]
-        floor_signed = (
-            np.linalg.norm(np.maximum(floor_q, 0.0), axis=2)
-            + np.minimum(np.maximum(floor_q[:, :, 0], floor_q[:, :, 1]), 0.0)
+        return float(
+            self._static_clearances_with_radii(
+                np.asarray(point, dtype=float).reshape(1, 2),
+                np.asarray([radius], dtype=float),
+            )[0]
         )
-        floor_margin = float(np.min(np.max(-floor_signed, axis=1)))
+
+    def _points_on_floor(self, points: np.ndarray) -> np.ndarray:
+        if not self._floor_bounds.size:
+            return np.zeros(points.shape[0], dtype=bool)
+        lower = self._floor_bounds[:, :2]
+        upper = lower + self._floor_bounds[:, 2:]
+        return np.any(
+            np.all(
+                (points[:, None, :] >= lower[None, :, :])
+                & (points[:, None, :] <= upper[None, :, :]),
+                axis=2,
+            ),
+            axis=1,
+        )
+
+    def _floor_union_signed_clearances(self, points: np.ndarray) -> np.ndarray:
+        if not self._floor_boundary_starts.size:
+            return np.full(points.shape[0], -np.inf)
+        segments = self._floor_boundary_ends - self._floor_boundary_starts
+        lengths_squared = np.sum(segments * segments, axis=1)
+        relative = points[:, None, :] - self._floor_boundary_starts[None, :, :]
+        fractions = np.clip(
+            np.sum(relative * segments[None, :, :], axis=2)
+            / np.maximum(lengths_squared[None, :], 1.0e-18),
+            0.0,
+            1.0,
+        )
+        closest = (
+            self._floor_boundary_starts[None, :, :]
+            + fractions[:, :, None] * segments[None, :, :]
+        )
+        distances = np.min(
+            np.linalg.norm(points[:, None, :] - closest, axis=2), axis=1
+        )
+        return np.where(self._points_on_floor(points), distances, -distances)
+
+    def _static_clearances_with_radii(
+        self,
+        points: np.ndarray,
+        radii: np.ndarray,
+    ) -> np.ndarray:
+        floor_margin = self._floor_union_signed_clearances(points) - radii
         if self._wall_bounds.size:
-            wall_centers = self._wall_bounds[:, :2] + 0.5 * self._wall_bounds[:, 2:]
-            wall_half = 0.5 * self._wall_bounds[:, 2:] + radius
-            wall_q = np.abs(np.array([px, py]) - wall_centers) - wall_half
-            wall_signed = (
-                np.linalg.norm(np.maximum(wall_q, 0.0), axis=1)
-                + np.minimum(np.maximum(wall_q[:, 0], wall_q[:, 1]), 0.0)
+            q = (
+                np.abs(points[:, None, :] - self._wall_centers[None, :, :])
+                - self._wall_half[None, :, :]
             )
-            wall_margin = float(np.min(wall_signed))
+            wall_signed = (
+                np.linalg.norm(np.maximum(q, 0.0), axis=2)
+                + np.minimum(np.maximum(q[:, :, 0], q[:, :, 1]), 0.0)
+            )
+            wall_margin = np.min(wall_signed, axis=1) - radii
         else:
-            wall_margin = float("inf")
-        return min(floor_margin, wall_margin)
+            wall_margin = np.full(points.shape[0], np.inf)
+        return np.minimum(floor_margin, wall_margin)
 
     def collisions(
         self,
@@ -231,59 +329,10 @@ class HospitalEnvironment:
             np.asarray(radii, dtype=float),
             (point_array.shape[0],),
         )
-        sampled_radii = np.where(radius_array > 1e-9, radius_array, 0.0)
-        outside_bounds = (
-            (point_array[:, 0] < 0.0)
-            | (point_array[:, 0] > self.width)
-            | (point_array[:, 1] < 0.0)
-            | (point_array[:, 1] > self.height)
-        )
-
-        samples = np.concatenate(
-            (
-                point_array[:, None, :],
-                point_array[:, None, :]
-                + sampled_radii[:, None, None]
-                * self._collision_perimeter[None, :, :],
-            ),
-            axis=1,
-        )
-        floor_x0 = self._floor_bounds[:, 0]
-        floor_y0 = self._floor_bounds[:, 1]
-        floor_x1 = floor_x0 + self._floor_bounds[:, 2]
-        floor_y1 = floor_y0 + self._floor_bounds[:, 3]
-        on_a_floor = np.any(
-            (samples[:, :, None, 0] >= floor_x0)
-            & (samples[:, :, None, 0] <= floor_x1)
-            & (samples[:, :, None, 1] >= floor_y0)
-            & (samples[:, :, None, 1] <= floor_y1),
-            axis=2,
-        )
-        outside_floor = np.any(~on_a_floor, axis=1)
-
-        if self._wall_bounds.size:
-            wall_x0 = self._wall_bounds[:, 0] - radius_array[:, None]
-            wall_y0 = self._wall_bounds[:, 1] - radius_array[:, None]
-            wall_x1 = (
-                self._wall_bounds[:, 0]
-                + self._wall_bounds[:, 2]
-                + radius_array[:, None]
-            )
-            wall_y1 = (
-                self._wall_bounds[:, 1]
-                + self._wall_bounds[:, 3]
-                + radius_array[:, None]
-            )
-            in_wall = np.any(
-                (point_array[:, None, 0] >= wall_x0)
-                & (point_array[:, None, 0] <= wall_x1)
-                & (point_array[:, None, 1] >= wall_y0)
-                & (point_array[:, None, 1] <= wall_y1),
-                axis=1,
-            )
-        else:
-            in_wall = np.zeros(point_array.shape[0], dtype=bool)
-        return outside_bounds | outside_floor | in_wall
+        return self._static_clearances_with_radii(
+            point_array,
+            radius_array,
+        ) <= 0.0
 
     def static_clearances(
         self,
@@ -298,54 +347,10 @@ class HospitalEnvironment:
         if point_array.ndim != 2 or point_array.shape[1] != 2:
             raise ValueError("points must have shape (N, 2)")
 
-        perimeter = (
-            radius * self._clearance_perimeter
-            if radius > 1e-9
-            else np.zeros_like(self._clearance_perimeter)
+        return self._static_clearances_with_radii(
+            point_array,
+            np.full(point_array.shape[0], float(radius)),
         )
-        samples = np.concatenate(
-            (
-                point_array[:, None, :],
-                point_array[:, None, :] + perimeter[None, :, :],
-            ),
-            axis=1,
-        )
-        floor_q = (
-            np.abs(
-                samples[:, :, None, :]
-                - self._floor_centers[None, None, :, :]
-            )
-            - self._floor_half[None, None, :, :]
-        )
-        floor_signed = (
-            np.linalg.norm(np.maximum(floor_q, 0.0), axis=3)
-            + np.minimum(
-                np.maximum(floor_q[:, :, :, 0], floor_q[:, :, :, 1]),
-                0.0,
-            )
-        )
-        floor_margin = np.min(np.max(-floor_signed, axis=2), axis=1)
-
-        if self._wall_bounds.size:
-            wall_half = self._wall_half + radius
-            wall_q = (
-                np.abs(
-                    point_array[:, None, :]
-                    - self._wall_centers[None, :, :]
-                )
-                - wall_half[None, :, :]
-            )
-            wall_signed = (
-                np.linalg.norm(np.maximum(wall_q, 0.0), axis=2)
-                + np.minimum(
-                    np.maximum(wall_q[:, :, 0], wall_q[:, :, 1]),
-                    0.0,
-                )
-            )
-            wall_margin = np.min(wall_signed, axis=1)
-        else:
-            wall_margin = np.full(point_array.shape[0], np.inf)
-        return np.minimum(floor_margin, wall_margin)
 
     def segments_are_free(
         self,
@@ -706,6 +711,8 @@ def unique_points(points: Iterable[Sequence[float]]) -> list[np.ndarray]:
     output: list[np.ndarray] = []
     for point in points:
         candidate = np.asarray(point, dtype=float)
-        if not output or all(np.linalg.norm(candidate - item) > 1e-6 for item in output):
+        if not output or all(
+            np.linalg.norm(candidate - item) > 1e-6 for item in output
+        ):
             output.append(candidate)
     return output

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -51,7 +52,11 @@ def _row(method: str, story: str, seed: int, digest: str) -> BenchmarkResult:
             "safe_through_blockage": True,
             "goal_reached_after_clear": True,
             "normal_qp_room_selected": method == "plcbf",
+            "selector_fallback_room_selected": False,
             "numerical_fallback_room_selected": False,
+            "selector_fallback_count": 0,
+            "infeasible_count": 0,
+            "backup_executed_count": 0,
             "solver_fallback_count": 0,
             "steps": 2,
         },
@@ -85,6 +90,10 @@ def test_hospital_markdown_has_pooled_and_story_tables() -> None:
     assert "## Per-story results" in markdown
     assert "## Fixed story registry" in markdown
     assert "Normal-QP room selection" in markdown
+    assert "Selector-backup room selection" in markdown
+    assert "Selector fallback steps" in markdown
+    assert "Infeasible decisions" in markdown
+    assert "Backup/emergency steps" in markdown
     assert "not extra success requirements" in markdown
     assert "Source order is static / human / stretcher" in markdown
     assert "Runtime cache-miss delta" in markdown
@@ -92,6 +101,28 @@ def test_hospital_markdown_has_pooled_and_story_tables() -> None:
     assert "Deadlocked at end" in markdown
     assert "| plcbf | 1 / 0 / 0 | 0 / 1 / 0 | — |" in markdown
     assert "| main_eastbound | plcbf | 1 | 100.0%" in markdown
+
+
+def test_report_separates_feasible_selector_backup_from_infeasibility() -> None:
+    row = _row("plcbf", "main_eastbound", 0, "a" * 64)
+    row = replace(
+        row,
+        case_metrics={
+            **row.case_metrics,
+            "selector_fallback_count": 2,
+            "exceptional_decision_count": 2,
+            "solver_fallback_count": 2,
+            "infeasible_count": 0,
+            "backup_executed_count": 2,
+            "steps": 2,
+            "selector_fallback_room_selected": True,
+        },
+    )
+    markdown = hospital_benchmark_markdown((row,))
+    pooled_row = next(
+        line for line in markdown.splitlines() if line.startswith("| plcbf |")
+    )
+    assert pooled_row.endswith("100.0% | 0.0% | 100.0% |")
 
 
 def test_clearance_attribution_survives_raw_json_serialization() -> None:

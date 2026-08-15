@@ -444,6 +444,74 @@ class PolicySelectionTests(unittest.TestCase):
 
         self.assertEqual(decision.policy_id, first.policy_id)
 
+    def test_polygon_reuse_matches_general_qp_on_random_certificates(self) -> None:
+        rng = np.random.default_rng(20260809)
+        lower = np.array([-1.7, -1.7])
+        upper = np.array([1.7, 1.7])
+        for sample in range(160):
+            count = int(rng.integers(2, 7))
+            halfspaces = tuple(
+                CBFHalfspace(
+                    rng.normal(size=2),
+                    float(rng.uniform(-2.8, 2.8)),
+                    f"random-{sample}-{index}",
+                )
+                for index in range(count)
+            )
+            reference = rng.uniform(-2.2, 2.2, size=2)
+            weights = rng.uniform(0.4, 2.5, size=2)
+            certificate = PolicyCertificate(
+                f"candidate-{sample}",
+                1.0,
+                halfspaces,
+                backup_control=np.zeros(2),
+            )
+
+            decision = select_policy(
+                (certificate,),
+                reference,
+                lower,
+                upper,
+                weights=weights,
+                mode="input_volume",
+                tolerance=1e-9,
+            )
+            evaluation = decision.diagnostics.evaluations[0]
+            expected = solve_weighted_box_halfspaces_qp_2d(
+                reference,
+                lower,
+                upper,
+                halfspaces,
+                weights=weights,
+                tolerance=1e-9,
+            )
+            self.assertEqual(evaluation.feasible, expected.feasible)
+            self.assertAlmostEqual(
+                evaluation.input_volume,
+                rectangle_halfspaces_area(
+                    lower,
+                    upper,
+                    halfspaces,
+                    tolerance=1e-9,
+                ),
+                places=10,
+            )
+            if expected.feasible:
+                self.assertIsNotNone(evaluation.control)
+                np.testing.assert_allclose(
+                    evaluation.control,
+                    expected.control,
+                    rtol=1e-9,
+                    atol=2e-8,
+                )
+                self.assertAlmostEqual(
+                    evaluation.intervention_cost,
+                    expected.objective,
+                    places=9,
+                )
+            else:
+                self.assertIsNone(evaluation.control)
+
     def test_intervention_tie_does_not_use_value_or_volume(self) -> None:
         first = PolicyCertificate("first-low-value", 0.1)
         second = PolicyCertificate("second-high-value", 10.0)

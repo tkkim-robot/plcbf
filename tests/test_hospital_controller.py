@@ -23,6 +23,7 @@ from examples.hospital.dynamics import (
     waypoint_control,
 )
 from examples.hospital.obstacles import Human
+from examples.hospital.policies import rollout_policy
 from examples.hospital.simulation import build_blocked_main_hall_scenario
 from plcbf.policy_library import CBFHalfspace, PolicyCertificate
 
@@ -53,6 +54,43 @@ def test_controller_has_no_latched_refuge_executor() -> None:
     assert len(policies) == 13
     assert not hasattr(controller, "_cached_certificates")
     assert "certificate_update_period" not in source
+
+
+def test_default_policy_library_uses_one_certificate_horizon() -> None:
+    simulation = build_blocked_main_hall_scenario(3)
+    policies = simulation.controller.candidate_policies(simulation.state)
+
+    assert {policy.horizon for policy in policies} == {
+        simulation.config.policies.room_horizon
+    }
+
+
+def test_room_rollout_cursor_reaches_and_holds_the_terminal_room() -> None:
+    simulation = build_blocked_main_hall_scenario(3)
+    room_policy = next(
+        policy
+        for policy in simulation.controller.candidate_policies(
+            simulation.state
+        )
+        if policy.kind == "room" and policy.target_room.label == "Ward 44"
+    )
+
+    trajectory = rollout_policy(
+        room_policy,
+        simulation.state,
+        simulation.config,
+    )
+    terminal = trajectory[-1]
+
+    assert len(trajectory) == int(
+        room_policy.horizon / room_policy.rollout_dt
+    ) + 1
+    assert room_policy.target_room.interior_margin(terminal[:2]) >= (
+        simulation.config.refuge.terminal_interior_margin
+    )
+    assert np.linalg.norm(terminal[2:]) <= (
+        simulation.config.refuge.terminal_speed_max
+    )
 
 
 def test_complete_library_is_never_gated_by_obstacle_or_phase() -> None:
@@ -527,6 +565,36 @@ def test_static_hocbf_matches_playground_near_wall_selection() -> None:
     assert constraints
     assert len(constraints) <= DEFAULT_CONFIG.safety.max_static_hocbf_constraints
     assert all(item.obstacle_id.startswith(("wall-", "floor-")) for item in constraints)
+
+
+def test_static_hocbf_floor_rows_reference_true_union_boundary_segments() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    # This room/corridor overlap previously emitted a fictitious row at the
+    # internal edge [12, 15].
+    position = np.array([12.0, 13.86956522])
+    constraints = static_hocbf_constraints(
+        np.r_[position, 0.0, 0.0],
+        simulation.environment,
+        simulation.config,
+    )
+    floor_rows = [
+        item for item in constraints if item.obstacle_id.startswith("floor-")
+    ]
+    assert floor_rows
+    for row in floor_rows:
+        index = int(row.obstacle_id.removeprefix("floor-"))
+        start = simulation.environment._floor_boundary_starts[index]
+        end = simulation.environment._floor_boundary_ends[index]
+        segment = end - start
+        fraction = np.clip(
+            np.dot(position - start, segment) / np.dot(segment, segment),
+            0.0,
+            1.0,
+        )
+        expected_closest = start + fraction * segment
+        inferred_closest = position - 0.5 * row.a
+        np.testing.assert_allclose(inferred_closest, expected_closest)
+        assert np.linalg.norm(inferred_closest - np.array([12.0, 15.0])) > 1e-6
 
 
 @pytest.mark.parametrize(

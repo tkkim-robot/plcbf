@@ -34,6 +34,7 @@ from examples.hospital.obstacles import (
 )
 from examples.hospital.policies import (
     HospitalPolicy,
+    rollout_policy,
     rollout_value,
 )
 from examples.hospital.simulation import build_blocked_main_hall_scenario
@@ -168,6 +169,85 @@ def test_batched_rollouts_and_values_match_scalar_all_policy_kinds(
     assert np.all(np.isfinite(evaluation.gradients))
 
 
+def test_decision_only_evaluator_omits_host_rollouts_without_value_drift(
+    rollout_case,
+) -> None:
+    case = rollout_case
+    decision_only = evaluate_policy_batch(
+        case["simulation"].state,
+        case["nominal"],
+        case["packed_policies"],
+        case["packed_obstacles"],
+        case["geometry"],
+        case["parameters"],
+        include_diagnostics=False,
+    )
+
+    assert decision_only.diagnostics_available is False
+    assert decision_only.trajectories.shape == (
+        len(case["policies"]),
+        0,
+        4,
+    )
+    assert decision_only.trajectory_mask.shape == (len(case["policies"]), 0)
+    assert np.all(np.isnan(decision_only.nominal_prefix_values))
+    assert np.all(np.isnan(decision_only.terminal_clearances))
+    np.testing.assert_allclose(
+        decision_only.values,
+        case["evaluation"].values,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        decision_only.gradients,
+        case["evaluation"].gradients,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        decision_only.time_derivatives,
+        case["evaluation"].time_derivatives,
+        atol=2.0e-6,
+    )
+
+
+def test_room_policy_certifies_the_complete_horizon_after_entry(
+    rollout_case,
+) -> None:
+    case = rollout_case
+    original = next(
+        policy for policy in case["policies"] if policy.kind == "room"
+    )
+    assert original.target_room is not None
+    state = np.r_[original.target_room.center, 0.0, 0.0]
+    policy = replace(
+        original,
+        horizon=0.48,
+        rollout_dt=0.24,
+        waypoints=[original.target_room.center.copy()],
+    )
+
+    scalar = rollout_policy(policy, state, case["simulation"].config)
+    packed = pack_policy_batch(
+        (policy,), case["simulation"].config, case["capacities"]
+    )
+    evaluated = evaluate_policy_batch(
+        state,
+        case["nominal"],
+        packed,
+        case["packed_obstacles"],
+        case["geometry"],
+        case["parameters"],
+    )
+
+    assert scalar.shape == (3, 4)
+    assert int(np.sum(evaluated.trajectory_mask[0])) == 3
+    np.testing.assert_allclose(
+        evaluated.trajectories[0, evaluated.trajectory_mask[0]],
+        scalar,
+        rtol=2.0e-6,
+        atol=8.0e-6,
+    )
+
+
 def test_horizon_groups_match_unified_batch_in_original_order(
     rollout_case,
 ) -> None:
@@ -254,6 +334,67 @@ def test_horizon_groups_match_unified_batch_in_original_order(
     assert after.currsize == before.currsize
     assert after.misses == before.misses
     assert after.hits >= before.hits + 1
+
+
+def test_shared_regular_and_room_time_grids_match_unified_evaluator(
+    rollout_case,
+) -> None:
+    case = rollout_case
+    policies = tuple(
+        replace(
+            policy,
+            horizon=0.96,
+            rollout_dt=(0.12 if policy.kind == "room" else 0.24),
+        )
+        for policy in case["policies"]
+        if policy.kind != "retrace"
+    )
+    capacities = HospitalJaxCapacities(
+        max_policies=len(policies),
+        max_obstacles=4,
+        max_horizon_steps=8,
+        max_swept_samples=3,
+        human_prediction_steps=25,
+    )
+    grouped_capacities = HospitalJaxGroupedCapacities(
+        groups=(HospitalJaxPolicyGroupSpec(len(policies), 8, 3),),
+        max_obstacles=4,
+        human_prediction_steps=25,
+    )
+    unified = evaluate_policy_batch(
+        case["simulation"].state,
+        case["nominal"],
+        pack_policy_batch(policies, case["simulation"].config, capacities),
+        pack_obstacle_batch(case["obstacles"], capacities),
+        case["geometry"],
+        case["parameters"],
+        include_diagnostics=False,
+    )
+    grouped = evaluate_policy_groups(
+        case["simulation"].state,
+        case["nominal"],
+        pack_policy_groups(
+            policies,
+            case["simulation"].config,
+            grouped_capacities,
+        ),
+        pack_obstacle_batch(case["obstacles"], grouped_capacities),
+        case["geometry"],
+        case["parameters"],
+        include_diagnostics=False,
+    )
+
+    np.testing.assert_allclose(grouped.values, unified.values, atol=2.0e-6)
+    np.testing.assert_allclose(
+        grouped.gradients,
+        unified.gradients,
+        atol=3.0e-6,
+    )
+    np.testing.assert_allclose(
+        grouped.time_derivatives,
+        unified.time_derivatives,
+        atol=6.0e-6,
+    )
 
 
 def test_shift_prefix_and_terminal_outputs_match_scalar(rollout_case) -> None:
@@ -369,6 +510,50 @@ def test_exact_autodiff_gradient_matches_value_finite_difference(
     )
 
 
+def test_room_exact_autodiff_gradient_matches_value_finite_difference(
+    rollout_case,
+) -> None:
+    """Cover the production AD path without changing it to finite differences."""
+
+    case = rollout_case
+    room_index = next(
+        index
+        for index, policy in enumerate(case["policies"])
+        if policy.kind == "room"
+    )
+    state = case["simulation"].state.copy()
+    step = 2.0e-3
+    finite = np.zeros(4)
+    for axis in range(4):
+        plus, minus = state.copy(), state.copy()
+        plus[axis] += step
+        minus[axis] -= step
+        plus_value = evaluate_policy_batch(
+            plus,
+            case["nominal"],
+            case["packed_policies"],
+            case["packed_obstacles"],
+            case["geometry"],
+            case["parameters"],
+        ).values[room_index]
+        minus_value = evaluate_policy_batch(
+            minus,
+            case["nominal"],
+            case["packed_policies"],
+            case["packed_obstacles"],
+            case["geometry"],
+            case["parameters"],
+        ).values[room_index]
+        finite[axis] = (plus_value - minus_value) / (2.0 * step)
+
+    np.testing.assert_allclose(
+        case["evaluation"].gradients[room_index],
+        finite,
+        rtol=3.0e-2,
+        atol=5.0e-3,
+    )
+
+
 def test_static_floor_union_and_wall_clearance_match_environment(
     rollout_case,
 ) -> None:
@@ -381,6 +566,9 @@ def test_static_floor_union_and_wall_clearance_match_environment(
             [50.0, 36.0],
             [59.0, 51.2],
             [5.2, 47.0],
+            [69.66085247, 15.32107043],
+            [69.76131569, 43.46573127],
+            [12.0, 13.86956522],
         ],
         dtype=np.float32,
     )
@@ -399,6 +587,18 @@ def test_static_floor_union_and_wall_clearance_match_environment(
         ]
     )
     np.testing.assert_allclose(actual, expected, rtol=2.0e-6, atol=5.0e-6)
+    jax_collision = np.asarray(
+        backend._environment_collision(
+            jnp.asarray(points),
+            jnp.full((len(points),), radius),
+            geometry,
+        )
+    )
+    np.testing.assert_array_equal(
+        jax_collision,
+        simulation.environment.collisions(points, radius),
+    )
+    np.testing.assert_array_equal(jax_collision, actual <= 0.0)
 
 
 def test_human_bounce_and_reflected_stretcher_predictions_match_scalar(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from .benchmark import (
     build_benchmark_scenario,
     default_hospital_benchmark_steps,
     publication_benchmark_config,
+)
+from .config_io import (
+    DEFAULT_HOSPITAL_CONFIG_PATH,
+    load_hospital_config_artifact,
 )
 from .scenarios import (
     DEFAULT_HOSPITAL_TRAFFIC_SEEDS,
@@ -51,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=default_hospital_benchmark_steps(),
     )
+    parser.add_argument(
+        "--config",
+        "--config-json",
+        dest="config_json",
+        type=Path,
+        help=(
+            "PL-CBF HospitalConfig YAML/JSON or tuning summary (default: "
+            "packaged Optuna winner)"
+        ),
+    )
     parser.add_argument("--save", type=Path)
     parser.add_argument("--gif", type=Path)
     parser.add_argument("--snapshot-dir", type=Path)
@@ -63,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
+    config_path = (
+        DEFAULT_HOSPITAL_CONFIG_PATH
+        if arguments.config_json is None
+        else arguments.config_json
+    )
+    loaded_config, artifact = load_hospital_config_artifact(config_path)
+    runtime_config = publication_benchmark_config(loaded_config)
+    configuration_source = (
+        f"packaged_plcbf:{config_path}"
+        if arguments.config_json is None
+        else str(config_path)
+    )
     story_id = arguments.story
     if arguments.stretchers is None:
         story_id = story_id or "main_eastbound"
@@ -70,12 +97,13 @@ def main(argv: list[str] | None = None) -> int:
             story_id,
             traffic_seed=arguments.seed,
         )
-        simulation = scenario.to_simulation(publication_benchmark_config())
+        simulation = scenario.to_simulation(runtime_config)
         run_mode = "canonical_story"
     else:
         simulation = build_benchmark_scenario(
             f"blocked_{arguments.stretchers}_stretchers",
             seed=arguments.seed,
+            config=runtime_config,
         )
         run_mode = "legacy_stretcher_case"
     visual_artifacts = None
@@ -102,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
                 "world_sha256": provenance.get("world_sha256"),
                 "protocol_sha256": provenance.get(
                     "hospital_story_protocol_sha256"
+                ),
+                "controller_config_source": configuration_source,
+                "controller_config_sha256": hashlib.sha256(
+                    config_path.read_bytes()
+                ).hexdigest(),
+                "controller_config_provenance": artifact.get(
+                    "provenance", {}
                 ),
                 "time": round(simulation.time, 3),
                 "collision": bool(simulation.collision),

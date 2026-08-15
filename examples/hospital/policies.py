@@ -75,20 +75,42 @@ class HospitalPolicy:
         config: HospitalConfig,
         waypoint_index: int,
     ) -> tuple[np.ndarray, int]:
-        """Evaluate a warehouse-style retrace policy with a local cursor.
+        """Evaluate a waypoint policy with one rollout-local cursor.
 
         The cursor belongs to one independently simulated backup rollout.  It
         is returned to the caller rather than stored on the policy, so finite
         differences and competing MPS/Gatekeeper candidates cannot leak
-        waypoint progress into one another.
+        waypoint progress into one another.  It is numerical rollout state,
+        not a persistent controller mode or refuge state machine.
         """
 
-        if self.kind != "retrace" or not self.waypoints:
+        if self.kind not in {"nominal", "room", "retrace"} or not self.waypoints:
             return self.control(state, config), int(waypoint_index)
         value = np.asarray(state, dtype=float)
         index = int(np.clip(waypoint_index, 0, len(self.waypoints) - 1))
         target = self.waypoints[index]
         distance = float(np.linalg.norm(target - value[:2]))
+        if self.kind in {"nominal", "room"}:
+            radius = (
+                ROOM_APPROACH_RADIUS
+                if self.kind == "room" and index == 0
+                else ROOM_WAYPOINT_RADIUS
+                if self.kind == "room"
+                else NOMINAL_WAYPOINT_RADIUS
+            )
+            if distance < radius and index + 1 < len(self.waypoints):
+                index += 1
+                target = self.waypoints[index]
+            return (
+                waypoint_control(
+                    value,
+                    target,
+                    config.robot,
+                    self.target_speed,
+                ),
+                index,
+            )
+
         if (
             distance < RETRACE_WAYPOINT_RADIUS
             and index + 1 < len(self.waypoints)
@@ -125,26 +147,9 @@ class HospitalPolicy:
         config: HospitalConfig,
     ) -> np.ndarray:
         value = np.asarray(state, dtype=float)
-        if self.kind == "retrace" and self.waypoints:
+        if self.kind in {"nominal", "room", "retrace"} and self.waypoints:
             control, _ = self.control_with_cursor(value, config, 0)
             return control
-        if self.kind in {"nominal", "room"} and self.waypoints:
-            target = self.waypoints[-1]
-            for index, waypoint in enumerate(self.waypoints):
-                if self.kind == "room":
-                    radius = (
-                        ROOM_APPROACH_RADIUS
-                        if index == 0
-                        else ROOM_WAYPOINT_RADIUS
-                    )
-                else:
-                    radius = NOMINAL_WAYPOINT_RADIUS
-                if np.linalg.norm(waypoint - value[:2]) > radius:
-                    target = waypoint
-                    break
-            return waypoint_control(
-                value, target, config.robot, self.target_speed
-            )
         if self.kind == "stop":
             return np.clip(
                 -config.policies.stop_gain * value[2:4],
@@ -179,14 +184,14 @@ def rollout_policy(
     steps = max(1, int(policy.horizon / policy.rollout_dt))
     origin = np.asarray(state, dtype=float)
     trajectory = [origin.copy()]
-    retrace_waypoint_index = 0
+    waypoint_index = 0
     for _ in range(steps):
         current = trajectory[-1]
-        if policy.kind == "retrace":
-            control, retrace_waypoint_index = policy.control_with_cursor(
+        if policy.kind in {"nominal", "room", "retrace"}:
+            control, waypoint_index = policy.control_with_cursor(
                 current,
                 config,
-                retrace_waypoint_index,
+                waypoint_index,
             )
         else:
             control = policy.control(current, config)
@@ -200,14 +205,6 @@ def rollout_policy(
         ):
             break
         trajectory.append(following)
-        if (
-            policy.kind == "room"
-            and policy.target_room is not None
-            and policy.target_room.contains(following[:2])
-            and policy.target_room.interior_margin(following[:2])
-            >= config.refuge.terminal_interior_margin
-        ):
-            break
     return np.asarray(trajectory)
 
 

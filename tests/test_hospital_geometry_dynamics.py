@@ -12,6 +12,10 @@ import matplotlib.pyplot as plt
 from examples.hospital.config import DEFAULT_CONFIG
 from examples.hospital.dynamics import step_double_integrator
 from examples.hospital.environment import build_hospital_environment
+from examples.hospital.feasibility import (
+    WITNESS_DYNAMIC_SUBSTEPS,
+    _precompute_traffic,
+)
 from examples.hospital.obstacles import Human, Stretcher
 from examples.hospital.planner import HospitalGridPlanner
 from examples.hospital.simulation import (
@@ -121,7 +125,6 @@ def test_vectorized_environment_queries_match_scalar_geometry_exactly() -> None:
             rtol=0.0,
             atol=1e-12,
         )
-
     tiny_radii = np.resize(np.asarray([0.0, 1e-12]), len(points))
     np.testing.assert_array_equal(
         environment.collisions(points, tiny_radii),
@@ -144,6 +147,137 @@ def test_vectorized_environment_queries_match_scalar_geometry_exactly() -> None:
             ]
         ),
     )
+
+
+def test_x64_feasibility_human_replay_matches_3000_simulator_steps() -> None:
+    """The offline witness must see the exact publication crowd trajectory."""
+
+    environment = build_hospital_environment()
+    humans = (
+        Human("horizontal", 67.0, 47.5, 1.2, 0.0),
+        Human("vertical", 24.0, 47.5, 0.0, 1.0),
+    )
+    prediction = _precompute_traffic(
+        humans,
+        (),
+        environment,
+        DEFAULT_CONFIG,
+    )
+    replay = [
+        Human(
+            human.identifier,
+            human.x,
+            human.y,
+            human.vx,
+            human.vy,
+            human.radius,
+        )
+        for human in humans
+    ]
+    expected = np.empty_like(prediction.human_centers)
+    expected[0] = np.asarray([human.center for human in replay])
+    swept_check_steps = {0, 1, 10, 100, 500, 1000, 2000, 2999}
+    expected_swept: dict[int, np.ndarray] = {}
+    for step_index in range(1, 3001):
+        source_index = step_index - 1
+        if source_index in swept_check_steps:
+            expected_swept[source_index] = np.asarray(
+                [
+                    [
+                        human.predicted(
+                            sample_index
+                            / WITNESS_DYNAMIC_SUBSTEPS
+                            * DEFAULT_CONFIG.dt,
+                            environment,
+                        ).center
+                        for human in replay
+                    ]
+                    for sample_index in range(
+                        WITNESS_DYNAMIC_SUBSTEPS + 1
+                    )
+                ]
+            )
+        for human in replay:
+            human.advance(DEFAULT_CONFIG.dt, environment)
+        expected[step_index] = np.asarray([human.center for human in replay])
+
+    assert prediction.human_centers.shape == (3001, 2, 2)
+    assert prediction.human_swept_centers.shape == (3000, 9, 2, 2)
+    np.testing.assert_allclose(
+        prediction.human_centers,
+        expected,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    for step_index, expected_samples in expected_swept.items():
+        np.testing.assert_array_equal(
+            prediction.human_swept_centers[step_index],
+            expected_samples,
+        )
+    # At a reflection, Human.predicted(dt) may differ from the independent
+    # production Human.advance(dt) carry.  The audit must retain both rather
+    # than linearly interpolate between production endpoints.
+    assert np.any(
+        prediction.human_swept_centers[:, -1]
+        != prediction.human_centers[1:]
+    )
+    # Both trajectories cross enough of the map to exercise repeated wall
+    # reflections, rather than testing only unobstructed linear propagation.
+    horizontal_direction = np.sign(np.diff(expected[:, 0, 0]))
+    vertical_direction = np.sign(np.diff(expected[:, 1, 1]))
+    assert np.count_nonzero(np.diff(horizontal_direction)) >= 2
+    assert np.count_nonzero(np.diff(vertical_direction)) >= 2
+
+
+def test_static_collision_and_signed_clearance_use_one_exact_geometry() -> None:
+    environment = build_hospital_environment()
+    rng = np.random.default_rng(2901)
+    # Include wall corners and doorway/seam points that disagreed under the old
+    # 16-sample collision and 12-sample clearance approximations.
+    points = np.vstack(
+        (
+            rng.uniform([0.0, 0.0], [140.0, 95.0], size=(500, 2)),
+            np.array(
+                [
+                    [69.66085247, 15.32107043],
+                    [104.47959414, 23.96464175],
+                    [69.76131569, 43.46573127],
+                    [62.24284852, 23.59176186],
+                    [12.0, 15.0],
+                    [12.0, 13.86956522],
+                ]
+            ),
+        )
+    )
+    radii = rng.uniform(0.0, 0.8, size=len(points))
+    radii[-6:] = 0.55
+    clearances = np.asarray(
+        [
+            environment.static_clearance(point, radius)
+            for point, radius in zip(points, radii, strict=True)
+        ]
+    )
+    np.testing.assert_array_equal(
+        environment.collisions(points, radii),
+        clearances <= 0.0,
+    )
+
+
+def test_cached_floor_segments_are_only_exterior_union_boundaries() -> None:
+    environment = build_hospital_environment()
+    assert len(environment._floor_boundary_starts) > 0
+    for start, end in zip(
+        environment._floor_boundary_starts,
+        environment._floor_boundary_ends,
+        strict=True,
+    ):
+        tangent = end - start
+        tangent /= np.linalg.norm(tangent)
+        normal = np.array([-tangent[1], tangent[0]])
+        midpoint = 0.5 * (start + end)
+        first = environment.is_on_floor(midpoint + 1.0e-5 * normal)
+        second = environment.is_on_floor(midpoint - 1.0e-5 * normal)
+        assert first is not second
 
 
 def test_double_integrator_bounds_and_stretcher_geometry_prediction() -> None:

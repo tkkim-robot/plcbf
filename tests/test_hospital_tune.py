@@ -129,6 +129,13 @@ def test_suggested_qp_refuge_config_can_be_reconstructed() -> None:
     assert suggested.policies.num_angle_policies == 12
     assert suggested.policies.room_policy_count == 7
     assert suggested.policies.room_rollout_dt == pytest.approx(0.24)
+    assert {
+        suggested.policies.nominal_horizon,
+        suggested.policies.angle_horizon,
+        suggested.policies.reverse_horizon,
+        suggested.policies.stop_horizon,
+        suggested.policies.room_horizon,
+    } == {7.2}
     assert suggested.safety.safety_margin == pytest.approx(0.45)
     assert suggested.safety.stretcher_margin == pytest.approx(0.55)
     assert suggested.policies.cbf_value_buffer == trial.params[
@@ -240,6 +247,7 @@ def test_full_benchmark_grid_and_fingerprint_are_stable() -> None:
         "num_angle_policies": 12,
         "room_policy_count": 7,
         "room_rollout_dt_s": 0.24,
+        "common_policy_horizon_s": 7.2,
         "room_horizon_s": 7.2,
         "refuge_geometry": asdict(first.base_config.refuge),
     }
@@ -910,3 +918,9 @@ def test_fingerprint_binds_relevant_source_content(monkeypatch) -> None:
         },
     )
     assert tune.study_configuration_fingerprint(config) != original
+
+
+def test_source_fingerprint_covers_baseline_dispatch() -> None:
+    hashes = tune._relevant_source_content_sha256()
+    assert "hospital_baselines" in hashes
+    assert "core_baselines" in hashes

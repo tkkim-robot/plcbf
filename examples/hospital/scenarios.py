@@ -30,6 +30,21 @@ from .environment import (
     Room,
     build_hospital_environment,
 )
+from .feasibility import (
+    DYNAMIC_FEASIBILITY_SCHEMA,
+    DynamicFeasibilityAudit,
+    GOAL_TOLERANCE_M,
+    MAXIMUM_WITNESS_TIME_S,
+    MINIMUM_OPERATIONAL_CLEARANCE_M,
+    MINIMUM_ROOM_ENTRY_LEAD_S,
+    POST_CONVOY_DEPARTURE_DELAYS_S,
+    POST_CONVOY_HOLD_BUFFER_S,
+    WITNESS_DYNAMIC_SUBSTEPS,
+    WITNESS_HUMAN_CAUTION_CLEARANCE_M,
+    WITNESS_NOMINAL_BLOCK_STEPS,
+    WITNESS_PREFERRED_CLEARANCE_M,
+    validate_dynamic_refuge_feasibility,
+)
 from .obstacles import DynamicObstacle, Human, Stretcher, stretcher_route
 from .scenario_generation import (
     DEFAULT_HUMAN_COUNT,
@@ -46,7 +61,7 @@ from .scenario_generation import (
 )
 
 
-HOSPITAL_STORY_PROTOCOL_VERSION = "hospital_fixed_refuge_v3"
+HOSPITAL_STORY_PROTOCOL_VERSION = "hospital_fixed_refuge_v4"
 HOSPITAL_GEOMETRY_VERSION = "hospital_floorplan_140x95_v1"
 HOSPITAL_STORY_SEED_NAMESPACE = 0x48535031
 DEFAULT_HOSPITAL_TRAFFIC_SEEDS = tuple(range(20))
@@ -58,6 +73,7 @@ BLOCKER_WIDTH_M = 7.1
 # uses that ceiling while remaining strictly faster than the 2.85 m/s ego, so
 # pure corridor retreat is still swept and a lateral room route is necessary.
 BLOCKER_SPEED_MPS = 3.0
+MAX_DYNAMIC_FEASIBILITY_GENERATION_ATTEMPTS = 256
 
 
 @dataclass(frozen=True)
@@ -189,10 +205,13 @@ HOSPITAL_STORIES: tuple[HospitalStoryTemplate, ...] = (
         diagnostic_refuge_room="North Patient 34",
         corridor_name="North corridor",
         travel_direction=1,
-        convoy_coordinates_m=(89.0, 95.4, 101.8),
+        # Shift the complete immutable convoy and witness together by 6 s.
+        # This preserves the relative no-room necessity encounter while giving
+        # the actual bounded-DI start-to-room construction witness >1 s lead.
+        convoy_coordinates_m=(107.0, 113.4, 119.8),
         convoy_speed_mps=-BLOCKER_SPEED_MPS,
         necessity_witness_station_m=40.0,
-        necessity_witness_time_s=11.9,
+        necessity_witness_time_s=17.9,
         nonroom_escape_interval_m=(28.0, 62.0),
         human_corridor_names=_NORTH_HUMAN_REGION,
         narrative=(
@@ -207,10 +226,13 @@ HOSPITAL_STORIES: tuple[HospitalStoryTemplate, ...] = (
         diagnostic_refuge_room="North Patient 76",
         corridor_name="North corridor",
         travel_direction=-1,
-        convoy_coordinates_m=(47.0, 40.6),
+        # The westbound story needs 7.5 s more actual start-to-room travel.
+        # Positions and witness time move together, so encounter geometry and
+        # the stop/continue/max-retreat necessity proof remain unchanged.
+        convoy_coordinates_m=(24.5, 18.1),
         convoy_speed_mps=BLOCKER_SPEED_MPS,
         necessity_witness_station_m=82.0,
-        necessity_witness_time_s=7.1,
+        necessity_witness_time_s=14.6,
         nonroom_escape_interval_m=(70.0, 104.0),
         human_corridor_names=_NORTH_HUMAN_REGION,
         narrative=(
@@ -225,10 +247,10 @@ HOSPITAL_STORIES: tuple[HospitalStoryTemplate, ...] = (
         diagnostic_refuge_room="South Patient 34",
         corridor_name="South corridor",
         travel_direction=1,
-        convoy_coordinates_m=(89.0, 95.4, 101.8),
+        convoy_coordinates_m=(107.0, 113.4, 119.8),
         convoy_speed_mps=-BLOCKER_SPEED_MPS,
         necessity_witness_station_m=40.0,
-        necessity_witness_time_s=11.9,
+        necessity_witness_time_s=17.9,
         nonroom_escape_interval_m=(28.0, 62.0),
         human_corridor_names=_SOUTH_HUMAN_REGION,
         narrative=(
@@ -240,6 +262,31 @@ HOSPITAL_STORIES: tuple[HospitalStoryTemplate, ...] = (
 
 HOSPITAL_STORY_IDS = tuple(story.story_id for story in HOSPITAL_STORIES)
 _STORY_BY_ID = {story.story_id: story for story in HOSPITAL_STORIES}
+HOSPITAL_ACCEPTED_ATTEMPT_MANIFEST_SCHEMA = (
+    "hospital_accepted_generation_attempts_v1"
+)
+# Frozen after exact, controller-independent replay of all 100 publication
+# worlds. Rows follow HOSPITAL_STORY_IDS; columns follow traffic seeds 0..19.
+HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS: tuple[tuple[int, ...], ...] = (
+    (2, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1),
+    (1, 2, 1, 0, 0, 0, 2, 0, 1, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0),
+    (34, 39, 54, 6, 42, 1, 35, 7, 56, 29, 29, 33, 4, 5, 13, 23, 28, 140, 42, 38),
+    (6, 15, 5, 3, 42, 15, 5, 2, 12, 7, 8, 1, 9, 0, 4, 0, 10, 2, 2, 3),
+    (21, 4, 7, 25, 0, 7, 1, 8, 35, 6, 11, 21, 15, 5, 36, 5, 31, 21, 35, 20),
+)
+if (
+    len(HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS) != len(HOSPITAL_STORY_IDS)
+    or any(
+        len(attempts) != len(DEFAULT_HOSPITAL_TRAFFIC_SEEDS)
+        or any(
+            attempt < 0
+            or attempt >= MAX_DYNAMIC_FEASIBILITY_GENERATION_ATTEMPTS
+            for attempt in attempts
+        )
+        for attempts in HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS
+    )
+):
+    raise AssertionError("Hospital accepted-attempt manifest must be 5x20")
 
 
 @dataclass(frozen=True)
@@ -251,6 +298,7 @@ class HospitalPublicationTrial:
     story_id: str
     traffic_seed: int
     generator_seed: int
+    generation_attempt: int = 0
 
     @property
     def case_id(self) -> str:
@@ -378,6 +426,8 @@ class HospitalStoryScenario:
     crowd_metadata: HospitalCrowdMetadata
     contract: HospitalGeometryContract
     necessity_audit: HospitalNecessityAudit
+    blocker_only_feasibility_audit: DynamicFeasibilityAudit
+    feasibility_audit: DynamicFeasibilityAudit
     world_sha256: str
     config: HospitalConfig = field(repr=False, compare=False)
     environment: HospitalEnvironment = field(repr=False, compare=False)
@@ -395,6 +445,8 @@ class HospitalStoryScenario:
             "used_as_controller_input": False,
             "used_for_policy_ranking": False,
             "used_for_success_classification": False,
+            "dynamic_witness_room": self.feasibility_audit.witness_room_label,
+            "dynamic_witness_used_as_controller_input": False,
         }
 
     def benchmark_metadata(self) -> dict[str, object]:
@@ -410,6 +462,7 @@ class HospitalStoryScenario:
             "story_index": self.trial.story_index,
             "traffic_seed": self.trial.traffic_seed,
             "traffic_generator_seed": self.trial.generator_seed,
+            "traffic_generation_attempt": self.trial.generation_attempt,
             "world_sha256": self.world_sha256,
             "hospital_world_sha256": self.world_sha256,
             "human_count": len(self.humans),
@@ -438,6 +491,10 @@ class HospitalStoryScenario:
             "traffic_randomizes_humans_only": True,
             "external_refuge_state_machine": False,
             "diagnostic_refuge_supplied_to_controller": False,
+            "blocker_only_dynamic_refuge_feasibility_verified": (
+                self.blocker_only_feasibility_audit.valid
+            ),
+            **self.feasibility_audit.public_metadata(),
         }
 
     def to_simulation(
@@ -460,12 +517,41 @@ class HospitalStoryScenario:
         return simulation
 
 
+def hospital_accepted_generation_attempt_manifest() -> dict[str, object]:
+    """Return the canonical accepted-attempt table for protocol v4."""
+
+    return {
+        "schema": HOSPITAL_ACCEPTED_ATTEMPT_MANIFEST_SCHEMA,
+        "story_order": list(HOSPITAL_STORY_IDS),
+        "traffic_seeds": list(DEFAULT_HOSPITAL_TRAFFIC_SEEDS),
+        "attempts": [
+            list(attempts)
+            for attempts in HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS
+        ],
+    }
+
+
+@lru_cache(maxsize=1)
+def hospital_accepted_generation_attempt_manifest_sha256() -> str:
+    """Hash the canonical JSON encoding of the accepted-attempt table."""
+
+    encoded = json.dumps(
+        hospital_accepted_generation_attempt_manifest(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def hospital_publication_trial_grid() -> tuple[HospitalPublicationTrial, ...]:
     """Return the exact, stable five-story × twenty-traffic-seed grid."""
 
     output: list[HospitalPublicationTrial] = []
     for story_index, story in enumerate(HOSPITAL_STORIES):
         for traffic_seed in DEFAULT_HOSPITAL_TRAFFIC_SEEDS:
+            generation_attempt = HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS[
+                story_index
+            ][traffic_seed]
             output.append(
                 HospitalPublicationTrial(
                     ordinal=len(output),
@@ -475,7 +561,9 @@ def hospital_publication_trial_grid() -> tuple[HospitalPublicationTrial, ...]:
                     generator_seed=_derive_generator_seed(
                         story_index,
                         traffic_seed,
+                        generation_attempt,
                     ),
+                    generation_attempt=generation_attempt,
                 )
             )
     if len(output) != 100 or len({trial.case_id for trial in output}) != 100:
@@ -508,12 +596,20 @@ def get_hospital_publication_trial(
     if seed not in DEFAULT_HOSPITAL_TRAFFIC_SEEDS:
         raise ValueError("traffic_seed must be an integer from 0 through 19")
     story_index = HOSPITAL_STORIES.index(story)
+    generation_attempt = HOSPITAL_ACCEPTED_GENERATION_ATTEMPTS[
+        story_index
+    ][seed]
     return HospitalPublicationTrial(
         ordinal=story_index * len(DEFAULT_HOSPITAL_TRAFFIC_SEEDS) + seed,
         story_index=story_index,
         story_id=story.story_id,
         traffic_seed=seed,
-        generator_seed=_derive_generator_seed(story_index, seed),
+        generator_seed=_derive_generator_seed(
+            story_index,
+            seed,
+            generation_attempt,
+        ),
+        generation_attempt=generation_attempt,
     )
 
 
@@ -524,6 +620,71 @@ def build_hospital_story_scenario(
     config: HospitalConfig = DEFAULT_CONFIG,
     human_count: int = PUBLICATION_HUMAN_COUNT,
     environment: HospitalEnvironment | None = None,
+) -> HospitalStoryScenario:
+    """Build one story, caching the 100 strict publication worlds."""
+
+    if (
+        environment is None
+        and human_count == PUBLICATION_HUMAN_COUNT
+        and _scenario_construction_projection(config)
+        == _scenario_construction_projection(DEFAULT_CONFIG)
+    ):
+        canonical = _cached_canonical_hospital_story_scenario(
+            str(story_id),
+            traffic_seed,
+        )
+        return replace(canonical, config=config)
+    return _build_hospital_story_scenario_uncached(
+        story_id,
+        traffic_seed=traffic_seed,
+        config=config,
+        human_count=human_count,
+        environment=environment,
+    )
+
+
+def _scenario_construction_projection(
+    config: HospitalConfig,
+) -> tuple[object, ...]:
+    """Return fields that affect generated geometry or exact replay."""
+
+    return (
+        config.width,
+        config.height,
+        config.dt,
+        config.robot,
+        config.planner,
+        config.refuge,
+        config.safety.safety_margin,
+        config.safety.human_margin,
+        config.safety.stretcher_margin,
+        config.safety.static_margin,
+    )
+
+
+@lru_cache(maxsize=100)
+def _cached_canonical_hospital_story_scenario(
+    story_id: str,
+    traffic_seed: int,
+) -> HospitalStoryScenario:
+    """Validate one frozen plant world once per process."""
+
+    return _build_hospital_story_scenario_uncached(
+        story_id,
+        traffic_seed=traffic_seed,
+        config=DEFAULT_CONFIG,
+        human_count=PUBLICATION_HUMAN_COUNT,
+        environment=None,
+    )
+
+
+def _build_hospital_story_scenario_uncached(
+    story_id: str,
+    *,
+    traffic_seed: int,
+    config: HospitalConfig,
+    human_count: int,
+    environment: HospitalEnvironment | None,
 ) -> HospitalStoryScenario:
     """Build and validate one fixed story with seeded circular traffic.
 
@@ -558,22 +719,6 @@ def build_hospital_story_scenario(
         (start_room, goal_room),
         config,
     )
-    crowd = generate_hospital_crowd(
-        hospital,
-        config,
-        seed=trial.generator_seed,
-        ego_position=initial_state[:2],
-        goal_position=goal,
-        human_count=human_count,
-        ordinary_stretcher_count=0,
-        protected_points=protected_points,
-        protected_clearance=DEFAULT_PROTECTED_CLEARANCE,
-        existing_obstacles=blockers,
-        human_corridors=active_corridors,
-    )
-    if crowd.stretchers:
-        raise AssertionError("publication traffic must not generate stretchers")
-
     necessity_audit = (
         _cached_canonical_necessity_audit(template.story_id, config)
         if uses_canonical_environment
@@ -585,24 +730,115 @@ def build_hospital_story_scenario(
         )
     )
     necessity_audit.require_valid()
-    contract = validate_hospital_story_geometry(
-        template,
-        initial_state,
-        goal,
-        blockers,
-        crowd.humans,
-        hospital,
-        config,
-        necessity_audit=necessity_audit,
+    blocker_only_feasibility_audit = (
+        _cached_canonical_blocker_only_feasibility_audit(
+            template.story_id,
+            config,
+        )
+        if uses_canonical_environment
+        else validate_dynamic_refuge_feasibility(
+            story_id=template.story_id,
+            start_room_label=template.start_room,
+            goal_room_label=template.goal_room,
+            corridor_name=template.corridor_name,
+            nonroom_escape_interval_m=template.nonroom_escape_interval_m,
+            initial_state=initial_state,
+            goal=goal,
+            blockers=blockers,
+            humans=(),
+            environment=hospital,
+            config=config,
+        )
     )
-    contract.require_valid()
+    blocker_only_feasibility_audit.require_valid()
+
+    strict_publication_world = bool(
+        uses_canonical_environment and human_count == PUBLICATION_HUMAN_COUNT
+    )
+    attempts = (
+        (trial.generation_attempt,) if strict_publication_world else (0,)
+    )
+    crowd = None
+    contract = None
+    feasibility_audit = None
+    accepted_trial = trial
+    for generation_attempt in attempts:
+        generator_seed = _derive_generator_seed(
+            trial.story_index,
+            trial.traffic_seed,
+            generation_attempt,
+        )
+        candidate_crowd = generate_hospital_crowd(
+            hospital,
+            config,
+            seed=generator_seed,
+            ego_position=initial_state[:2],
+            goal_position=goal,
+            human_count=human_count,
+            ordinary_stretcher_count=0,
+            protected_points=protected_points,
+            protected_clearance=DEFAULT_PROTECTED_CLEARANCE,
+            existing_obstacles=blockers,
+            human_corridors=active_corridors,
+        )
+        if candidate_crowd.stretchers:
+            raise AssertionError(
+                "publication traffic must not generate stretchers"
+            )
+        candidate_contract = validate_hospital_story_geometry(
+            template,
+            initial_state,
+            goal,
+            blockers,
+            candidate_crowd.humans,
+            hospital,
+            config,
+            necessity_audit=necessity_audit,
+        )
+        candidate_contract.require_valid()
+        candidate_feasibility_audit = validate_dynamic_refuge_feasibility(
+            story_id=template.story_id,
+            start_room_label=template.start_room,
+            goal_room_label=template.goal_room,
+            corridor_name=template.corridor_name,
+            nonroom_escape_interval_m=template.nonroom_escape_interval_m,
+            initial_state=initial_state,
+            goal=goal,
+            blockers=blockers,
+            humans=candidate_crowd.humans,
+            environment=hospital,
+            config=config,
+        )
+        if strict_publication_world and not candidate_feasibility_audit.valid:
+            raise RuntimeError(
+                f"pinned publication world {trial.case_id!r} at generation "
+                f"attempt {trial.generation_attempt} failed its exact "
+                "dynamic-feasibility audit; protocol v4 never re-searches "
+                "at runtime"
+            )
+        crowd = candidate_crowd
+        contract = candidate_contract
+        feasibility_audit = candidate_feasibility_audit
+        accepted_trial = replace(
+            trial,
+            generator_seed=generator_seed,
+            generation_attempt=generation_attempt,
+        )
+        break
+    if crowd is None or contract is None or feasibility_audit is None:
+        raise RuntimeError(
+            f"story {template.story_id!r}/seed-{trial.traffic_seed} did not "
+            "produce a valid Hospital world"
+        )
+    if strict_publication_world:
+        feasibility_audit.require_valid()
     world_sha256 = hospital_story_world_sha256(
         initial_state,
         goal,
         (*blockers, *crowd.humans),
     )
     return HospitalStoryScenario(
-        trial=trial,
+        trial=accepted_trial,
         template=template,
         initial_state=initial_state,
         goal=goal,
@@ -611,6 +847,8 @@ def build_hospital_story_scenario(
         crowd_metadata=crowd.metadata,
         contract=contract,
         necessity_audit=necessity_audit,
+        blocker_only_feasibility_audit=blocker_only_feasibility_audit,
+        feasibility_audit=feasibility_audit,
         world_sha256=world_sha256,
         config=config,
         environment=hospital,
@@ -975,6 +1213,38 @@ def _cached_canonical_necessity_audit(
     )
 
 
+@lru_cache(maxsize=64)
+def _cached_canonical_blocker_only_feasibility_audit(
+    story_id: str,
+    config: HospitalConfig,
+) -> DynamicFeasibilityAudit:
+    """Replay the fixed story before any randomized traffic is admitted."""
+
+    template = get_hospital_story(story_id)
+    environment = build_hospital_environment()
+    rooms = _rooms_by_label(environment)
+    corridor = _require_key(
+        _corridors_by_name(environment),
+        template.corridor_name,
+        "corridor",
+    )
+    blockers = _build_fixed_blockers(template, corridor)
+    initial_state = np.r_[rooms[template.start_room].center, 0.0, 0.0]
+    return validate_dynamic_refuge_feasibility(
+        story_id=template.story_id,
+        start_room_label=template.start_room,
+        goal_room_label=template.goal_room,
+        corridor_name=template.corridor_name,
+        nonroom_escape_interval_m=template.nonroom_escape_interval_m,
+        initial_state=initial_state,
+        goal=rooms[template.goal_room].center,
+        blockers=blockers,
+        humans=(),
+        environment=environment,
+        config=config,
+    )
+
+
 def hospital_story_world_sha256(
     initial_state: Sequence[float],
     goal: Sequence[float],
@@ -1095,6 +1365,12 @@ def _protocol_payload() -> dict[str, object]:
         "traffic_seeds": list(DEFAULT_HOSPITAL_TRAFFIC_SEEDS),
         "human_count": PUBLICATION_HUMAN_COUNT,
         "ordinary_stretcher_count": 0,
+        "accepted_generation_attempt_manifest": (
+            hospital_accepted_generation_attempt_manifest()
+        ),
+        "accepted_generation_attempt_manifest_sha256": (
+            hospital_accepted_generation_attempt_manifest_sha256()
+        ),
         "traffic_generator": {
             "traffic_speed_cap_mps": TRAFFIC_SPEED_CAP,
             "human_speed_range_mps": list(HUMAN_SPEED_RANGE),
@@ -1106,6 +1382,38 @@ def _protocol_payload() -> dict[str, object]:
             "static_placement_margin_m": STATIC_PLACEMENT_MARGIN,
             "maximum_attempts_per_obstacle": (
                 MAX_PLACEMENT_ATTEMPTS_PER_OBSTACLE
+            ),
+        },
+        "dynamic_feasibility_conditioning": {
+            "schema": DYNAMIC_FEASIBILITY_SCHEMA,
+            "method_independent": True,
+            "witness_room_is_controller_input": False,
+            "witness_controls_are_controller_input": False,
+            "accepted_generation_attempt_recorded": True,
+            "strict_build_runtime_research": False,
+            "canonical_scenario_cache_size": 100,
+            "maximum_generation_attempts": (
+                MAX_DYNAMIC_FEASIBILITY_GENERATION_ATTEMPTS
+            ),
+            "minimum_room_entry_lead_s": MINIMUM_ROOM_ENTRY_LEAD_S,
+            "post_convoy_hold_buffer_s": POST_CONVOY_HOLD_BUFFER_S,
+            "minimum_operational_clearance_m": (
+                MINIMUM_OPERATIONAL_CLEARANCE_M
+            ),
+            "dynamic_substeps_per_plant_step": WITNESS_DYNAMIC_SUBSTEPS,
+            "maximum_witness_time_s": MAXIMUM_WITNESS_TIME_S,
+            "goal_tolerance_m": GOAL_TOLERANCE_M,
+            "witness_human_caution_clearance_m": (
+                WITNESS_HUMAN_CAUTION_CLEARANCE_M
+            ),
+            "witness_preferred_clearance_m": (
+                WITNESS_PREFERRED_CLEARANCE_M
+            ),
+            "nominal_jit_block_steps": WITNESS_NOMINAL_BLOCK_STEPS,
+            "exact_synchronized_dynamic_replay": True,
+            "clearance_approximation_used": False,
+            "post_convoy_departure_delays_s": list(
+                POST_CONVOY_DEPARTURE_DELAYS_S
             ),
         },
         "blocker_geometry": {
@@ -1152,13 +1460,24 @@ def _protocol_payload() -> dict[str, object]:
     }
 
 
-def _derive_generator_seed(story_index: int, traffic_seed: int) -> int:
+def _derive_generator_seed(
+    story_index: int,
+    traffic_seed: int,
+    generation_attempt: int = 0,
+) -> int:
+    if generation_attempt < 0:
+        raise ValueError("generation_attempt must be nonnegative")
+    entropy = [
+        HOSPITAL_STORY_SEED_NAMESPACE,
+        int(story_index),
+        int(traffic_seed),
+    ]
+    # Attempt zero intentionally retains the v3 generator seed.  Subsequent
+    # attempts occupy a disjoint, versioned deterministic namespace.
+    if generation_attempt:
+        entropy.extend((0x46454153, int(generation_attempt)))
     sequence = np.random.SeedSequence(
-        [
-            HOSPITAL_STORY_SEED_NAMESPACE,
-            int(story_index),
-            int(traffic_seed),
-        ]
+        entropy
     )
     return int(sequence.generate_state(1, dtype=np.uint32)[0])
 

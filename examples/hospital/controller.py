@@ -27,6 +27,7 @@ from .environment import HospitalEnvironment, Rect, Room
 from .jax_rollout import (
     DEFAULT_OBSTACLE_BUCKETS,
     HospitalJaxCapacities,
+    _device_tree,
     compiled_evaluator_cache_info,
     compiled_grouped_evaluator_cache_info,
     evaluate_policy_batch,
@@ -309,29 +310,6 @@ def _closest_point_on_rect(point: np.ndarray, rect: Rect) -> np.ndarray:
     )
 
 
-def _closest_rect_boundary(
-    point: np.ndarray,
-    rect: Rect,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    if not rect.contains(point):
-        closest = _closest_point_on_rect(point, rect)
-        distance = float(np.linalg.norm(point - closest))
-        outward = (
-            (point - closest) / distance
-            if distance > 1e-12
-            else np.zeros(2)
-        )
-        return closest, outward, distance
-    candidates = (
-        (np.array([rect.x, point[1]]), np.array([-1.0, 0.0]), point[0] - rect.x),
-        (np.array([rect.x1, point[1]]), np.array([1.0, 0.0]), rect.x1 - point[0]),
-        (np.array([point[0], rect.y]), np.array([0.0, -1.0]), point[1] - rect.y),
-        (np.array([point[0], rect.y1]), np.array([0.0, 1.0]), rect.y1 - point[1]),
-    )
-    closest, outward, distance = min(candidates, key=lambda item: item[2])
-    return closest, outward, float(distance)
-
-
 def static_hocbf_constraints(
     state: Sequence[float],
     environment: HospitalEnvironment,
@@ -351,10 +329,16 @@ def static_hocbf_constraints(
         distance = float(np.linalg.norm(position - closest))
         if distance <= activation:
             candidates.append((distance, f"wall-{index}", closest))
-    for index, floor in enumerate(environment.floor_rects):
-        closest, outward, distance = _closest_rect_boundary(position, floor)
-        probe = closest + outward * (safe_distance + 0.15)
-        if not environment.is_on_floor(probe) and distance <= activation:
+    for index, (start, end) in enumerate(
+        zip(
+            environment._floor_boundary_starts,
+            environment._floor_boundary_ends,
+            strict=True,
+        )
+    ):
+        closest = _closest_on_segment(position, start, end)
+        distance = float(np.linalg.norm(position - closest))
+        if distance <= activation:
             candidates.append((distance, f"floor-{index}", closest))
 
     output: list[HocbfConstraint] = []
@@ -590,30 +574,46 @@ class RoomPolicyProvider:
             return []
 
         path_radius = self.config.robot.radius + 0.06
-        direct_targets = np.asarray(
-            [
-                point
-                for _room, outside, door, inside in geometries
-                for point in (outside, door, inside)
-            ],
-            dtype=float,
-        )
-        direct_free = self.environment.segments_are_free(
-            np.repeat(start[None, :], len(direct_targets), axis=0),
-            direct_targets,
+        # Preserve the playground's door -> outside -> inside priority while
+        # avoiding three full collision-sampling queries for every room.  Most
+        # nearby rooms have a direct door line, so lower-priority reachability
+        # is evaluated only for the rooms that actually need it.
+        door_free = self.environment.segments_are_free(
+            np.repeat(start[None, :], len(geometries), axis=0),
+            np.asarray([item[2] for item in geometries], dtype=float),
             path_radius,
             step=0.65,
-        ).reshape(len(geometries), 3)
+        )
+        outside_free = np.zeros(len(geometries), dtype=bool)
+        outside_indices = np.flatnonzero(~door_free)
+        if outside_indices.size:
+            outside_free[outside_indices] = self.environment.segments_are_free(
+                np.repeat(start[None, :], outside_indices.size, axis=0),
+                np.asarray(
+                    [geometries[index][1] for index in outside_indices],
+                    dtype=float,
+                ),
+                path_radius,
+                step=0.65,
+            )
+        inside_free = np.zeros(len(geometries), dtype=bool)
+        inside_indices = np.flatnonzero(~door_free & ~outside_free)
+        if inside_indices.size:
+            inside_free[inside_indices] = self.environment.segments_are_free(
+                np.repeat(start[None, :], inside_indices.size, axis=0),
+                np.asarray(
+                    [geometries[index][3] for index in inside_indices],
+                    dtype=float,
+                ),
+                path_radius,
+                step=0.65,
+            )
 
         raw_candidates: list[tuple[Room, list[np.ndarray]]] = []
-        for (room, outside, door, inside), reachable in zip(
-            geometries,
-            direct_free,
-            strict=True,
-        ):
-            outside_reachable, door_reachable, entry_reachable = (
-                bool(value) for value in reachable
-            )
+        for index, (room, outside, door, inside) in enumerate(geometries):
+            outside_reachable = bool(outside_free[index])
+            door_reachable = bool(door_free[index])
+            entry_reachable = bool(inside_free[index])
             try:
                 if door_reachable:
                     raw_path = [door, inside]
@@ -700,8 +700,11 @@ class HospitalController:
             np.asarray(initial_state, dtype=float)[:2], self.goal
         )
         self.navigation_index = min(1, len(self.navigation_path) - 1)
-        self._jax_geometry = pack_static_geometry(environment)
-        self._jax_parameters = pack_parameters(config)
+        # Geometry and numerical parameters are immutable for the controller.
+        # Keep them device-resident instead of rebuilding/transferring the
+        # same JAX pytrees at every 60 ms decision.
+        self._jax_geometry = _device_tree(pack_static_geometry(environment))
+        self._jax_parameters = _device_tree(pack_parameters(config))
         maximum_obstacles = max(1, int(config.safety.max_obstacles))
         self._jax_obstacle_buckets = tuple(
             sorted(
@@ -1214,9 +1217,13 @@ class HospitalController:
             "nominal_prefix_safe": prefix_safe,
             "nominal_prefix_value": prefix_value,
             "rollout_diagnostics_available": diagnostics_available,
-            "terminal_cost": float(
-                np.linalg.norm(trajectory[-1, :2] - self.goal)
-                + 0.1 * np.linalg.norm(trajectory[-1, 2:4])
+            "terminal_cost": (
+                float(
+                    np.linalg.norm(trajectory[-1, :2] - self.goal)
+                    + 0.1 * np.linalg.norm(trajectory[-1, 2:4])
+                )
+                if diagnostics_available
+                else None
             ),
         }
         base_certificate = PolicyCertificate.from_cbf(
