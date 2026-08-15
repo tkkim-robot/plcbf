@@ -212,6 +212,33 @@ The full policy library is the publication default. The
 `--compact-policy-library` option is an explicit smoke/performance override,
 not the reporting configuration.
 
+## Final publication results
+
+The selected PL-CBF configuration achieves 86 successes on the complete
+100-world paired benchmark. Computation time is measured with one method per
+fresh process on the predeclared `main_eastbound/seed-0` publication world;
+the full policy library is retained and JAX warmup is excluded.
+
+| Method | Success | Collision | Timeout | Decisions | Mean [ms] | P95 [ms] | Max [ms] |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **PL-CBF** | **86%** | **12%** | **2%** | 1,082 | 23.898 | 30.332 | 37.221 |
+| Gatekeeper | 2% | 98% | 0% | 240 | 218.538 | 466.373 | 484.835 |
+| MPS | 1% | 99% | 0% | 240 | 53.155 | 72.458 | 88.528 |
+| Backup CBF | 0% | 87% | 13% | 1,155 | 68.466 | 92.186 | 167.058 |
+| Library-PCBF-MI | 0% | 100% | 0% | 234 | 23.101 | 29.173 | 33.377 |
+| MI-MPC | 0% | 100% | 0% | 234 | 425.623 | 1,118.886 | 1,163.340 |
+| Multi-Backup-CBF-MI | 0% | 100% | 0% | 240 | 540.188 | 851.672 | 1,002.096 |
+| PCBF | 0% | 100% | 0% | 243 | 11.709 | 14.175 | 14.896 |
+
+All isolated timing runs use the same world SHA-256
+`fef6f32b2eeb6f64bb21fa329c2735338be8d7ea417d75a0ee881e895da21394`.
+PL-CBF, PCBF, and Library-PCBF-MI have zero runtime JAX cache misses after
+warmup. MPS and Gatekeeper are the same NumPy committed-trajectory shields
+used by the NL-Quad3D and warehouse studies; neither invokes JAX. Hospital MPS
+evaluates a 67-step backup with swept crowded-map geometry, while Gatekeeper
+may test all 31 nominal-prefix lengths, so their cost is algorithmic rather
+than a recompilation artifact.
+
 ## Interpreting the report
 
 Task outcomes are exclusively success (the robot reaches its goal without a

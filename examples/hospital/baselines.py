@@ -202,6 +202,7 @@ class HospitalBaselineSuite:
             int(round(algorithm_config.backup_horizon_s / config.dt)),
         )
         self._retrace_rollout_index = 0
+        self._fixed_backup_rollout_policy: HospitalPolicy | None = None
         self.last_mi_mpc_result: BigMTrajectoryMPCResult | None = None
         self.last_plcbf_result: ControllerResult | None = None
         common = dict(
@@ -236,8 +237,11 @@ class HospitalBaselineSuite:
         )
 
     def _fixed_backup_feedback(self, state: np.ndarray) -> np.ndarray:
+        policy = self._fixed_backup_rollout_policy
+        if policy is None:
+            policy = self.fixed_backup_policy(state)
         control, self._retrace_rollout_index = (
-            self.fixed_backup_policy(state).control_with_cursor(
+            policy.control_with_cursor(
                 state,
                 self.config,
                 self._retrace_rollout_index,
@@ -1189,6 +1193,7 @@ class HospitalBaselineSuite:
         nominal_array = np.asarray(nominal, dtype=float).reshape(2)
         self._obstacles = tuple(obstacles)
         self._reset_prediction_cache()
+        self._fixed_backup_rollout_policy = None
         self._target = self.controller.navigation_path[
             self.controller.navigation_index
         ].copy()
@@ -1248,10 +1253,12 @@ class HospitalBaselineSuite:
                 emergency_control=self._terminal_stop_feedback(value),
             )
         if parsed is BenchmarkMethod.MPS:
+            self._fixed_backup_rollout_policy = self.fixed_backup_policy(value)
             return self._shield_baseline_decision(
                 parsed, self.mps.solve(value), nominal_array
             )
         if parsed is BenchmarkMethod.GATEKEEPER:
+            self._fixed_backup_rollout_policy = self.fixed_backup_policy(value)
             return self._shield_baseline_decision(
                 parsed, self.gatekeeper.solve(value), nominal_array
             )

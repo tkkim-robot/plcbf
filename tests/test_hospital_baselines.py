@@ -693,6 +693,35 @@ def test_mps_and_gatekeeper_reset_retrace_before_each_candidate() -> None:
         assert suite._retrace_rollout_index > 0
 
 
+@pytest.mark.parametrize(
+    "method",
+    [BenchmarkMethod.MPS, BenchmarkMethod.GATEKEEPER],
+)
+def test_shields_build_fixed_retrace_policy_once_per_decision(
+    method: BenchmarkMethod,
+    monkeypatch,
+) -> None:
+    simulation, suite = _short_suite()
+    state = simulation.state.copy()
+    nominal = _nominal(simulation)
+    original = suite.fixed_backup_policy
+    calls = 0
+
+    def counted_fixed_backup_policy(value=None):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(
+        suite,
+        "fixed_backup_policy",
+        counted_fixed_backup_policy,
+    )
+    suite.solve(method, state, (), nominal)
+
+    assert calls == 1
+
+
 def test_pcbf_backup_cbf_mps_and_gatekeeper_execute_retrace_only() -> None:
     simulation, suite = _short_suite()
     state = simulation.state.copy()
