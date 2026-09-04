@@ -18,7 +18,12 @@ from examples.hospital.controller import (
     sensed_obstacles,
     static_hocbf_constraints,
 )
+from examples.hospital.dynamics import (
+    step_double_integrator,
+    waypoint_control,
+)
 from examples.hospital.obstacles import Human
+from examples.hospital.policies import rollout_policy
 from examples.hospital.simulation import build_blocked_main_hall_scenario
 from plcbf.policy_library import CBFHalfspace, PolicyCertificate
 
@@ -49,6 +54,43 @@ def test_controller_has_no_latched_refuge_executor() -> None:
     assert len(policies) == 13
     assert not hasattr(controller, "_cached_certificates")
     assert "certificate_update_period" not in source
+
+
+def test_default_policy_library_uses_one_certificate_horizon() -> None:
+    simulation = build_blocked_main_hall_scenario(3)
+    policies = simulation.controller.candidate_policies(simulation.state)
+
+    assert {policy.horizon for policy in policies} == {
+        simulation.config.policies.room_horizon
+    }
+
+
+def test_room_rollout_cursor_reaches_and_holds_the_terminal_room() -> None:
+    simulation = build_blocked_main_hall_scenario(3)
+    room_policy = next(
+        policy
+        for policy in simulation.controller.candidate_policies(
+            simulation.state
+        )
+        if policy.kind == "room" and policy.target_room.label == "Ward 44"
+    )
+
+    trajectory = rollout_policy(
+        room_policy,
+        simulation.state,
+        simulation.config,
+    )
+    terminal = trajectory[-1]
+
+    assert len(trajectory) == int(
+        room_policy.horizon / room_policy.rollout_dt
+    ) + 1
+    assert room_policy.target_room.interior_margin(terminal[:2]) >= (
+        simulation.config.refuge.terminal_interior_margin
+    )
+    assert np.linalg.norm(terminal[2:]) <= (
+        simulation.config.refuge.terminal_speed_max
+    )
 
 
 def test_complete_library_is_never_gated_by_obstacle_or_phase() -> None:
@@ -220,6 +262,226 @@ def test_current_room_policy_is_omitted_without_changing_nominal_route() -> None
     }
 
 
+def test_nominal_route_from_room_uses_playground_door_centerline() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    nurse = next(
+        room for room in simulation.environment.rooms if room.label == "Nurse"
+    )
+    state = np.r_[nurse.center, np.zeros(2)]
+    controller = HospitalController(
+        simulation.environment,
+        simulation.planner,
+        simulation.config,
+        state,
+        simulation.goal,
+    )
+    center, inside, door, outside = controller._room_exit_route(nurse)
+
+    np.testing.assert_allclose(controller.navigation_path[:4], [
+        state[:2],
+        inside,
+        door,
+        outside,
+    ])
+    np.testing.assert_allclose(center, nurse.center)
+    route_radius = simulation.config.robot.radius + 0.08
+    assert all(
+        simulation.environment.segment_is_free(
+            start,
+            end,
+            route_radius,
+            step=0.55,
+        )
+        for start, end in zip(
+            controller.navigation_path[:3],
+            controller.navigation_path[1:4],
+            strict=True,
+        )
+    )
+    # The centerline points prevent a diagonal shortcut through the wall.
+    assert nurse.contains(inside)
+    assert np.linalg.norm(door - nurse.door.center) < 1e-9
+    assert not nurse.contains(outside, margin=-0.05)
+
+
+def test_unscheduled_room_entry_repairs_stale_nominal_route_once() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    controller = simulation.controller
+    nurse = next(
+        room for room in simulation.environment.rooms if room.label == "Nurse"
+    )
+    diverted_position = nurse.center + np.array([0.8, 0.0])
+    diverted_state = np.r_[diverted_position, np.zeros(2)]
+    stale_path = [point.copy() for point in controller.navigation_path]
+    stale_remaining = [
+        point.copy()
+        for point in stale_path[controller.navigation_index :]
+    ]
+
+    assert controller._ensure_room_exit_waypoints(diverted_state)
+    assert not all(
+        np.array_equal(left, right)
+        for left, right in zip(
+            controller.navigation_path,
+            stale_path,
+            strict=False,
+        )
+    )
+    center, inside, door, outside = controller._room_exit_route(nurse)
+    np.testing.assert_allclose(
+        controller.navigation_path[:5],
+        [diverted_state[:2], center, inside, door, outside],
+    )
+    # The geometric insertion rejoins and preserves the previously unvisited
+    # nominal suffix rather than discarding it in a fresh goal replan.
+    suffix_start = next(
+        index
+        for index, point in enumerate(controller.navigation_path)
+        if np.linalg.norm(point - stale_remaining[0]) <= 0.35
+    )
+    np.testing.assert_allclose(
+        controller.navigation_path[
+            suffix_start : suffix_start + len(stale_remaining)
+        ],
+        stale_remaining,
+    )
+    path_after_repair = [point.copy() for point in controller.navigation_path]
+    assert not controller._ensure_room_exit_waypoints(diverted_state)
+    assert all(
+        np.array_equal(left, right)
+        for left, right in zip(
+            controller.navigation_path,
+            path_after_repair,
+            strict=True,
+        )
+    )
+
+
+def test_repaired_nominal_route_exits_room_and_resumes_preserved_suffix() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    controller = simulation.controller
+    nurse = next(
+        room for room in simulation.environment.rooms if room.label == "Nurse"
+    )
+    state = np.r_[nurse.center + np.array([2.0, 3.0]), np.zeros(2)]
+    stale_target = controller.navigation_path[controller.navigation_index].copy()
+
+    assert controller._ensure_room_exit_waypoints(state)
+    np.testing.assert_allclose(controller._navigation_target(state), nurse.center)
+
+    exited = False
+    for _ in range(250):
+        target = controller._navigation_target(state)
+        nominal = waypoint_control(
+            state,
+            target,
+            simulation.config.robot,
+            simulation.config.policies.nominal_target_speed,
+        )
+        state = step_double_integrator(
+            state,
+            nominal,
+            simulation.config.dt,
+            simulation.config.robot,
+        )
+        exited |= not nurse.contains(state[:2])
+
+    assert exited
+    assert any(
+        np.linalg.norm(point - stale_target) <= 0.35
+        for point in controller.navigation_path
+    )
+    assert controller.navigation_index >= 5
+
+
+def test_goal_room_does_not_trigger_exit_route_repair() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    nurse = next(
+        room for room in simulation.environment.rooms if room.label == "Nurse"
+    )
+    state = np.r_[nurse.center, np.zeros(2)]
+    controller = HospitalController(
+        simulation.environment,
+        simulation.planner,
+        simulation.config,
+        state,
+        nurse.center,
+    )
+    original_path = [point.copy() for point in controller.navigation_path]
+
+    assert not controller._ensure_room_exit_waypoints(state)
+    assert all(
+        np.array_equal(left, right)
+        for left, right in zip(
+            controller.navigation_path,
+            original_path,
+            strict=True,
+        )
+    )
+
+
+def test_room_exit_repair_has_only_geometry_state_input() -> None:
+    signature = inspect.signature(HospitalController._ensure_room_exit_waypoints)
+    assert tuple(signature.parameters) == ("self", "state")
+    source = inspect.getsource(HospitalController._ensure_room_exit_waypoints)
+    for forbidden in (
+        "obstacles",
+        "blocker",
+        "selected_policy",
+        "time_seconds",
+        "hold_time",
+        "release_guard",
+    ):
+        assert forbidden not in source
+
+
+def test_jax_warmup_preserves_navigation_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    controller = simulation.controller
+    nurse = next(
+        room for room in simulation.environment.rooms if room.label == "Nurse"
+    )
+    diverted_state = np.r_[nurse.center + np.array([2.0, 3.0]), np.zeros(2)]
+    original_path = [point.copy() for point in controller.navigation_path]
+    original_index = controller.navigation_index
+    original_goal = controller.goal.copy()
+    warmed_buckets: list[int] = []
+
+    def record_warmup(
+        _state,
+        _nominal,
+        policies,
+        obstacles,
+        _geometry,
+        _parameters,
+        *,
+        include_diagnostics,
+    ) -> None:
+        assert policies.active_count > 0
+        assert not include_diagnostics
+        warmed_buckets.append(int(obstacles.active.shape[0]))
+
+    monkeypatch.setattr(
+        controller_module,
+        "warmup_policy_groups",
+        record_warmup,
+    )
+    controller.warmup_certificate_oracle(diverted_state)
+
+    assert warmed_buckets == list(controller._jax_obstacle_buckets)
+    assert controller.navigation_index == original_index
+    np.testing.assert_allclose(controller.goal, original_goal)
+    assert len(controller.navigation_path) == len(original_path)
+    for actual, expected in zip(
+        controller.navigation_path,
+        original_path,
+        strict=True,
+    ):
+        np.testing.assert_allclose(actual, expected)
+
+
 def test_dense_scene_controller_uses_only_nearest_sensed_limit() -> None:
     simulation = build_blocked_main_hall_scenario(2)
     state = simulation.state
@@ -303,6 +565,36 @@ def test_static_hocbf_matches_playground_near_wall_selection() -> None:
     assert constraints
     assert len(constraints) <= DEFAULT_CONFIG.safety.max_static_hocbf_constraints
     assert all(item.obstacle_id.startswith(("wall-", "floor-")) for item in constraints)
+
+
+def test_static_hocbf_floor_rows_reference_true_union_boundary_segments() -> None:
+    simulation = build_blocked_main_hall_scenario(2)
+    # This room/corridor overlap previously emitted a fictitious row at the
+    # internal edge [12, 15].
+    position = np.array([12.0, 13.86956522])
+    constraints = static_hocbf_constraints(
+        np.r_[position, 0.0, 0.0],
+        simulation.environment,
+        simulation.config,
+    )
+    floor_rows = [
+        item for item in constraints if item.obstacle_id.startswith("floor-")
+    ]
+    assert floor_rows
+    for row in floor_rows:
+        index = int(row.obstacle_id.removeprefix("floor-"))
+        start = simulation.environment._floor_boundary_starts[index]
+        end = simulation.environment._floor_boundary_ends[index]
+        segment = end - start
+        fraction = np.clip(
+            np.dot(position - start, segment) / np.dot(segment, segment),
+            0.0,
+            1.0,
+        )
+        expected_closest = start + fraction * segment
+        inferred_closest = position - 0.5 * row.a
+        np.testing.assert_allclose(inferred_closest, expected_closest)
+        assert np.linalg.norm(inferred_closest - np.array([12.0, 15.0])) > 1e-6
 
 
 @pytest.mark.parametrize(

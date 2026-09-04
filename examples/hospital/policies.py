@@ -67,6 +67,79 @@ class HospitalPolicy:
     waypoints: list[np.ndarray] = field(default_factory=list)
     target_room: Room | None = None
     max_rollout_distance: float | None = None
+    feedback_gain: float | None = None
+
+    def control_with_cursor(
+        self,
+        state: Sequence[float],
+        config: HospitalConfig,
+        waypoint_index: int,
+    ) -> tuple[np.ndarray, int]:
+        """Evaluate a waypoint policy with one rollout-local cursor.
+
+        The cursor belongs to one independently simulated backup rollout.  It
+        is returned to the caller rather than stored on the policy, so finite
+        differences and competing MPS/Gatekeeper candidates cannot leak
+        waypoint progress into one another.  It is numerical rollout state,
+        not a persistent controller mode or refuge state machine.
+        """
+
+        if self.kind not in {"nominal", "room", "retrace"} or not self.waypoints:
+            return self.control(state, config), int(waypoint_index)
+        value = np.asarray(state, dtype=float)
+        index = int(np.clip(waypoint_index, 0, len(self.waypoints) - 1))
+        target = self.waypoints[index]
+        distance = float(np.linalg.norm(target - value[:2]))
+        if self.kind in {"nominal", "room"}:
+            radius = (
+                ROOM_APPROACH_RADIUS
+                if self.kind == "room" and index == 0
+                else ROOM_WAYPOINT_RADIUS
+                if self.kind == "room"
+                else NOMINAL_WAYPOINT_RADIUS
+            )
+            if distance < radius and index + 1 < len(self.waypoints):
+                index += 1
+                target = self.waypoints[index]
+            return (
+                waypoint_control(
+                    value,
+                    target,
+                    config.robot,
+                    self.target_speed,
+                ),
+                index,
+            )
+
+        if (
+            distance < RETRACE_WAYPOINT_RADIUS
+            and index + 1 < len(self.waypoints)
+        ):
+            index += 1
+            target = self.waypoints[index]
+            distance = float(np.linalg.norm(target - value[:2]))
+
+        direction = (target - value[:2]) / (distance + 1e-6)
+        braking_speed = np.sqrt(
+            2.0 * config.robot.a_max * max(distance, 0.0)
+        )
+        desired_speed = min(
+            self.target_speed,
+            braking_speed,
+            config.robot.v_max,
+        )
+        desired_velocity = direction * desired_speed
+        gain = (
+            config.robot.k_velocity
+            if self.feedback_gain is None
+            else float(self.feedback_gain)
+        )
+        control = np.clip(
+            gain * (desired_velocity - value[2:4]),
+            -config.robot.a_max,
+            config.robot.a_max,
+        )
+        return control, index
 
     def control(
         self,
@@ -75,24 +148,8 @@ class HospitalPolicy:
     ) -> np.ndarray:
         value = np.asarray(state, dtype=float)
         if self.kind in {"nominal", "room", "retrace"} and self.waypoints:
-            target = self.waypoints[-1]
-            for index, waypoint in enumerate(self.waypoints):
-                if self.kind == "room":
-                    radius = (
-                        ROOM_APPROACH_RADIUS
-                        if index == 0
-                        else ROOM_WAYPOINT_RADIUS
-                    )
-                elif self.kind == "retrace":
-                    radius = RETRACE_WAYPOINT_RADIUS
-                else:
-                    radius = NOMINAL_WAYPOINT_RADIUS
-                if np.linalg.norm(waypoint - value[:2]) > radius:
-                    target = waypoint
-                    break
-            return waypoint_control(
-                value, target, config.robot, self.target_speed
-            )
+            control, _ = self.control_with_cursor(value, config, 0)
+            return control
         if self.kind == "stop":
             return np.clip(
                 -config.policies.stop_gain * value[2:4],
@@ -127,9 +184,17 @@ def rollout_policy(
     steps = max(1, int(policy.horizon / policy.rollout_dt))
     origin = np.asarray(state, dtype=float)
     trajectory = [origin.copy()]
+    waypoint_index = 0
     for _ in range(steps):
         current = trajectory[-1]
-        control = policy.control(current, config)
+        if policy.kind in {"nominal", "room", "retrace"}:
+            control, waypoint_index = policy.control_with_cursor(
+                current,
+                config,
+                waypoint_index,
+            )
+        else:
+            control = policy.control(current, config)
         following = step_double_integrator(
             current, control, policy.rollout_dt, config.robot
         )
@@ -140,14 +205,6 @@ def rollout_policy(
         ):
             break
         trajectory.append(following)
-        if (
-            policy.kind == "room"
-            and policy.target_room is not None
-            and policy.target_room.contains(following[:2])
-            and policy.target_room.interior_margin(following[:2])
-            >= config.refuge.terminal_interior_margin
-        ):
-            break
     return np.asarray(trajectory)
 
 
@@ -289,6 +346,7 @@ def build_policy_library(
         )
     ]
     count = config.policies.num_angle_policies
+    angle_candidates: list[tuple[int, float, np.ndarray]] = []
     for index in range(count):
         offset = (
             0.0
@@ -302,12 +360,23 @@ def build_policy_library(
         )
         if any(room.contains(preview) for room in environment.rooms):
             continue
-        if not environment.segment_is_free(
-            value[:2],
-            preview,
+        angle_candidates.append((index, angle, preview))
+    angle_free = (
+        environment.segments_are_free(
+            np.repeat(value[None, :2], len(angle_candidates), axis=0),
+            np.asarray([item[2] for item in angle_candidates]),
             config.robot.radius + config.safety.static_margin,
             step=0.65,
-        ):
+        )
+        if angle_candidates
+        else np.zeros(0, dtype=bool)
+    )
+    for (index, angle, _preview), is_free in zip(
+        angle_candidates,
+        angle_free,
+        strict=True,
+    ):
+        if not is_free:
             continue
         policies.append(
             HospitalPolicy(
@@ -323,18 +392,51 @@ def build_policy_library(
 
     reverse_count = max(0, config.policies.num_reverse_policies)
     reverse_preview = config.policies.reverse_preview_distance
+    reverse_candidates: list[tuple[str, float, np.ndarray]] = []
 
-    def add_reverse(name: str, angle: float) -> None:
+    def queue_reverse(name: str, angle: float) -> None:
         preview = value[:2] - reverse_preview * np.array(
             [cos(angle), sin(angle)]
         )
-        if not environment.segment_is_free(
-            value[:2],
-            preview,
+        reverse_candidates.append((name, angle, preview))
+
+    for index in range(reverse_count):
+        offset = (
+            0.0
+            if reverse_count <= 1
+            else -0.5 * config.policies.reverse_policy_arc
+            + index
+            * config.policies.reverse_policy_arc
+            / (reverse_count - 1)
+        )
+        queue_reverse(f"reverse_{index}", route_angle + offset)
+
+    speed = float(np.linalg.norm(value[2:4]))
+    body_reverse_angle = atan2(value[3], value[2]) if speed > 1e-6 else 0.0
+    if (
+        config.policies.body_reverse_policy
+        and abs(_angle_normalize(body_reverse_angle - route_angle))
+        >= config.policies.body_reverse_min_angle
+    ):
+        queue_reverse("reverse_body", body_reverse_angle)
+
+    reverse_free = (
+        environment.segments_are_free(
+            np.repeat(value[None, :2], len(reverse_candidates), axis=0),
+            np.asarray([item[2] for item in reverse_candidates]),
             config.robot.radius + config.safety.static_margin,
             step=0.65,
-        ):
-            return
+        )
+        if reverse_candidates
+        else np.zeros(0, dtype=bool)
+    )
+    for (name, angle, _preview), is_free in zip(
+        reverse_candidates,
+        reverse_free,
+        strict=True,
+    ):
+        if not is_free:
+            continue
         policies.append(
             HospitalPolicy(
                 name,
@@ -346,26 +448,6 @@ def build_policy_library(
                 max_rollout_distance=config.robot.sensing_range,
             )
         )
-
-    for index in range(reverse_count):
-        offset = (
-            0.0
-            if reverse_count <= 1
-            else -0.5 * config.policies.reverse_policy_arc
-            + index
-            * config.policies.reverse_policy_arc
-            / (reverse_count - 1)
-        )
-        add_reverse(f"reverse_{index}", route_angle + offset)
-
-    speed = float(np.linalg.norm(value[2:4]))
-    body_reverse_angle = atan2(value[3], value[2]) if speed > 1e-6 else 0.0
-    if (
-        config.policies.body_reverse_policy
-        and abs(_angle_normalize(body_reverse_angle - route_angle))
-        >= config.policies.body_reverse_min_angle
-    ):
-        add_reverse("reverse_body", body_reverse_angle)
 
     policies.append(
         HospitalPolicy(

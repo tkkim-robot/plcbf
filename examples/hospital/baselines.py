@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import cos, sin
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -43,11 +43,35 @@ from plcbf.trajectory_shielding import (
 )
 
 from .config import HospitalConfig
-from .controller import HospitalController
+from .controller import ControllerResult, HospitalController
 from .dynamics import step_double_integrator
 from .environment import HospitalEnvironment
 from .obstacles import DynamicObstacle, Human, Stretcher, obstacle_clearance
 from .policies import HospitalPolicy
+
+
+class _PreparedModelPredictiveShield(ModelPredictiveShield):
+    """Reset the fixed retrace cursor before each independent candidate."""
+
+    def __init__(self, *, prepare_backup_rollout: Callable[[], None], **kwargs):
+        self._prepare_backup_rollout = prepare_backup_rollout
+        super().__init__(**kwargs)
+
+    def _candidate(self, initial_state, nominal_steps):
+        self._prepare_backup_rollout()
+        return super()._candidate(initial_state, nominal_steps)
+
+
+class _PreparedGatekeeperShield(GatekeeperShield):
+    """Reset the fixed retrace cursor before each independent candidate."""
+
+    def __init__(self, *, prepare_backup_rollout: Callable[[], None], **kwargs):
+        self._prepare_backup_rollout = prepare_backup_rollout
+        super().__init__(**kwargs)
+
+    def _candidate(self, initial_state, nominal_steps):
+        self._prepare_backup_rollout()
+        return super()._candidate(initial_state, nominal_steps)
 
 
 @dataclass(frozen=True)
@@ -79,6 +103,7 @@ class HospitalBaselineConfig:
     trajectory_swept_substeps: int = 4
     fixed_backup_policy_id: str = "retrace_waypoint"
     fixed_backup_target_speed_mps: float = 2.8
+    fixed_backup_gain: float = 6.0
     mi_position_tube_m: float = 3.0
     mi_control_tube_mps2: float = 6.0
     mi_control_tube_steps: int = 2
@@ -113,6 +138,8 @@ class HospitalBaselineConfig:
             raise ValueError(
                 "fixed_backup_target_speed_mps must be positive"
             )
+        if self.fixed_backup_gain <= 0.0:
+            raise ValueError("fixed_backup_gain must be positive")
         if self.mi_position_tube_m < 0.0:
             raise ValueError("mi_position_tube_m must be nonnegative")
         if self.mi_control_tube_mps2 < 0.0:
@@ -172,9 +199,12 @@ class HospitalBaselineSuite:
         self._batch_human_radii = np.empty(0, dtype=float)
         self._backup_steps = max(
             1,
-            int(algorithm_config.backup_horizon_s / config.dt),
+            int(round(algorithm_config.backup_horizon_s / config.dt)),
         )
+        self._retrace_rollout_index = 0
+        self._fixed_backup_rollout_policy: HospitalPolicy | None = None
         self.last_mi_mpc_result: BigMTrajectoryMPCResult | None = None
+        self.last_plcbf_result: ControllerResult | None = None
         common = dict(
             step=self._plant_step,
             nominal_control=self._nominal_feedback,
@@ -182,9 +212,10 @@ class HospitalBaselineSuite:
             trajectory_is_safe=self._trajectory_is_safe,
             backup_horizon_steps=self._backup_steps,
             backup_policy_id=algorithm_config.fixed_backup_policy_id,
+            prepare_backup_rollout=self._prepare_retrace_rollout,
         )
-        self.mps = ModelPredictiveShield(**common)
-        self.gatekeeper = GatekeeperShield(
+        self.mps = _PreparedModelPredictiveShield(**common)
+        self.gatekeeper = _PreparedGatekeeperShield(
             **common,
             nominal_horizon_steps=algorithm_config.gatekeeper_nominal_steps,
             horizon_discount_steps=algorithm_config.gatekeeper_discount_steps,
@@ -206,10 +237,22 @@ class HospitalBaselineSuite:
         )
 
     def _fixed_backup_feedback(self, state: np.ndarray) -> np.ndarray:
-        return self.fixed_backup_policy(state).control(
-            state,
-            self.config,
+        policy = self._fixed_backup_rollout_policy
+        if policy is None:
+            policy = self.fixed_backup_policy(state)
+        control, self._retrace_rollout_index = (
+            policy.control_with_cursor(
+                state,
+                self.config,
+                self._retrace_rollout_index,
+            )
         )
+        return control
+
+    def _prepare_retrace_rollout(self) -> None:
+        """Start one independently tested retrace rollout at its first target."""
+
+        self._retrace_rollout_index = 0
 
     def _terminal_stop_feedback(self, state: np.ndarray) -> np.ndarray:
         limit = self.config.robot.a_max
@@ -251,6 +294,7 @@ class HospitalBaselineSuite:
                 self.config.robot.v_max,
             ),
             waypoints=retrace_waypoints,
+            feedback_gain=self.algorithm_config.fixed_backup_gain,
         )
 
     def mi_mpc_policies(
@@ -783,12 +827,22 @@ class HospitalBaselineSuite:
         )
         state = np.asarray(initial_state, dtype=float).copy()
         states = [state.copy()]
+        waypoint_index = 0
         for step_index in range(1, state_count):
-            control = (
-                policy.control(state, self.config)
-                if step_index <= maneuver_steps
-                else self._terminal_stop_feedback(state)
-            )
+            if step_index > maneuver_steps:
+                control = self._terminal_stop_feedback(state)
+            elif policy.kind in {"nominal", "room", "retrace"}:
+                # This cursor belongs only to this hypothetical backup
+                # rollout.  It is neither stored on the policy nor carried
+                # across controller decisions, so it cannot create a latched
+                # room/refuge mode.
+                control, waypoint_index = policy.control_with_cursor(
+                    state,
+                    self.config,
+                    waypoint_index,
+                )
+            else:
+                control = policy.control(state, self.config)
             state = self._plant_step(state, control)
             states.append(state.copy())
         return np.asarray(states)
@@ -899,10 +953,21 @@ class HospitalBaselineSuite:
         current = np.asarray(state, dtype=float).reshape(4).copy()
         states = [current.copy()]
         controls = []
+        waypoint_index = 0
         for step_index in range(self._backup_steps):
-            control = np.asarray(
-                policy.control(current, self.config), dtype=float
-            ).reshape(2)
+            if policy.kind in {"nominal", "room", "retrace"}:
+                # MI-MPC branch geometry must use the same rollout-local
+                # feedback realization as the scalar and JAX certificates.
+                # Reinitializing this index on every simulated step would keep
+                # a multi-waypoint room branch pinned to its first waypoint.
+                control, waypoint_index = policy.control_with_cursor(
+                    current,
+                    self.config,
+                    waypoint_index,
+                )
+            else:
+                control = policy.control(current, self.config)
+            control = np.asarray(control, dtype=float).reshape(2)
             current = self._plant_step(current, control)
             controls.append(control.copy())
             states.append(current.copy())
@@ -981,9 +1046,12 @@ class HospitalBaselineSuite:
             ]
         )
         fallback_index = int(np.argmax(branch_safety))
-        fallback = policy_tuple[fallback_index].control(
-            state,
-            self.config,
+        fallback = np.clip(
+            0.75
+            * policy_tuple[fallback_index].control(state, self.config)
+            + 0.25 * np.asarray(nominal, dtype=float),
+            -self.config.robot.a_max,
+            self.config.robot.a_max,
         )
         return (
             BigMTrajectoryMPCProblem(
@@ -1125,6 +1193,7 @@ class HospitalBaselineSuite:
         nominal_array = np.asarray(nominal, dtype=float).reshape(2)
         self._obstacles = tuple(obstacles)
         self._reset_prediction_cache()
+        self._fixed_backup_rollout_policy = None
         self._target = self.controller.navigation_path[
             self.controller.navigation_index
         ].copy()
@@ -1143,15 +1212,23 @@ class HospitalBaselineSuite:
             )
         if parsed is BenchmarkMethod.PLCBF:
             result = self.controller.compute(
-                value, self._obstacles, float(time_seconds)
+                value,
+                self._obstacles,
+                float(time_seconds),
+                obstacles_are_sensed=True,
+                include_rollout_diagnostics=False,
             )
+            self.last_plcbf_result = result
             delta = result.control - nominal_array
             used_fallback = result.decision.diagnostics.used_fallback
             return BaselineDecision(
                 method=parsed.value,
                 control=result.control,
                 policy_id=result.selected_policy,
-                feasible=bool(result.feasible and not used_fallback),
+                # Numerical fallback use and safety-QP feasibility are
+                # independent diagnostics.  A feasible HOCBF-filtered backup
+                # remains feasible even when the PL selector needed fallback.
+                feasible=bool(result.feasible),
                 status=(
                     "fallback:"
                     + str(
@@ -1176,10 +1253,12 @@ class HospitalBaselineSuite:
                 emergency_control=self._terminal_stop_feedback(value),
             )
         if parsed is BenchmarkMethod.MPS:
+            self._fixed_backup_rollout_policy = self.fixed_backup_policy(value)
             return self._shield_baseline_decision(
                 parsed, self.mps.solve(value), nominal_array
             )
         if parsed is BenchmarkMethod.GATEKEEPER:
+            self._fixed_backup_rollout_policy = self.fixed_backup_policy(value)
             return self._shield_baseline_decision(
                 parsed, self.gatekeeper.solve(value), nominal_array
             )

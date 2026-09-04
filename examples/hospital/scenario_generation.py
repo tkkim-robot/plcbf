@@ -108,14 +108,18 @@ def generate_hospital_crowd(
     protected_points: Sequence[Sequence[float]] = (),
     protected_clearance: float = DEFAULT_PROTECTED_CLEARANCE,
     existing_obstacles: Sequence[DynamicObstacle] = (),
+    human_corridors: Sequence[Rect] | None = None,
 ) -> GeneratedHospitalCrowd:
     """Generate non-overlapping dynamic hospital traffic from ``seed``.
 
-    Humans are sampled throughout the traversable corridor union.  Ordinary
-    stretchers are placed on reflecting, corridor-aligned routes outside the
-    main corridor so the strict benchmark can layer its guaranteed convoy
-    there.  ``ego_position``, ``goal_position``, and any additional protected
-    points retain the requested obstacle-to-robot clearance.
+    Humans are sampled throughout the traversable corridor union by default.
+    ``human_corridors`` can restrict that sampling to a fixed,
+    method-independent subset (for example, the corridor and junctions
+    involved in a publication story). Ordinary stretchers are placed on
+    reflecting, corridor-aligned routes outside the main corridor so the
+    strict benchmark can layer its guaranteed convoy there. ``ego_position``,
+    ``goal_position``, and any additional protected points retain the requested
+    obstacle-to-robot clearance.
     ``existing_obstacles`` lets callers place the guaranteed convoy first;
     generated traffic will then also be separated from those blockers.
     """
@@ -187,21 +191,29 @@ def generate_hospital_crowd(
         obstacles.append(accepted)
 
     humans: list[Human] = []
-    human_corridors, human_probabilities = _weighted_human_corridors(
+    requested_human_corridors = (
         environment.corridor_rects
+        if human_corridors is None
+        else tuple(human_corridors)
     )
-    if human_count and not human_corridors:
+    sampled_human_corridors, human_probabilities = _weighted_human_corridors(
+        requested_human_corridors
+    )
+    if human_count and not sampled_human_corridors:
         raise RuntimeError("hospital has no corridor that can contain a human")
     for index in range(human_count):
         accepted_human: Human | None = None
         for _ in range(MAX_PLACEMENT_ATTEMPTS_PER_OBSTACLE):
             attempts += 1
             corridor_index = int(
-                rng.choice(len(human_corridors), p=human_probabilities)
+                rng.choice(
+                    len(sampled_human_corridors),
+                    p=human_probabilities,
+                )
             )
             candidate = _sample_human(
                 rng,
-                human_corridors[corridor_index],
+                sampled_human_corridors[corridor_index],
                 index,
             )
             if environment.is_collision(

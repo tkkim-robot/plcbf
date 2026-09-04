@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
 
 import numpy as np
 
@@ -13,6 +13,7 @@ from .dynamics import step_double_integrator
 from .environment import HospitalEnvironment, build_hospital_environment
 from .obstacles import (
     DynamicObstacle,
+    Human,
     Stretcher,
     obstacle_clearance,
     stretcher_route,
@@ -79,12 +80,32 @@ class TraceRecord:
 
 
 @dataclass(frozen=True)
+class ClearanceWitness:
+    """Geometry and synchronized sample that attained a clearance minimum.
+
+    ``elapsed_s`` and ``sample_fraction`` are relative to the swept transition.
+    Benchmark code combines them with the plant-step start time and index.  The
+    witness is diagnostic only and is never consumed by a controller.
+    """
+
+    value: float
+    source_kind: Literal["static", "human", "stretcher"]
+    obstacle_identifier: str | None
+    elapsed_s: float
+    sample_index: int
+    sample_fraction: float
+    robot_position: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class SweptTransitionSafety:
     """Geometry metrics over one synchronized robot/obstacle transition."""
 
     collision: bool
     minimum_clearance: float
     minimum_safety_clearance: float
+    minimum_clearance_witness: ClearanceWitness | None = None
+    minimum_safety_clearance_witness: ClearanceWitness | None = None
 
 
 def evaluate_swept_transition(
@@ -122,26 +143,87 @@ def evaluate_swept_transition(
         end_position,
         config.robot.radius,
     )
-    minimum_clearance = float("inf")
-    minimum_safety_clearance = float("inf")
+    minimum_clearance_witness: ClearanceWitness | None = None
+    minimum_safety_clearance_witness: ClearanceWitness | None = None
+    sampled_positions: list[tuple[float, np.ndarray]] = []
+
+    def witness(
+        value: float,
+        *,
+        source_kind: Literal["static", "human", "stretcher"],
+        obstacle_identifier: str | None,
+        sample_index: int,
+        sample_fraction: float,
+        position: np.ndarray,
+    ) -> ClearanceWitness:
+        return ClearanceWitness(
+            value=float(value),
+            source_kind=source_kind,
+            obstacle_identifier=obstacle_identifier,
+            elapsed_s=float(sample_fraction * elapsed),
+            sample_index=int(sample_index),
+            sample_fraction=float(sample_fraction),
+            robot_position=(float(position[0]), float(position[1])),
+        )
+
+    def lower(
+        current: ClearanceWitness | None,
+        value: float,
+        *,
+        source_kind: Literal["static", "human", "stretcher"],
+        obstacle_identifier: str | None,
+        sample_index: int,
+        sample_fraction: float,
+        position: np.ndarray,
+    ) -> ClearanceWitness:
+        if current is None or value < current.value:
+            return witness(
+                value,
+                source_kind=source_kind,
+                obstacle_identifier=obstacle_identifier,
+                sample_index=sample_index,
+                sample_fraction=sample_fraction,
+                position=position,
+            )
+        return current
+
     for index in range(dynamic_substeps + 1):
         alpha = index / dynamic_substeps
         position = start_position + alpha * (end_position - start_position)
-        minimum_clearance = min(
-            minimum_clearance,
+        sampled_positions.append((alpha, position))
+        minimum_clearance_witness = lower(
+            minimum_clearance_witness,
             environment.static_clearance(position, config.robot.radius),
+            source_kind="static",
+            obstacle_identifier=None,
+            sample_index=index,
+            sample_fraction=alpha,
+            position=position,
         )
-        minimum_safety_clearance = min(
-            minimum_safety_clearance,
+        minimum_safety_clearance_witness = lower(
+            minimum_safety_clearance_witness,
             environment.static_clearance(
                 position,
                 config.robot.radius + config.safety.static_margin,
             ),
+            source_kind="static",
+            obstacle_identifier=None,
+            sample_index=index,
+            sample_fraction=alpha,
+            position=position,
         )
         for obstacle in obstacles:
             predicted = obstacle.predicted(alpha * elapsed, environment)
-            minimum_clearance = min(
-                minimum_clearance,
+            if isinstance(predicted, Human):
+                source_kind: Literal["human", "stretcher"] = "human"
+            else:
+                # Match ``obstacle_clearance``'s existing protocol behavior:
+                # every non-Human dynamic obstacle uses stretcher geometry and
+                # margin semantics. This keeps structural test doubles and
+                # future stretcher-compatible implementations supported.
+                source_kind = "stretcher"
+            minimum_clearance_witness = lower(
+                minimum_clearance_witness,
                 obstacle_clearance(
                     predicted,
                     position,
@@ -149,9 +231,14 @@ def evaluate_swept_transition(
                     0.0,
                     0.0,
                 ),
+                source_kind=source_kind,
+                obstacle_identifier=predicted.identifier,
+                sample_index=index,
+                sample_fraction=alpha,
+                position=position,
             )
-            minimum_safety_clearance = min(
-                minimum_safety_clearance,
+            minimum_safety_clearance_witness = lower(
+                minimum_safety_clearance_witness,
                 obstacle_clearance(
                     predicted,
                     position,
@@ -159,14 +246,57 @@ def evaluate_swept_transition(
                     config.safety.human_margin,
                     config.safety.stretcher_margin,
                 ),
+                source_kind=source_kind,
+                obstacle_identifier=predicted.identifier,
+                sample_index=index,
+                sample_fraction=alpha,
+                position=position,
             )
-    if not static_free:
-        minimum_clearance = min(minimum_clearance, 0.0)
-        minimum_safety_clearance = min(minimum_safety_clearance, 0.0)
+    if (
+        minimum_clearance_witness is None
+        or minimum_safety_clearance_witness is None
+    ):
+        raise RuntimeError("swept transition produced no clearance samples")
+    if not static_free and minimum_clearance_witness.value > 0.0:
+        collision_sample = next(
+            (
+                (index, alpha, position)
+                for index, (alpha, position) in enumerate(sampled_positions)
+                if environment.is_collision(position, config.robot.radius)
+            ),
+            None,
+        )
+        if collision_sample is None:
+            # ``segment_is_free`` and the synchronized sweep both include the
+            # endpoints and midpoint.  Retain a deterministic location even if
+            # their conservative perimeter samplers disagree at roundoff.
+            index = minimum_clearance_witness.sample_index
+            alpha, position = sampled_positions[index]
+        else:
+            index, alpha, position = collision_sample
+        minimum_clearance_witness = witness(
+            0.0,
+            source_kind="static",
+            obstacle_identifier=None,
+            sample_index=index,
+            sample_fraction=alpha,
+            position=position,
+        )
+    if not static_free and minimum_safety_clearance_witness.value > 0.0:
+        minimum_safety_clearance_witness = witness(
+            0.0,
+            source_kind="static",
+            obstacle_identifier=None,
+            sample_index=minimum_clearance_witness.sample_index,
+            sample_fraction=minimum_clearance_witness.sample_fraction,
+            position=np.asarray(minimum_clearance_witness.robot_position),
+        )
     return SweptTransitionSafety(
-        collision=bool(not static_free or minimum_clearance <= 0.0),
-        minimum_clearance=float(minimum_clearance),
-        minimum_safety_clearance=float(minimum_safety_clearance),
+        collision=bool(not static_free or minimum_clearance_witness.value <= 0.0),
+        minimum_clearance=minimum_clearance_witness.value,
+        minimum_safety_clearance=minimum_safety_clearance_witness.value,
+        minimum_clearance_witness=minimum_clearance_witness,
+        minimum_safety_clearance_witness=minimum_safety_clearance_witness,
     )
 
 
