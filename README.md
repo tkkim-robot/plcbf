@@ -80,7 +80,7 @@ uv run python -m examples.hospital.run \
   --story main_eastbound --seed 0 --steps 3000
 ```
 
-Hospital protocol `hospital_fixed_refuge_v3` gives every canonical story 50
+Hospital protocol `hospital_fixed_refuge_v4` gives every canonical story 50
 seeded moving humans and a fixed two- or three-stretcher convoy traveling at
 3.0 m/s across the complete hallway width. Human placement is independent of
 the diagnostic refuge: only the start-room and goal-room door routes are
@@ -141,7 +141,7 @@ Markdown table. Add `--quick` for a short plumbing smoke test. Every seed
 generates a deterministic paired world shared by every method: the default
 nonlinear Quad3D stress protocol has 48 moving spheres (24 coordinated
 six-axis streams and 24 corridor-random hazards). The Hospital publication
-protocol `hospital_fixed_refuge_v3` has five immutable start/goal/convoy
+protocol `hospital_fixed_refuge_v4` has five immutable start/goal/convoy
 stories and seeds `0..19`; only the 50 circular humans are randomized, while
 each story's mandatory two- or three-stretcher, 3.0 m/s full-width blockage is
 fixed. The diagnostic refuge does not influence human placement; only the
@@ -184,13 +184,12 @@ no post-selection simulation rerun.
 Running `python -m examples.hospital.tune` without `--run` only prints this
 resolved protocol and does not create an Optuna study.
 
-The hospital tuning summary can be replayed directly by the all-method
-benchmark with `--config-json results/hospital_optuna_100_summary.json`; the tuned
-full policy library is preserved and certificates are still recomputed at
-every plant step. Nonlinear Quad3D tuning atomically exports its audited winner
-to `examples/nl_quad3d/configs/plcbf_optuna_best.yaml`; both its benchmark and
-single-run entry point load that file by default, while `--config` can replay a
-different YAML/JSON artifact explicitly.
+Hospital and nonlinear Quad3D tuning atomically export their audited winners
+to `examples/hospital/configs/plcbf_optuna_best.yaml` and
+`examples/nl_quad3d/configs/plcbf_optuna_best.yaml`, respectively. Each
+benchmark and single-run entry point loads its packaged winner by default,
+while `--config` can replay a different YAML/JSON artifact explicitly without
+changing the comparison-method configuration.
 
 ## Useful Options
 
