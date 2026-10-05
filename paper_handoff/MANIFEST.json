@@ -1,0 +1,361 @@
+{
+  "schema_version": 1,
+  "prepared_date": "2026-10-04",
+  "branch": "codex/paper-handoff-2026-10-04",
+  "base_commit": "0bdb020c61745cadddd596072979597caee9e308",
+  "safe_control_gitlink": "b748c41daa953e4e457c552d795d7f3f5a5255ab",
+  "scope": "Original available artifacts only. No experiments were rerun to produce this bundle. Hospital and nonlinear Quad3D raw result archives were not found in the searched locations.",
+  "file_count": 35,
+  "files": [
+    {
+      "path": "paper/2026_XXX__Policy_Library_CBF.pdf",
+      "bytes": 4725817,
+      "sha256": "f9783143d9c7a2cd396dce066a39cfc7227ef7bed34ada035eaab9121e4b2373",
+      "evidence_type": "paper",
+      "source": {
+        "local_path": "/Users/ktk/Downloads/2026_XXX__Policy_Library_CBF.pdf",
+        "description": "Current paper PDF supplied by the user; unchanged."
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/README.md",
+      "bytes": 2356,
+      "sha256": "3d3a67d44805febfa9286d3b6b683a794039bb8d381be86be0125d7f3f4d81d5",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/README.md"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.csv",
+      "bytes": 1072837,
+      "sha256": "bb6dba4b1ffafdbe8a03fc337b3bd15dec1506f6c57bd8d8e9110a5c86865ce6",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.json",
+      "bytes": 3758676,
+      "sha256": "152f8022b0723598e685cc1eb1f6285e2ae182650f85df84dd965e4c1edf8ad8",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.json"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.md",
+      "bytes": 1834,
+      "sha256": "ece1197112ed1ee9bf7cc5a3e4c42cd0f8e38ee4ebdbbe748d638ae4fe573dec",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_seed7_50.md"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.csv",
+      "bytes": 61543,
+      "sha256": "dfc4b7fa1d66e6b42bde16aff4128af14f27475f292f628deab4397230657f52",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.json",
+      "bytes": 215504,
+      "sha256": "83328b2a1a96318708e8b9abd4465462c89f15507232fadd051139a814ad4c3c",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.json"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.md",
+      "bytes": 1807,
+      "sha256": "c48639934ca746fe4c029ed1c840c04a4dd7aa84a94ed5c99d5d4d433d5365ad",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/drift_timing_serial3.md"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/publication_report.md",
+      "bytes": 9050,
+      "sha256": "a5f0c7c146b3108ee7d210e1c2706d441be1e2199304cb5ea97f02ec637f58ac",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/publication_report.md"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/reproduction_manifest.json",
+      "bytes": 15920,
+      "sha256": "91f29882f8e1f8ee317c2ab5b99e93979b58236a1489b4e7f6d9aa7d962bbbad",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/reproduction_manifest.json"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.csv",
+      "bytes": 2633456,
+      "sha256": "8990b00589d0945100aec862f751ad104e17396072d03ede24cea7d2dd367744",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.json",
+      "bytes": 7049644,
+      "sha256": "5c556498f53121eb16bc52fc78efb84007cf2b03f01e45bfcfb0772f5a66a13f",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.json"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.md",
+      "bytes": 2053,
+      "sha256": "96fc36ae8a29592c6ca7e408930957675364663302a926b25c25104cdb81bc77",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_seed11_100.md"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.csv",
+      "bytes": 71795,
+      "sha256": "aa27d453d45e17d5994b9d450e59f9052fe07caabf85809e36bc9c5bf29de03d",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.json",
+      "bytes": 197255,
+      "sha256": "93aa7340497f8006a7a387efb4177213a47424523556d6f7c2f728a0298290cc",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.json"
+      }
+    },
+    {
+      "path": "additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.md",
+      "bytes": 2000,
+      "sha256": "14e24df276e02220897ecbf703def83a749e5f1f49fb074d02186ee94ef3773e",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/projection_audited_baseline_only_2026-07-14/warehouse_timing_serial3.md"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/README.md",
+      "bytes": 4221,
+      "sha256": "b9db0f78539b11d97afe12f33e74d7a3fbde5f02753cd42accd88fa6ed0d1482",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/README.md"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.csv",
+      "bytes": 283,
+      "sha256": "57bd56f541a9177cf1845096d73da84c5617a00a0efff5b756b17fe175e88d2a",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.json",
+      "bytes": 2017,
+      "sha256": "4def25e459d2b158941903c5802ee0fb64a57fab2727902a859cdd75316ea06e",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.json"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.md",
+      "bytes": 773,
+      "sha256": "5d38293698b8d09eda8260013d85fd9674d8090fbe08854becf0ad6dd91223b2",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_lib_seed7_1.md"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.csv",
+      "bytes": 288,
+      "sha256": "5a8eb94dde9875177201bc33e77c33d31525724b066df99be030d1c443e4c167",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.json",
+      "bytes": 2036,
+      "sha256": "d47e09d9b118417b9c3bcfc58a745cf31d9db5f9b1d74f742069dcf3352d4dbc",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.json"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.md",
+      "bytes": 775,
+      "sha256": "09fe022d313d4d91b048fbf41125544dec94c678051e05cc4a62374c45c7f070",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/drift_mb_seed7_1.md"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.csv",
+      "bytes": 4122,
+      "sha256": "7c249fb9aeae55d6b67ef313005be076ed31f72d3da19134e6c4abaa1ce65d7a",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.json",
+      "bytes": 10012,
+      "sha256": "bc9d898ec6704a264de0acae815b7611b7653173787d96b6b4eef13c937c57a7",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.json"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.md",
+      "bytes": 871,
+      "sha256": "4033ec9d79fae241f2558dfce1173e2fd2128fe292b8499719bed4ed496d6830",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_lib_seed11_p64_1.md"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.csv",
+      "bytes": 4129,
+      "sha256": "f90d00fed1592ab5a4e197a2295ac8c264314454cd9ab019e464ebb087888888",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.csv"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.json",
+      "bytes": 10039,
+      "sha256": "4c69a3f7d291f1e14959772bef810385ce7d8858c6aea8bbf62870ec73447985",
+      "evidence_type": "raw_results",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.json"
+      }
+    },
+    {
+      "path": "additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.md",
+      "bytes": 872,
+      "sha256": "c490d6db95429833b341a550863d6ea8f5a0b665770eb1f7ee0ce1224e7601f9",
+      "evidence_type": "report_or_provenance",
+      "source": {
+        "git_commit": "de4f4d7bc583ae7b0a862271c8c135c2b32d913c",
+        "git_path": "output/additional_baselines/single_trial_timing_2026-07-14/warehouse_mb_seed11_p64_1.md"
+      }
+    },
+    {
+      "path": "snapshots/hospital/README.md",
+      "bytes": 18476,
+      "sha256": "0e4bd703fbee21ba8deaae7a043fda147b44525667869452c0d076041de7b3d8",
+      "evidence_type": "summary_or_config_only",
+      "source": {
+        "git_commit": "0bdb020c61745cadddd596072979597caee9e308",
+        "git_path": "examples/hospital/README.md"
+      }
+    },
+    {
+      "path": "snapshots/hospital/configs/plcbf_optuna_best.yaml",
+      "bytes": 3863,
+      "sha256": "e0a664f0502f5282a60589843681210156558af585940b82e3e5c27bee82fb6c",
+      "evidence_type": "summary_or_config_only",
+      "source": {
+        "git_commit": "0bdb020c61745cadddd596072979597caee9e308",
+        "git_path": "examples/hospital/configs/plcbf_optuna_best.yaml"
+      }
+    },
+    {
+      "path": "snapshots/nl_quad3d/README.md",
+      "bytes": 7338,
+      "sha256": "8b62aebc0b3eebed8e50dac38617eaedb83d399cc928b8d3e2f48efa9f9e5dd0",
+      "evidence_type": "summary_or_config_only",
+      "source": {
+        "git_commit": "0bdb020c61745cadddd596072979597caee9e308",
+        "git_path": "examples/nl_quad3d/README.md"
+      }
+    },
+    {
+      "path": "snapshots/nl_quad3d/configs/plcbf_optuna_best.yaml",
+      "bytes": 7516,
+      "sha256": "f4c86f18b2ad9ce4f44bae3ddfb9cac911ed7bb07b3dfe659d0aca578160fa50",
+      "evidence_type": "summary_or_config_only",
+      "source": {
+        "git_commit": "0bdb020c61745cadddd596072979597caee9e308",
+        "git_path": "examples/nl_quad3d/configs/plcbf_optuna_best.yaml"
+      }
+    },
+    {
+      "path": "historical_highway/benchmark_black_ice_results_50_tuned.md",
+      "bytes": 2117,
+      "sha256": "5f313bebe2a670c8cfe3c5f731436330ac9dc68e15662136c3e07797126624e1",
+      "evidence_type": "historical_summary_only",
+      "source": {
+        "local_path": "/Users/ktk/Desktop/mycode/plcbf/examples/drift_car/benchmark_black_ice_results_50_tuned.md",
+        "description": "Existing ignored local report; unchanged and not newly rerun."
+      }
+    },
+    {
+      "path": "historical_highway/benchmark_black_ice_speed_search_final_summary.md",
+      "bytes": 4034,
+      "sha256": "d73d161d7923e6d805cb14f721a524ed449d4ef4825432c27cc501c97569582e",
+      "evidence_type": "historical_summary_only",
+      "source": {
+        "local_path": "/Users/ktk/Desktop/mycode/plcbf/examples/drift_car/benchmark_black_ice_speed_search_final_summary.md",
+        "description": "Existing ignored local report; unchanged and not newly rerun."
+      }
+    }
+  ]
+}

@@ -1,0 +1,148 @@
+schema_version: 1
+case_study: hospital
+method: plcbf
+config:
+  width: 140.0
+  height: 95.0
+  dt: 0.06
+  robot:
+    radius: 0.55
+    sensing_range: 24.0
+    v_max: 2.85
+    a_max: 1.7
+    k_position: 0.95
+    k_velocity: 2.1
+  planner:
+    resolution: 1.5
+    clearance_buffer: 0.18
+    preferred_clearance: 3.6
+    clearance_weight: 4.5
+  policies:
+    rollout_dt: 0.24
+    nominal_horizon: 7.2
+    angle_horizon: 7.2
+    reverse_horizon: 7.2
+    stop_horizon: 7.2
+    room_rollout_dt: 0.24
+    room_horizon: 7.2
+    num_angle_policies: 12
+    angle_arc: 3.141592653589793
+    angle_preview_distance: 5.2
+    angle_target_speed: 1.75
+    num_reverse_policies: 1
+    reverse_policy_arc: 1.5707963267948966
+    reverse_preview_distance: 3.2
+    reverse_target_speed: 1.1
+    body_reverse_policy: true
+    body_reverse_min_angle: 0.25
+    nominal_target_speed: 2.85
+    room_target_speed: 2.849995196985561
+    stop_gain: 2.8749810840207335
+    room_policy_count: 7
+    room_search_radius: 42.0
+    component_temperature: 29.065101567400315
+    time_temperature: 14.717893083622087
+    cbf_alpha: 2.1774542113693043
+    cbf_value_buffer: 0.9
+    gradient_steps:
+    - 0.06
+    - 0.06
+    - 0.025
+    - 0.04
+    time_derivative_step: 0.12
+    max_gradient_norm: 99.11995880067508
+    safe_value_threshold: 0.0
+    constraint_tolerance: 0.0001
+  safety:
+    safety_margin: 0.45
+    human_margin: 0.0
+    stretcher_margin: 0.55
+    static_margin: 0.14
+    max_obstacles: 53
+    enable_hocbf: true
+    hocbf_lambda1: 0.5556737985556784
+    hocbf_lambda2: 0.9710970735487752
+    hocbf_margin: 0.45
+    hocbf_activation_margin: 3.2
+    hocbf_wide_stretcher_width: 4.0
+    hocbf_wide_stretcher_activation_margin: 1.0
+    stretcher_proxy_count: 5
+    enable_static_hocbf: true
+    static_hocbf_margin: 0.14
+    static_hocbf_lambda1: 1.6
+    static_hocbf_lambda2: 2.2
+    static_hocbf_activation_margin: 1.4
+    max_static_hocbf_constraints: 8
+    occlusion_clearance: 0.1
+    occlusion_floor_step: 0.55
+  refuge:
+    inside_door_offset: 2.3
+    outside_door_offset: 1.75
+    terminal_interior_margin: 2.1
+    terminal_speed_max: 2.2
+    waypoint_radius: 0.75
+provenance:
+  source: selected_complete_trial_exact_archive_no_rerun
+  study:
+    name: hospital_plcbf_v11_100_final
+    storage: results/hospital_optuna_v11_100_final.db
+    best_trial_number: 42
+    best_value: 147153793553.2009
+    target_terminal_trial_count: 50
+    terminal_trial_count: 50
+    trial_state_counts:
+      complete: 31
+      pruned: 19
+  optimization:
+    held_out_validation: false
+    post_selection_simulation: false
+    completed_trial_requires_full_benchmark_grid: true
+    search_space_version: hospital_plcbf_v11_feasible_100world_common_horizon
+    objective_configuration_fingerprint: 4bb4ff8d0d879ae4adb22cd5c6bc43614b7dab269fc20b62fa184b63624e2e3b
+  benchmark_grid:
+    case_count: 5
+    cases:
+    - main_eastbound
+    - main_westbound
+    - north_eastbound
+    - north_westbound
+    - south_eastbound
+    traffic_seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    world_count: 100
+    grid_sha256: 4ac2a0acde9080b543bc91f2d9da280fbdfad3b2475230a8e53010452e0f348a
+    story_protocol_sha256: 5aa5a772d901f682226f4eb597f89da125a3909108bfa6d2435a3b99d6529021
+  exact_result_archive:
+    path: results/hospital_optuna_v11_100_final_trials_4bb4ff8d0d879ae4/trial-0042.json
+    sha256: 8b9375ae80a088e9960d2b585c1c07f3b2356c486926a2a6844a3f2313d088f2
+    byte_count: 3612471
+    result_count: 100
+  outcomes:
+    success: 86
+    collision: 12
+    timeout: 2
+    error: 0
+    infeasible: 0
+  reports:
+    json: results/hospital_optuna_v11_100_final.json
+    csv: results/hospital_optuna_v11_100_final.csv
+    markdown: results/hospital_optuna_v11_100_final.md

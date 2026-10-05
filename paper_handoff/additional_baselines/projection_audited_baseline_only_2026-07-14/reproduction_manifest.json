@@ -1,0 +1,425 @@
+{
+  "schema_version": 3,
+  "artifact_role": "publication_projection_audited_baseline_only",
+  "not_for_publication": false,
+  "generated_at_utc": "2026-07-14T18:16:49Z",
+  "branch": "multi-backup-baselines",
+  "generated_from_commit": "4298440db247747105f587b73bbb9ed5c1e4a3f2",
+  "base_main_commit": "34795fae8ab04846e312cdb399872e9a6deda7b5",
+  "algorithm_keys": [
+    "multi_backup_cbf_mi",
+    "library_pcbf_mi"
+  ],
+  "scope": {
+    "controllers_executed_as_standalone_trials": [
+      "multi_backup_cbf_mi",
+      "library_pcbf_mi"
+    ],
+    "standalone_historical_trial_executed": false,
+    "historical_solve_control_problem_called": false,
+    "drift_historical_reference_constructed": true,
+    "drift_historical_reference_purpose": "policy-library equality oracle only",
+    "historical_rows": "copied verbatim from the submitted manuscript; not recomputed",
+    "superseded_pre_projection_audit": "../native_control_baseline_only_2026-07-13",
+    "common_stop_audit": "../reviewer_fix_2026-07-13",
+    "common_stop_audit_role": "common_stop_audit_not_for_publication"
+  },
+  "source_checkout": {
+    "kind": "clean detached recursive clone",
+    "cwd": "/tmp/policy-library-projection-audit-4298440",
+    "commit": "4298440db247747105f587b73bbb9ed5c1e4a3f2",
+    "parent_status_porcelain": "",
+    "pyproject_sha256": "854d3a6a5efe25759faa744a38ea22b49a3266ae81ad2d79a1daba796295cfee",
+    "submodules": {
+      "safe_control": {
+        "gitlink": "b748c41daa953e4e457c552d795d7f3f5a5255ab",
+        "head": "b748c41daa953e4e457c552d795d7f3f5a5255ab",
+        "status_porcelain": ""
+      }
+    }
+  },
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.10.18 (main, Jun 12 2025, 12:22:33) [Clang 20.1.4 ]",
+    "python_executable": "/tmp/policy-runtime-projection-audit-4298440/bin/python",
+    "distribution_count": 66,
+    "distribution_snapshot_sha256": "01194f15ea2fd44305f764853a4d6e4a9f6fd51b54995d85df6e8682ead0535c",
+    "packages": {
+      "casadi": "3.7.2",
+      "clarabel": "0.11.1",
+      "cvxpy": "1.7.5",
+      "do-mpc": "5.1.1",
+      "jax": "0.6.2",
+      "jaxlib": "0.6.2",
+      "numpy": "2.2.6",
+      "osqp": "1.0.5",
+      "scipy": "1.15.3",
+      "scs": "3.2.9"
+    },
+    "cvxpy_installed_solvers": [
+      "CLARABEL",
+      "OSQP",
+      "SCIPY",
+      "SCS"
+    ],
+    "thread_caps": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1"
+    },
+    "timing_is_tentative": true
+  },
+  "projection_audit_contract": {
+    "solver_input_bound_tolerance": 1e-5,
+    "projection": "clip a finite, correctly dimensioned, actuator-tolerance-valid solver control exactly to the actuator bounds",
+    "all_original_qp_inequalities_rechecked": true,
+    "auxiliary_values": "audit at solver-returned auxiliary values; the drift PCBF nonnegative slack attribute is checked explicitly",
+    "constraint_form": "each original affine CVXPY inequality is evaluated in canonical expr <= 0 form",
+    "violation": "max(expr, 0) for each scalar row",
+    "scale": "max(1, abs(constant), abs(linear_value))",
+    "threshold": "absolute_tolerance + relative_tolerance * scale",
+    "failed_audit_rejects_candidate": true,
+    "failed_audit_semantics": "candidate rejection; contributes to candidate-QP failure only if a certified policy exists and no accepted candidate remains; never an unrecoverable runtime failure",
+    "osqp_absolute_tolerance": 1e-5,
+    "osqp_relative_tolerance": 1e-5,
+    "scs_absolute_tolerance": 1e-4,
+    "scs_relative_tolerance": 1e-4,
+    "persisted_diagnostics": [
+      "projection_occurred",
+      "num_post_projection_audits",
+      "projection_event_count",
+      "post_projection_rejection_count",
+      "max_projection_delta_inf",
+      "max_post_projection_constraint_violation",
+      "max_post_projection_violation_ratio",
+      "six corresponding per-step arrays"
+    ],
+    "projection_event_scope": "candidate-level",
+    "projection_delta_units": "native control units"
+  },
+  "scenario_contract": {
+    "drift": {
+      "master_seed": 7,
+      "trials_per_algorithm": 50,
+      "puddle_friction": 0.3,
+      "target_speed_mps": 10.0,
+      "library_size": 4,
+      "historical_saved_geometry_sha256": "b1462f165fd0dcfa811d8a334d3d8c1106c83d063e66e92b62a318e20b617e15"
+    },
+    "warehouse": {
+      "master_seed": 11,
+      "trials_per_algorithm": 100,
+      "P": 64,
+      "extras": [
+        "stop",
+        "nominal"
+      ],
+      "library_size": 66,
+      "historical_saved_geometry_sha256": "125b631d315b3c9debdc141caa22a1d5105757bb252255568f8cec845e656604"
+    }
+  },
+  "failure_contract": {
+    "historical_failure": "collision OR unrecoverable infeasibility/runtime failure",
+    "certificate_loss": "diagnostic only; does not set historical failure",
+    "candidate_qp_failure": "a certified policy exists but no candidate QP returns an accepted bounded input; diagnostic only and does not set historical failure",
+    "continuation": "apply the exact finite, dimension-valid, actuator-valid control returned by the selected baseline",
+    "benchmark_action_override": false,
+    "unrecoverable": "solve exception, runtime/simulator error, non-finite control, invalid control dimension, or materially out-of-bounds control",
+    "filter_failure": "collision OR certificate_lost OR qp_infeasible",
+    "union_failure": "filter_failure OR runtime_error OR NOT completed_or_survived"
+  },
+  "timing_contract": {
+    "paper_source": "separate one-worker three-trial artifacts",
+    "outcome_timing_is_publication_timing": false,
+    "candidate_execution": "sequential within each control step",
+    "drift_warmup_calls_excluded_per_trial": 5,
+    "warehouse_warmup_calls_excluded_per_trial": 10,
+    "historical_timing_replaced": false,
+    "historical_timing_directly_comparable": false,
+    "new_baseline_timing_is_tentative": true
+  },
+  "benchmarks": {
+    "drift_outcome": {
+      "cwd": "/tmp/policy-library-projection-audit-4298440",
+      "workers": 6,
+      "trials_per_algorithm": 50,
+      "publication_timing": false,
+      "command": [
+        "/tmp/policy-runtime-projection-audit-4298440/bin/python",
+        "examples/drift_car/benchmark_additional_baselines.py",
+        "--num-runs",
+        "50",
+        "--seed",
+        "7",
+        "--variant-key",
+        "multi_backup_cbf_mi",
+        "--variant-key",
+        "library_pcbf_mi",
+        "--num-workers",
+        "6",
+        "--output-md",
+        "/tmp/projection-audit-results-4298440/drift_seed7_50.md",
+        "--output-json",
+        "/tmp/projection-audit-results-4298440/drift_seed7_50.json",
+        "--output-csv",
+        "/tmp/projection-audit-results-4298440/drift_seed7_50.csv"
+      ],
+      "artifacts": [
+        "drift_seed7_50.md",
+        "drift_seed7_50.json",
+        "drift_seed7_50.csv"
+      ],
+      "summary": {
+        "multi_backup_cbf_mi": {
+          "historical_failures": 0,
+          "collisions": 0,
+          "unrecoverable": 0,
+          "certificate_losses": 0,
+          "candidate_qp_failure_trials": 0,
+          "horizon_survivals": 50,
+          "num_post_projection_audits": 49976,
+          "projection_event_count": 78,
+          "post_projection_rejection_count": 5
+        },
+        "library_pcbf_mi": {
+          "historical_failures": 17,
+          "collisions": 17,
+          "unrecoverable": 0,
+          "certificate_losses": 45,
+          "candidate_qp_failure_trials": 12,
+          "horizon_survivals": 33,
+          "num_post_projection_audits": 35291,
+          "projection_event_count": 300,
+          "post_projection_rejection_count": 5
+        }
+      }
+    },
+    "warehouse_outcome": {
+      "cwd": "/tmp/policy-library-projection-audit-4298440",
+      "workers": 4,
+      "trials_per_algorithm": 100,
+      "publication_timing": false,
+      "command": [
+        "/tmp/policy-runtime-projection-audit-4298440/bin/python",
+        "examples/warehouse/benchmark_additional_baselines_quad.py",
+        "--num-trials",
+        "100",
+        "--seed",
+        "11",
+        "--level",
+        "7",
+        "--num-dynamic-obstacles",
+        "45",
+        "--safety-margin",
+        "1.3",
+        "--alpha",
+        "6.0",
+        "--max-steps",
+        "350",
+        "--num-angle-policies",
+        "64",
+        "--jit-warmup-steps",
+        "10",
+        "--tracking-tol",
+        "0.1",
+        "--speed-min",
+        "3.0",
+        "--speed-max",
+        "4.5",
+        "--ghost-radius",
+        "2.4",
+        "--inter-ghost-clearance",
+        "0.2",
+        "--start-exclusion-max-x",
+        "18.0",
+        "--start-exclusion-max-y",
+        "18.0",
+        "--start-clearance-radius",
+        "8.0",
+        "--algorithms",
+        "multi_backup_cbf_mi",
+        "library_pcbf_mi",
+        "--num-workers",
+        "4",
+        "--progress-every",
+        "10",
+        "--output-md",
+        "/tmp/projection-audit-results-4298440/warehouse_seed11_100.md",
+        "--output-json",
+        "/tmp/projection-audit-results-4298440/warehouse_seed11_100.json",
+        "--output-csv",
+        "/tmp/projection-audit-results-4298440/warehouse_seed11_100.csv"
+      ],
+      "artifacts": [
+        "warehouse_seed11_100.md",
+        "warehouse_seed11_100.json",
+        "warehouse_seed11_100.csv"
+      ],
+      "summary": {
+        "multi_backup_cbf_mi": {
+          "historical_failures": 85,
+          "collisions": 85,
+          "unrecoverable": 0,
+          "certificate_losses": 100,
+          "candidate_qp_failure_trials": 95,
+          "horizon_survivals": 15,
+          "num_post_projection_audits": 29128,
+          "projection_event_count": 84,
+          "post_projection_rejection_count": 48
+        },
+        "library_pcbf_mi": {
+          "historical_failures": 82,
+          "collisions": 82,
+          "unrecoverable": 0,
+          "certificate_losses": 98,
+          "candidate_qp_failure_trials": 12,
+          "horizon_survivals": 18,
+          "num_post_projection_audits": 325030,
+          "projection_event_count": 609,
+          "post_projection_rejection_count": 0
+        }
+      }
+    },
+    "drift_timing_serial3": {
+      "cwd": "/tmp/policy-library-projection-audit-4298440",
+      "workers": 1,
+      "trials_per_algorithm": 3,
+      "publication_timing": true,
+      "warmup_calls_excluded_per_trial": 5,
+      "command": [
+        "/tmp/policy-runtime-projection-audit-4298440/bin/python",
+        "examples/drift_car/benchmark_additional_baselines.py",
+        "--num-runs",
+        "3",
+        "--seed",
+        "7",
+        "--variant-key",
+        "multi_backup_cbf_mi",
+        "--variant-key",
+        "library_pcbf_mi",
+        "--num-workers",
+        "1",
+        "--output-md",
+        "/tmp/projection-audit-results-4298440/drift_timing_serial3.md",
+        "--output-json",
+        "/tmp/projection-audit-results-4298440/drift_timing_serial3.json",
+        "--output-csv",
+        "/tmp/projection-audit-results-4298440/drift_timing_serial3.csv"
+      ],
+      "artifacts": [
+        "drift_timing_serial3.md",
+        "drift_timing_serial3.json",
+        "drift_timing_serial3.csv"
+      ],
+      "mean_compute_ms": {
+        "multi_backup_cbf_mi": 514.6449849486464,
+        "library_pcbf_mi": 17.418788745604036
+      }
+    },
+    "warehouse_timing_serial3": {
+      "cwd": "/tmp/policy-library-projection-audit-4298440",
+      "workers": 1,
+      "trials_per_algorithm": 3,
+      "publication_timing": true,
+      "warmup_calls_excluded_per_trial": 10,
+      "command": [
+        "/tmp/policy-runtime-projection-audit-4298440/bin/python",
+        "examples/warehouse/benchmark_additional_baselines_quad.py",
+        "--num-trials",
+        "3",
+        "--seed",
+        "11",
+        "--level",
+        "7",
+        "--num-dynamic-obstacles",
+        "45",
+        "--safety-margin",
+        "1.3",
+        "--alpha",
+        "6.0",
+        "--max-steps",
+        "350",
+        "--num-angle-policies",
+        "64",
+        "--jit-warmup-steps",
+        "10",
+        "--tracking-tol",
+        "0.1",
+        "--speed-min",
+        "3.0",
+        "--speed-max",
+        "4.5",
+        "--ghost-radius",
+        "2.4",
+        "--inter-ghost-clearance",
+        "0.2",
+        "--start-exclusion-max-x",
+        "18.0",
+        "--start-exclusion-max-y",
+        "18.0",
+        "--start-clearance-radius",
+        "8.0",
+        "--algorithms",
+        "multi_backup_cbf_mi",
+        "library_pcbf_mi",
+        "--num-workers",
+        "1",
+        "--progress-every",
+        "1",
+        "--output-md",
+        "/tmp/projection-audit-results-4298440/warehouse_timing_serial3.md",
+        "--output-json",
+        "/tmp/projection-audit-results-4298440/warehouse_timing_serial3.json",
+        "--output-csv",
+        "/tmp/projection-audit-results-4298440/warehouse_timing_serial3.csv"
+      ],
+      "artifacts": [
+        "warehouse_timing_serial3.md",
+        "warehouse_timing_serial3.json",
+        "warehouse_timing_serial3.csv"
+      ],
+      "mean_compute_ms": {
+        "multi_backup_cbf_mi": 142.97778733090078,
+        "library_pcbf_mi": 502.5609786424017
+      }
+    }
+  },
+  "mb_cbf_mi_dagger_caveat": "The sampled drift stopping envelope and warehouse stopping/near-hover terminal proxies are not proved control-invariant terminal sets; this benchmark adaptation does not inherit Chen et al.'s formal guarantee.",
+  "acceptance": {
+    "approved_plcbf_source_identity": "pass",
+    "baseline_selection_cannot_change_historical_control_or_trajectory": "pass",
+    "exact_returned_action_passthrough": "pass",
+    "certificate_loss_alone_does_not_set_historical_infeasible": "pass",
+    "historical_failure_identity_for_every_raw_trial": "pass",
+    "projection_audit_for_all_four_candidate_qp_paths": "pass",
+    "forced_post_projection_rejection_for_all_four_paths": "pass",
+    "per_step_trial_summary_projection_aggregation": "pass",
+    "outcome_and_timing_artifact_keys_exactly_two": "pass",
+    "saved_historical_seeded_geometry_parity": "pass",
+    "timing_scenario_prefix_parity": "pass",
+    "reproduction_commands_exclude_literal_plcbf": "pass",
+    "clean_parent_and_submodule_checkout": "pass",
+    "single_worker_warmed_timing_without_historical_controller": "pass",
+    "zero_runtime_errors_in_all_outcome_and_timing_runs": "pass",
+    "csv_line_endings_lf_only": "pass",
+    "focused_baseline_semantics_artifact_suite": "82 passed, 3 warnings",
+    "full_repository_suite": "83 passed, 6 warnings"
+  },
+  "artifacts_sha256": {
+    "README.md": "3d3a67d44805febfa9286d3b6b683a794039bb8d381be86be0125d7f3f4d81d5",
+    "drift_seed7_50.csv": "bb6dba4b1ffafdbe8a03fc337b3bd15dec1506f6c57bd8d8e9110a5c86865ce6",
+    "drift_seed7_50.json": "152f8022b0723598e685cc1eb1f6285e2ae182650f85df84dd965e4c1edf8ad8",
+    "drift_seed7_50.md": "ece1197112ed1ee9bf7cc5a3e4c42cd0f8e38ee4ebdbbe748d638ae4fe573dec",
+    "drift_timing_serial3.csv": "dfc4b7fa1d66e6b42bde16aff4128af14f27475f292f628deab4397230657f52",
+    "drift_timing_serial3.json": "83328b2a1a96318708e8b9abd4465462c89f15507232fadd051139a814ad4c3c",
+    "drift_timing_serial3.md": "c48639934ca746fe4c029ed1c840c04a4dd7aa84a94ed5c99d5d4d433d5365ad",
+    "publication_report.md": "a5f0c7c146b3108ee7d210e1c2706d441be1e2199304cb5ea97f02ec637f58ac",
+    "warehouse_seed11_100.csv": "8990b00589d0945100aec862f751ad104e17396072d03ede24cea7d2dd367744",
+    "warehouse_seed11_100.json": "5c556498f53121eb16bc52fc78efb84007cf2b03f01e45bfcfb0772f5a66a13f",
+    "warehouse_seed11_100.md": "96fc36ae8a29592c6ca7e408930957675364663302a926b25c25104cdb81bc77",
+    "warehouse_timing_serial3.csv": "aa27d453d45e17d5994b9d450e59f9052fe07caabf85809e36bc9c5bf29de03d",
+    "warehouse_timing_serial3.json": "93aa7340497f8006a7a387efb4177213a47424523556d6f7c2f728a0298290cc",
+    "warehouse_timing_serial3.md": "14e24df276e02220897ecbf703def83a749e5f1f49fb074d02186ee94ef3773e"
+  }
+}

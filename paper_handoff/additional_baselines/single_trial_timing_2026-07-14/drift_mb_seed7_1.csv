@@ -1,0 +1,2 @@
+algorithm,seed,run_idx,obstacle_geometry,library_size,collision,unrecoverable_infeasible,historical_failure,total_steps,timed_steps,solve_time_sum_sec
+multi_backup_cbf_mi,7,0,"[[82.5888552038783, ""middle""], [80.32749474882655, ""right""]]",4,False,False,False,280,275,143.6763861651998
