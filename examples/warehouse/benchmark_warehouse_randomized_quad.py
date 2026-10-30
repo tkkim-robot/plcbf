@@ -27,14 +27,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
 
+from plcbf.benchmark_timing import BenchmarkTiming
 from safe_control.envs.warehouse_env import WarehouseEnv
 import examples.warehouse.test_warehouse_quad as test_quad
 from examples.warehouse.controllers.policies_quad3d_jax import RetracePolicyParams
@@ -98,6 +102,7 @@ def _solve_with_timing(fn):
     t0 = time.perf_counter()
     try:
         out = fn()
+        np.asarray(out)
         err = None
     except Exception as exc:  # pragma: no cover - defensive runtime path
         out = None
@@ -261,6 +266,7 @@ def run_trial(
     tracking_tol: float,
     plcbf_num_angle_policies: int,
     mip_num_angle_policies: int,
+    baseline_backend: str = "jax",
 ) -> TrialResult:
     env, robot, nom_ctrl, shielding, robot_spec, ctrl_params = test_quad.setup_test(
         algo=algo,
@@ -272,6 +278,13 @@ def run_trial(
     )
 
     _apply_scenario_to_env(env, scenario)
+    if algo == "pcbf":
+        shielding.cbf_alpha = alpha
+    elif algo in ("mps", "gatekeeper"):
+        shielding.nominal_controller = None
+        if baseline_backend == "jax":
+            from plcbf.jax_shielding import enable_jax
+            enable_jax(shielding, "warehouse")
 
     current_state = _build_initial_state(env, robot_spec)
 
@@ -285,7 +298,7 @@ def run_trial(
     solve_time_sum = 0.0
     timed_steps = 0
 
-    warmup_steps = jit_warmup_steps if algo in {"pcbf", "plcbf"} else 0
+    timing = BenchmarkTiming(warmup_steps=jit_warmup_steps)
 
     for step in range(max_steps):
         env.step()
@@ -352,7 +365,7 @@ def run_trial(
             infeasible = True
             break
 
-        if step >= warmup_steps:
+        if timing.record(solve_dt):
             solve_time_sum += float(solve_dt)
             timed_steps += 1
 
@@ -455,6 +468,7 @@ def run_algorithm_trials(
             tracking_tol=args.tracking_tol,
             plcbf_num_angle_policies=args.plcbf_num_angle_policies,
             mip_num_angle_policies=args.mip_num_angle_policies,
+            baseline_backend=args.baseline_backend,
         )
         trials.append(result)
 
@@ -507,6 +521,7 @@ def refresh_timing_one_by_one(
                 tracking_tol=args.tracking_tol,
                 plcbf_num_angle_policies=args.plcbf_num_angle_policies,
                 mip_num_angle_policies=args.mip_num_angle_policies,
+                baseline_backend=args.baseline_backend,
             )
             total_solve_sec += trial.solve_time_sum_sec
             total_timed_steps += trial.timed_steps
@@ -755,6 +770,7 @@ def main():
 
     parser.add_argument("--safety-margin", type=float, default=1.3)
     parser.add_argument("--alpha", type=float, default=6.0)
+    parser.add_argument("--baseline-backend", choices=("jax", "numpy"), default="jax")
     parser.add_argument("--max-steps", type=int, default=350)
 
     parser.add_argument("--plcbf-num-angle-policies", type=int, default=64)

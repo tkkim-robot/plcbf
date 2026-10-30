@@ -17,8 +17,12 @@ import random
 import time
 from typing import Callable, Iterable, Mapping
 
+import jax
 import numpy as np
 
+jax.config.update("jax_enable_x64", True)
+
+from plcbf.benchmark_timing import BenchmarkTiming
 from plcbf.baselines import (
     BENCHMARK_METHODS,
     BaselineDecision,
@@ -75,6 +79,10 @@ Clock = Callable[[], float]
 DEFAULT_BENCHMARK_SCENARIOS = (PLAYGROUND_STRESS_SCENARIO,)
 
 
+def _default_controller_config() -> NLQuad3DControllerConfig:
+    return load_controller_config_artifact(DEFAULT_CONTROLLER_CONFIG_PATH)[0]
+
+
 def _default_controller_factory(
     model: NLQuad3D,
     config: NLQuad3DControllerConfig,
@@ -104,10 +112,10 @@ class NLQuad3DBenchmarkConfig:
 
     methods: tuple[str, ...] = BENCHMARK_METHODS
     scenarios: tuple[str, ...] = DEFAULT_BENCHMARK_SCENARIOS
-    seeds: tuple[int, ...] = (0,)
+    seeds: tuple[int, ...] = tuple(range(101, 201))
     max_steps: int | None = None
     controller_config: NLQuad3DControllerConfig = field(
-        default_factory=NLQuad3DControllerConfig
+        default_factory=_default_controller_config
     )
     plcbf_controller_config: NLQuad3DControllerConfig | None = None
     safe_value_threshold: float = 0.0
@@ -116,10 +124,13 @@ class NLQuad3DBenchmarkConfig:
     playground_obstacle_count: int | None = None
     tilt_max_rad: float = np.deg2rad(60.0)
     warmup: bool = True
+    baseline_backend: str = "jax"
     stop_on_collision: bool = True
     configuration_source: str = "defaults"
 
     def __post_init__(self) -> None:
+        if self.baseline_backend not in ("jax", "numpy"):
+            raise ValueError("baseline_backend must be 'jax' or 'numpy'")
         if not self.methods:
             raise ValueError("at least one benchmark method is required")
         methods = tuple(BenchmarkMethod(method).value for method in self.methods)
@@ -354,13 +365,13 @@ class NLQuad3DBenchmarkConfig:
                 "position_clipping": "inside bounds when bounds are defined",
             },
             "warmup": self.warmup,
+            "baseline_backend": self.baseline_backend,
             "stop_on_collision": self.stop_on_collision,
             "baseline_controller": asdict(self.controller_config),
             "plcbf_controller": asdict(self.plcbf_controller_config),
             "controller": asdict(self.controller_config),
             "controller_scope": (
-                "The packaged/tuned controller applies only to PL-CBF; "
-                "comparison methods retain baseline_controller."
+                "All methods use the selected controller configuration."
             ),
             "state_validity": {
                 "body_tilt_rad": (
@@ -850,6 +861,7 @@ def run_trial(
     playground_obstacle_count: int | None = None,
     tilt_max_rad: float = np.deg2rad(60.0),
     warmup: bool = True,
+    baseline_backend: str = "jax",
     stop_on_collision: bool = True,
     model_factory: ModelFactory = NLQuad3D,
     controller_factory: ControllerFactory = _default_controller_factory,
@@ -900,6 +912,7 @@ def run_trial(
     certificate_times: list[float] = []
     solver_times: list[float] = []
     full_step_times: list[float] = []
+    timing = BenchmarkTiming(warmup_steps=10 if warmup else 0)
     certificate_counts: list[int] = []
     selected_policies: list[str] = []
     infeasible_count = 0
@@ -932,7 +945,7 @@ def run_trial(
 
     try:
         model = model_factory()
-        config = controller_config or NLQuad3DControllerConfig(dt=model.dt)
+        config = controller_config or _default_controller_config()
         _validate_tilt_protocol(config, tilt_max_rad)
         if not np.isclose(config.dt, model.dt):
             raise ValueError("controller dt and nonlinear dynamics dt must match")
@@ -981,6 +994,18 @@ def run_trial(
             current_scenario.bounds,
             waypoints=current_scenario.waypoints,
         )
+        if baseline_backend not in ("jax", "numpy"):
+            raise ValueError("baseline_backend must be 'jax' or 'numpy'")
+        if (
+            baseline_backend == "jax"
+            and type(model) is NLQuad3D
+            and type(controller) is PLCBF_NLQuad3D
+            and parsed_method not in {
+                BenchmarkMethod.PLCBF, BenchmarkMethod.LIBRARY_PCBF_MI
+            }
+        ):
+            from .baselines_jax import enable_jax
+            enable_jax(baseline_suite)
         min_clearance_value = minimum_clearance(
             model.safety_point(state),
             obstacles,
@@ -1014,6 +1039,8 @@ def run_trial(
                 break
             goal = current_scenario.waypoints[waypoint_index]
             nominal = model.nominal_input(state, goal)
+            if parsed_method in {BenchmarkMethod.MPS, BenchmarkMethod.GATEKEEPER}:
+                baseline_suite.prepare_nominal_trajectory(parsed_method, state, goal)
 
             certificate_started = clock()
             if parsed_method is BenchmarkMethod.LIBRARY_PCBF_MI:
@@ -1094,6 +1121,7 @@ def run_trial(
             certificate_times.append(certificate_elapsed)
             solver_times.append(solver_elapsed)
             full_step_times.append(certificate_elapsed + solver_elapsed)
+            timing.record(certificate_elapsed + solver_elapsed)
             certificate_counts.append(certificate_count)
 
             previous_position = state[:3].copy()
@@ -1215,7 +1243,7 @@ def run_trial(
         intervention=(
             _mean(intervention_values) if intervention_values else None
         ),
-        solve_times_s=tuple(full_step_times),
+        solve_times_s=tuple(timing.samples),
         case_metrics=metrics,
         error=error_message,
     )
@@ -1259,6 +1287,7 @@ def run_benchmark(
                         ),
                         tilt_max_rad=config.tilt_max_rad,
                         warmup=config.warmup,
+                        baseline_backend=config.baseline_backend,
                         stop_on_collision=config.stop_on_collision,
                         model_factory=model_factory,
                         controller_factory=controller_factory,
@@ -1312,8 +1341,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="config_json",
         type=Path,
         help=(
-            "PL-CBF controller YAML/JSON or tuning summary (default: "
-            "packaged Optuna winner); comparison baselines are unchanged"
+            "Controller YAML/JSON or tuning summary (default: packaged settings)"
         ),
     )
     parser.add_argument(
@@ -1348,6 +1376,7 @@ def build_parser() -> argparse.ArgumentParser:
             "48 for playground_stress, 32 for playground_crowded)"
         ),
     )
+    parser.add_argument("--baseline-backend", choices=("jax", "numpy"), default="jax")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument(
         "--quick",
@@ -1359,7 +1388,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _config_from_args(args: argparse.Namespace) -> NLQuad3DBenchmarkConfig:
     artifact: Mapping[str, object] = {}
-    baseline_controller = NLQuad3DControllerConfig()
     config_path = (
         args.config_json
         if args.config_json is not None
@@ -1384,7 +1412,7 @@ def _config_from_args(args: argparse.Namespace) -> NLQuad3DBenchmarkConfig:
             )
         )
     )
-    seeds = tuple(args.seed) if args.seed else (0,)
+    seeds = tuple(args.seed) if args.seed else ((101,) if args.quick else tuple(range(101, 201)))
     artifact_steps = tuning_metadata.get("max_steps")
     steps = (
         args.steps
@@ -1405,13 +1433,6 @@ def _config_from_args(args: argparse.Namespace) -> NLQuad3DBenchmarkConfig:
         backup_horizon = 0.1 if backup_horizon is None else backup_horizon
         plcbf_max_obstacles = 2
         plcbf_nominal_prefix_steps = 0
-        baseline_controller = replace(
-            baseline_controller,
-            num_radial_policies=radial_policies,
-            backup_horizon=backup_horizon,
-            max_obstacles=2,
-            nominal_prefix_steps=0,
-        )
     plcbf_controller = replace(
         plcbf_controller,
         num_radial_policies=(
@@ -1462,12 +1483,13 @@ def _config_from_args(args: argparse.Namespace) -> NLQuad3DBenchmarkConfig:
         scenarios=scenarios,
         seeds=seeds,
         max_steps=steps,
-        controller_config=baseline_controller,
+        controller_config=plcbf_controller,
         plcbf_controller_config=plcbf_controller,
         obstacle_position_perturbation=position_perturbation,
         obstacle_velocity_perturbation=velocity_perturbation,
         playground_obstacle_count=playground_obstacle_count,
         warmup=bool(artifact_warmup) and not args.no_warmup,
+        baseline_backend=args.baseline_backend,
         configuration_source=(
             f"packaged_plcbf:{config_path}"
             if args.config_json is None

@@ -14,13 +14,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import jax
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
 
+from plcbf.benchmark_timing import BenchmarkTiming
 from safe_control.envs.warehouse_env import WarehouseEnv
 import examples.warehouse.additional_baselines_setup_quad as test_quad
 
@@ -96,6 +100,7 @@ def _solve_with_timing(fn):
     t0 = time.perf_counter()
     try:
         out = fn()
+        np.asarray(out)
         err = None
     except Exception as exc:  # pragma: no cover - defensive runtime path
         out = None
@@ -287,6 +292,7 @@ def run_trial(
     total_steps = 0
     solve_time_sum = 0.0
     timed_steps = 0
+    timing = BenchmarkTiming(warmup_steps=jit_warmup_steps)
 
     for step in range(max_steps):
         try:
@@ -344,7 +350,7 @@ def run_trial(
             break
 
         total_steps += 1
-        if step >= jit_warmup_steps:
+        if timing.record(solve_dt):
             solve_time_sum += float(solve_dt)
             timed_steps += 1
 

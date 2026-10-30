@@ -466,35 +466,37 @@ def grouped_capacities_for_obstacle_count(
 
 def pack_static_geometry(
     environment: HospitalEnvironment,
+    *,
+    dtype=np.float32,
 ) -> HospitalJaxStaticGeometry:
     """Pack the immutable floor and wall rectangles without approximation."""
 
     return HospitalJaxStaticGeometry(
-        floor_bounds=np.asarray(environment._floor_bounds, dtype=np.float32),
-        floor_centers=np.asarray(environment._floor_centers, dtype=np.float32),
-        floor_half=np.asarray(environment._floor_half, dtype=np.float32),
+        floor_bounds=np.asarray(environment._floor_bounds, dtype=dtype),
+        floor_centers=np.asarray(environment._floor_centers, dtype=dtype),
+        floor_half=np.asarray(environment._floor_half, dtype=dtype),
         floor_boundary_starts=np.asarray(
-            environment._floor_boundary_starts, dtype=np.float32
+            environment._floor_boundary_starts, dtype=dtype
         ),
         floor_boundary_ends=np.asarray(
-            environment._floor_boundary_ends, dtype=np.float32
+            environment._floor_boundary_ends, dtype=dtype
         ),
-        wall_bounds=np.asarray(environment._wall_bounds, dtype=np.float32),
-        wall_centers=np.asarray(environment._wall_centers, dtype=np.float32),
-        wall_half=np.asarray(environment._wall_half, dtype=np.float32),
-        width=np.asarray(environment.width, dtype=np.float32),
-        height=np.asarray(environment.height, dtype=np.float32),
+        wall_bounds=np.asarray(environment._wall_bounds, dtype=dtype),
+        wall_centers=np.asarray(environment._wall_centers, dtype=dtype),
+        wall_half=np.asarray(environment._wall_half, dtype=dtype),
+        width=np.asarray(environment.width, dtype=dtype),
+        height=np.asarray(environment.height, dtype=dtype),
     )
 
 
-def pack_parameters(config: HospitalConfig) -> HospitalJaxParameters:
+def pack_parameters(config: HospitalConfig, *, dtype=np.float32) -> HospitalJaxParameters:
     """Pack numerical controller parameters as dynamic JIT arguments."""
 
     robot = config.robot
     safety = config.safety
     policy = config.policies
     refuge = config.refuge
-    scalar = lambda value: np.asarray(value, dtype=np.float32)
+    scalar = lambda value: np.asarray(value, dtype=dtype)
     return HospitalJaxParameters(
         robot_radius=scalar(robot.radius),
         v_max=scalar(robot.v_max),
@@ -519,6 +521,8 @@ def pack_policy_batch(
     policies: Sequence[HospitalPolicy],
     config: HospitalConfig,
     capacities: HospitalJaxCapacities,
+    *,
+    dtype=np.float32,
 ) -> PackedHospitalPolicies:
     """Pack a variable policy library into fixed-capacity arrays."""
 
@@ -533,15 +537,15 @@ def pack_policy_batch(
     active = np.zeros(count, dtype=bool)
     kinds = np.zeros(count, dtype=np.int32)
     horizon_steps = np.ones(count, dtype=np.int32)
-    rollout_dt = np.full(count, config.policies.rollout_dt, dtype=np.float32)
-    target_speeds = np.zeros(count, dtype=np.float32)
-    angles = np.zeros(count, dtype=np.float32)
-    waypoints = np.zeros((count, waypoint_count, 2), dtype=np.float32)
+    rollout_dt = np.full(count, config.policies.rollout_dt, dtype=dtype)
+    target_speeds = np.zeros(count, dtype=dtype)
+    angles = np.zeros(count, dtype=dtype)
+    waypoints = np.zeros((count, waypoint_count, 2), dtype=dtype)
     waypoint_mask = np.zeros((count, waypoint_count), dtype=bool)
-    room_bounds = np.zeros((count, 4), dtype=np.float32)
+    room_bounds = np.zeros((count, 4), dtype=dtype)
     has_room = np.zeros(count, dtype=bool)
-    max_rollout_distance = np.full(count, 1.0e6, dtype=np.float32)
-    feedback_gains = np.full(count, config.robot.k_velocity, dtype=np.float32)
+    max_rollout_distance = np.full(count, 1.0e6, dtype=dtype)
+    feedback_gains = np.full(count, config.robot.k_velocity, dtype=dtype)
     swept_samples = np.full(count, 2, dtype=np.int32)
     names: list[str] = []
 
@@ -587,7 +591,7 @@ def pack_policy_batch(
         target_speeds[index] = policy.target_speed
         angles[index] = 0.0 if policy.angle is None else policy.angle
         if points:
-            waypoints[index, : len(points)] = np.asarray(points, dtype=np.float32)
+            waypoints[index, : len(points)] = np.asarray(points, dtype=dtype)
             waypoint_mask[index, : len(points)] = True
         if policy.target_room is not None:
             rectangle = policy.target_room.rect
@@ -683,6 +687,8 @@ def pack_policy_groups(
 def pack_obstacle_batch(
     obstacles: Sequence[DynamicObstacle],
     capacities: HospitalJaxCapacities | HospitalJaxGroupedCapacities,
+    *,
+    dtype=np.float32,
 ) -> HospitalJaxObstacleBatch:
     """Pack sensed Humans and Stretchers into fixed-capacity arrays."""
 
@@ -695,19 +701,19 @@ def pack_obstacle_batch(
     count = capacities.max_obstacles
     active = np.zeros(count, dtype=bool)
     kinds = np.zeros(count, dtype=np.int32)
-    centers = np.zeros((count, 2), dtype=np.float32)
-    velocities = np.zeros((count, 2), dtype=np.float32)
-    radii = np.zeros(count, dtype=np.float32)
-    half_lengths = np.zeros(count, dtype=np.float32)
-    half_widths = np.zeros(count, dtype=np.float32)
-    cosines = np.ones(count, dtype=np.float32)
-    sines = np.zeros(count, dtype=np.float32)
+    centers = np.zeros((count, 2), dtype=dtype)
+    velocities = np.zeros((count, 2), dtype=dtype)
+    radii = np.zeros(count, dtype=dtype)
+    half_lengths = np.zeros(count, dtype=dtype)
+    half_widths = np.zeros(count, dtype=dtype)
+    cosines = np.ones(count, dtype=dtype)
+    sines = np.zeros(count, dtype=dtype)
     bounce = np.zeros(count, dtype=bool)
     reflect = np.zeros(count, dtype=bool)
     axes = np.zeros(count, dtype=np.int32)
-    route_min = np.zeros(count, dtype=np.float32)
-    route_max = np.ones(count, dtype=np.float32)
-    route_speed = np.zeros(count, dtype=np.float32)
+    route_min = np.zeros(count, dtype=dtype)
+    route_max = np.ones(count, dtype=dtype)
+    route_speed = np.zeros(count, dtype=dtype)
 
     for index, obstacle in enumerate(obstacle_tuple):
         active[index] = True
@@ -1190,7 +1196,7 @@ def _policy_control(
     next_cursor = jnp.where(
         policy.kinds == POLICY_RETRACE, retrace_cursor, next_cursor
     )
-    return control, next_cursor
+    return control, next_cursor.astype(jnp.int32)
 
 
 def _step_double_integrator(

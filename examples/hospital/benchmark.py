@@ -18,8 +18,12 @@ from pathlib import Path
 import time
 from typing import Iterable, Mapping, Sequence
 
+import jax
 import numpy as np
 
+jax.config.update("jax_enable_x64", True)
+
+from plcbf.benchmark_timing import BenchmarkTiming
 from plcbf.baselines import (
     BENCHMARK_METHODS,
     BaselineDecision,
@@ -918,7 +922,8 @@ def run_hospital_trial(
     *,
     seed: int = 0,
     steps: int | None = None,
-    config: HospitalConfig = DEFAULT_CONFIG,
+    config: HospitalConfig | None = None,
+    baseline_backend: str = "jax",
     oracle_period_s: float | None = None,
     warmup: bool = True,
     raise_errors: bool = False,
@@ -926,6 +931,10 @@ def run_hospital_trial(
 ) -> BenchmarkResult:
     """Execute one method/case/seed trial and return a common result record."""
 
+    if config is None:
+        config = load_hospital_config_artifact(DEFAULT_HOSPITAL_CONFIG_PATH)[0]
+    if baseline_backend not in ("jax", "numpy"):
+        raise ValueError("baseline_backend must be 'jax' or 'numpy'")
     publication_case = str(case_id) in HOSPITAL_BENCHMARK_STORIES
     if publication_case:
         config = publication_benchmark_config(config)
@@ -981,6 +990,13 @@ def run_hospital_trial(
         baseline_suite = HospitalBaselineSuite(
             controller, simulation.environment, config
         )
+        if baseline_backend == "jax" and parsed_method not in {
+            BenchmarkMethod.PLCBF,
+            BenchmarkMethod.POLICY_PCBF,
+            BenchmarkMethod.LIBRARY_PCBF_MI,
+        }:
+            from .baselines_jax import enable_jax
+            enable_jax(baseline_suite, parsed_method.value)
         jax_certificate_method = parsed_method in {
             BenchmarkMethod.PLCBF,
             BenchmarkMethod.POLICY_PCBF,
@@ -1051,7 +1067,7 @@ def run_hospital_trial(
         )
         intervention_sum = 0.0
         intervention_energy = 0.0
-        solver_times: list[float] = []
+        timing = BenchmarkTiming(warmup_steps=10 if warmup else 0)
         oracle_time_total = 0.0
         solver_time_total = 0.0
         oracle_calls = 0
@@ -1108,6 +1124,10 @@ def run_hospital_trial(
                 controller,
                 simulation.state,
             )
+            if parsed_method in {BenchmarkMethod.MPS, BenchmarkMethod.GATEKEEPER}:
+                baseline_suite.prepare_nominal_trajectory(
+                    parsed_method, simulation.state
+                )
             oracle_started = time.perf_counter()
             if parsed_method is BenchmarkMethod.POLICY_PCBF:
                 policies = (
@@ -1203,7 +1223,7 @@ def run_hospital_trial(
             feasible = decision.feasible
             solver_elapsed = time.perf_counter() - solver_started
             solver_time_total += solver_elapsed
-            solver_times.append(oracle_elapsed + solver_elapsed)
+            timing.record(oracle_elapsed + solver_elapsed)
             if parsed_method is BenchmarkMethod.PLCBF:
                 plcbf_result = baseline_suite.last_plcbf_result
                 policy_count = (
@@ -1372,7 +1392,7 @@ def run_hospital_trial(
             outcome=outcome,
             min_clearance=float(minimum_clearance),
             intervention=intervention_sum / max(1, executed_steps),
-            solve_times_s=tuple(solver_times),
+            solve_times_s=tuple(timing.samples),
             case_metrics={
                 **scenario_contract,
                 **sampled_scenario_metrics,
@@ -1701,20 +1721,17 @@ def run_hospital_benchmark(
     cases: Iterable[str] = HOSPITAL_BENCHMARK_STORIES,
     seeds: Iterable[int] = DEFAULT_HOSPITAL_TRAFFIC_SEEDS,
     steps: int | None = None,
-    config: HospitalConfig = DEFAULT_CONFIG,
+    config: HospitalConfig | None = None,
+    baseline_backend: str = "jax",
     plcbf_config: HospitalConfig | None = None,
     oracle_period_s: float | None = None,
     compact_policy_library: bool = False,
     progress: bool = False,
 ) -> tuple[BenchmarkResult, ...]:
-    """Materialize the deterministic Cartesian product in stable order.
+    """Run the method, scenario, and seed grid in stable order."""
 
-    ``config`` remains the comparison-method configuration.  The optional
-    ``plcbf_config`` may change only the nine audited Optuna fields.  Keeping
-    ``None`` as "use config" preserves programmatic tuning/replay behavior;
-    the CLI explicitly supplies the packaged PL-CBF winner.
-    """
-
+    if config is None:
+        config = load_hospital_config_artifact(DEFAULT_HOSPITAL_CONFIG_PATH)[0]
     validate_strict_refuge_protocol(config)
     resolved_plcbf_config = config if plcbf_config is None else plcbf_config
     validate_strict_refuge_protocol(resolved_plcbf_config)
@@ -1777,6 +1794,7 @@ def run_hospital_benchmark(
                             else benchmark_config
                         ),
                         oracle_period_s=oracle_period_s,
+                        baseline_backend=baseline_backend,
                         _scenario=scenario,
                     )
                 )
@@ -1859,8 +1877,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="config_json",
         type=Path,
         help=(
-            "PL-CBF HospitalConfig YAML/JSON or tuning summary (default: "
-            "packaged Optuna winner); comparison baselines are unchanged"
+            "HospitalConfig YAML/JSON or tuning summary (default: packaged settings)"
         ),
     )
     parser.add_argument(
@@ -1869,6 +1886,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("results/hospital_benchmark"),
         help="report prefix; CSV, JSON, and Markdown are written",
     )
+    parser.add_argument("--baseline-backend", choices=("jax", "numpy"), default="jax")
     policy_group = parser.add_mutually_exclusive_group()
     policy_group.add_argument(
         "--full-policy-library",
@@ -1902,18 +1920,17 @@ def _resolve_cli_protocol(
     str,
     Mapping[str, object],
 ]:
-    """Resolve separate baseline/PL-CBF configs and the fixed protocol."""
+    """Load the shared benchmark configuration."""
 
     config_path = (
         DEFAULT_HOSPITAL_CONFIG_PATH
         if arguments.config_json is None
         else arguments.config_json
     )
-    baseline_config = DEFAULT_CONFIG
     plcbf_config, artifact = load_hospital_config_artifact(config_path)
     if any(case in HOSPITAL_BENCHMARK_STORIES for case in arguments.cases):
-        baseline_config = publication_benchmark_config(baseline_config)
         plcbf_config = publication_benchmark_config(plcbf_config)
+    baseline_config = plcbf_config
     validate_plcbf_configuration_scope(baseline_config, plcbf_config)
     mode = arguments.policy_library_mode
     compact = mode == "compact"
@@ -1983,6 +2000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config=runtime_config,
         plcbf_config=plcbf_runtime_config,
         oracle_period_s=oracle_period,
+        baseline_backend=arguments.baseline_backend,
         compact_policy_library=compact_policy_library,
         progress=True,
     )
@@ -2014,7 +2032,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "plant_dt_s": runtime_config.dt,
         "compact_policy_library": compact_policy_library,
         "configuration_source": plcbf_configuration_source,
-        "baseline_configuration_source": "publication_defaults",
+        "baseline_configuration_source": plcbf_configuration_source,
+        "baseline_backend": arguments.baseline_backend,
         "plcbf_configuration_source": plcbf_configuration_source,
         "plcbf_config_artifact": plcbf_config_artifact,
         "method_scoped_config_compatibility_verified": True,
@@ -2027,8 +2046,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for method in methods
         },
         "controller_scope": (
-            "The packaged/tuned Hospital configuration applies only to "
-            "PL-CBF; all seven comparison methods retain baseline_config."
+            "All methods use the selected controller configuration."
         ),
         "implementation_source_manifest": (
             implementation_source_manifest

@@ -15,12 +15,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import jax
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
 
+from plcbf.benchmark_timing import BenchmarkTiming
 from safe_control.envs.drifting_env import DriftingEnv
 from safe_control.position_control.mpcc import MPCC
 from safe_control.robots.drifting_car import DriftingCar, DriftingCarSimulator
@@ -67,8 +71,8 @@ class SimConfig:
     num_lanes: int = 5
     nominal_horizon_time: float = 1.5
     backup_horizon_time: float = 3.0
-    event_offset: float = 0.1
-    safety_margin: float = 1.5
+    event_offset: float = 0.05
+    safety_margin: float = 1.15
     initial_velocity: float = 10.0
     target_velocity: float = 10.0
     nominal_track_eps: float = 0.05
@@ -322,6 +326,11 @@ def setup_shielding(
             reference_plcbf=reference_plcbf,
         )
     shielding.set_environment(env)
+    if variant.algo == "multi_backup_cbf_mi":
+        for candidate in shielding.filters.values():
+            candidate.safety_margin = cfg.safety_margin
+    else:
+        shielding.safety_margin = cfg.safety_margin
     return shielding
 
 
@@ -404,9 +413,7 @@ def run_episode(
     total_steps = 0
     collision = False
     runtime_error = False
-    compute_times_s: List[float] = []
-    solve_calls = 0
-    timing_warmup_steps = 5
+    timing = BenchmarkTiming()
     quiet = not verbose
 
     for _step in range(n_steps):
@@ -427,7 +434,6 @@ def run_episode(
             break
 
         try:
-            solve_calls += 1
             solve_started = time.perf_counter()
             u_safe = call_quiet(
                 quiet,
@@ -440,6 +446,7 @@ def run_episode(
                 pred_controls=pred_controls,
                 friction=car.get_friction(),
             )
+            np.asarray(u_safe)
             solve_elapsed = time.perf_counter() - solve_started
         except Exception:
             runtime_error = True
@@ -464,8 +471,7 @@ def run_episode(
             runtime_error = True
             break
         total_steps += 1
-        if solve_calls > timing_warmup_steps:
-            compute_times_s.append(solve_elapsed)
+        timing.record(solve_elapsed)
         collision = bool(sim_res["collision"])
         if collision:
             break
@@ -490,8 +496,8 @@ def run_episode(
         unrecoverable_infeasible=runtime_error,
         historical_failure=historical_failure,
         total_steps=total_steps,
-        timed_steps=len(compute_times_s),
-        solve_time_sum_sec=float(np.sum(compute_times_s)),
+        timed_steps=len(timing.samples),
+        solve_time_sum_sec=float(np.sum(timing.samples)),
     )
 
 
@@ -634,7 +640,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Run only the two additional drift-car baselines"
     )
-    parser.add_argument("--num-runs", type=int, default=10, help="Runs per algorithm")
+    parser.add_argument("--num-runs", type=int, default=100, help="Runs per algorithm")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for scenario generation")
     parser.add_argument(
         "--output-md",

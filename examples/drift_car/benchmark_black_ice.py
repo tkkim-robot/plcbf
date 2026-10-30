@@ -20,18 +20,23 @@ import contextlib
 import io
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import jax
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 # Add project root and submodule path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "safe_control"))
 
+from plcbf.benchmark_timing import BenchmarkTiming
 from safe_control.envs.drifting_env import DriftingEnv
 from safe_control.position_control.backup_cbf_qp import BackupCBF
 from safe_control.position_control.backup_controller import LaneChangeController, StoppingController
@@ -55,8 +60,9 @@ class SimConfig:
     num_lanes: int = 5
     nominal_horizon_time: float = 1.5
     backup_horizon_time: float = 3.0
-    event_offset: float = 0.1
-    safety_margin: float = 1.5
+    event_offset: float = 0.05
+    safety_margin: float = 1.15
+    baseline_backend: str = "jax"
     initial_velocity: float = 10.0
     target_velocity: float = 10.0
     nominal_track_eps: float = 0.05
@@ -89,6 +95,8 @@ class EpisodeResult:
     infeasible: bool
     nominal_tracking_pct: float
     total_steps: int
+    solve_time_sum_sec: float = 0.0
+    timed_steps: int = 0
 
 
 def build_vehicle_spec() -> Dict[str, float]:
@@ -287,7 +295,7 @@ def setup_shielding(
             cbf_alpha=6.0,
             left_lane_y=lanes["left"],
             right_lane_y=lanes["right"],
-            safety_margin=1.15,
+            safety_margin=cfg.safety_margin,
             max_operator="input_space",
             debug=False,
             ax=None,
@@ -310,11 +318,8 @@ def setup_shielding(
             backup_horizon=cfg.backup_horizon_time,
             ax=None,
         )
-        shielding.set_backup_controller(backup_controller, target=backup_target)
-        shielding.set_environment(env)
-        return shielding
 
-    if variant.algo == "mps":
+    elif variant.algo == "mps":
         shielding = MPS(
             robot=car,
             robot_spec=car.robot_spec,
@@ -324,11 +329,8 @@ def setup_shielding(
             ax=None,
             safety_margin=cfg.safety_margin,
         )
-        shielding.set_backup_controller(backup_controller, target=backup_target)
-        shielding.set_environment(env)
-        return shielding
 
-    if variant.algo == "gatekeeper":
+    elif variant.algo == "gatekeeper":
         shielding = Gatekeeper(
             robot=car,
             robot_spec=car.robot_spec,
@@ -338,26 +340,31 @@ def setup_shielding(
             ax=None,
             safety_margin=cfg.safety_margin,
         )
-        shielding.set_backup_controller(backup_controller, target=backup_target)
-        shielding.set_environment(env)
-        return shielding
 
-    if variant.algo == "pcbf":
+    elif variant.algo == "pcbf":
         shielding = PCBF(
             robot=car,
             robot_spec=car.robot_spec,
             dt=cfg.dt,
             backup_horizon=cfg.backup_horizon_time,
-            cbf_alpha=5.0,
-            safety_margin=1.0,
+            cbf_alpha=6.0,
+            safety_margin=cfg.safety_margin,
             use_cbf_slack=False,
             ax=None,
         )
-        shielding.set_backup_controller(backup_controller, target=backup_target)
-        shielding.set_environment(env)
-        return shielding
 
-    raise ValueError(f"Unknown algorithm: {variant.algo}")
+    else:
+        raise ValueError(f"Unknown algorithm: {variant.algo}")
+
+    shielding.set_backup_controller(backup_controller, target=backup_target)
+    shielding.set_environment(env)
+    shielding.safety_margin = cfg.safety_margin
+    if variant.algo == "gatekeeper":
+        shielding.horizon_discount = cfg.dt
+    if variant.algo in ("mps", "gatekeeper") and cfg.baseline_backend == "jax":
+        from plcbf.jax_shielding import enable_jax
+        enable_jax(shielding, "highway")
+    return shielding
 
 
 def solve_safe_control(
@@ -407,6 +414,7 @@ def run_episode(variant: AlgoVariant, scenario: Scenario, cfg: SimConfig, verbos
 
     n_steps = int(cfg.tf / cfg.dt)
     total_steps = 0
+    timing = BenchmarkTiming()
     nominal_like_steps = 0
     collision = False
     infeasible = False
@@ -443,6 +451,7 @@ def run_episode(variant: AlgoVariant, scenario: Scenario, cfg: SimConfig, verbos
                 shielding.set_nominal_trajectory(pred_states, pred_controls)
 
         try:
+            started = time.perf_counter()
             u_safe = call_quiet(
                 quiet,
                 solve_safe_control,
@@ -454,6 +463,8 @@ def run_episode(variant: AlgoVariant, scenario: Scenario, cfg: SimConfig, verbos
                 pred_controls=pred_controls,
                 friction=car.get_friction(),
             )
+            np.asarray(u_safe)
+            timing.record(time.perf_counter() - started)
         except Exception:
             infeasible = True
             break
@@ -490,6 +501,8 @@ def run_episode(variant: AlgoVariant, scenario: Scenario, cfg: SimConfig, verbos
         infeasible=infeasible,
         nominal_tracking_pct=nominal_pct,
         total_steps=total_steps,
+        solve_time_sum_sec=sum(timing.samples),
+        timed_steps=len(timing.samples),
     )
 
 
@@ -522,6 +535,8 @@ def aggregate_results(
                 "fail_count": fail_count,
                 "fail_rate": 100.0 * fail_count / max(n, 1),
                 "nominal_avg": nominal_avg,
+                "compute_ms": 1000.0 * sum(r.solve_time_sum_sec for r in rows)
+                / max(1, sum(r.timed_steps for r in rows)),
             }
         )
     return summary_rows, all_results
@@ -538,18 +553,18 @@ def format_markdown_table(summary_rows: List[dict], num_runs: int, seed: int, cf
     )
     lines.append("- Obstacles per run: random 1 or 2, placed near and beyond puddle center (x in ~[72, 85])")
     lines.append("")
-    lines.append("| Algorithm | Collision/Infeasible Rate | Avg Nominal Tracking (%) |")
-    lines.append("|---|---:|---:|")
+    lines.append("| Algorithm | Collision/Infeasible Rate | Avg Nominal Tracking (%) | Time (ms) |")
+    lines.append("|---|---:|---:|---:|")
     for row in summary_rows:
         fail_text = f"{row['fail_count']}/{row['n']} ({row['fail_rate']:.1f}%)"
-        lines.append(f"| {row['label']} | {fail_text} | {row['nominal_avg']:.1f} |")
+        lines.append(f"| {row['label']} | {fail_text} | {row['nominal_avg']:.1f} | {row['compute_ms']:.3f} |")
     lines.append("")
     return "\n".join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark drift-car black-ice scenario")
-    parser.add_argument("--num-runs", type=int, default=10, help="Runs per algorithm")
+    parser.add_argument("--num-runs", type=int, default=100, help="Runs per algorithm")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for scenario generation")
     parser.add_argument(
         "--output-md",
@@ -558,6 +573,7 @@ def main():
         help="Path to output markdown report",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose per-run logging")
+    parser.add_argument("--baseline-backend", choices=("jax", "numpy"), default="jax")
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -566,7 +582,7 @@ def main():
         module="cvxpy",
     )
 
-    cfg = SimConfig()
+    cfg = SimConfig(baseline_backend=args.baseline_backend)
     variants = make_variants()
     scenarios = generate_scenarios(args.num_runs, args.seed)
 

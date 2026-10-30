@@ -7,7 +7,7 @@ policy library is rebuilt and optimized at every certificate update.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 import numpy as np
@@ -17,7 +17,9 @@ from plcbf.policy_library import (
     DecisionDiagnostics,
     PolicyCertificate,
     PolicyDecision,
+    PolicyEvaluation as InputPolicyEvaluation,
     SelectionMode,
+    clip_rectangle_halfspaces,
     select_policy,
 )
 
@@ -1530,16 +1532,20 @@ class HospitalController:
         *,
         obstacles_are_sensed: bool = False,
         include_rollout_diagnostics: bool = True,
+        nominal_control: Sequence[float] | None = None,
     ) -> ControllerResult:
         del time
         value = np.asarray(state, dtype=float)
-        target = self._navigation_target(value)
-        nominal = waypoint_control(
-            value,
-            target,
-            self.config.robot,
-            self.config.policies.nominal_target_speed,
-        )
+        if nominal_control is None:
+            target = self._navigation_target(value)
+            nominal = waypoint_control(
+                value,
+                target,
+                self.config.robot,
+                self.config.policies.nominal_target_speed,
+            )
+        else:
+            nominal = np.asarray(nominal_control, dtype=float).reshape(2)
         selected = "nominal"
 
         active_obstacles = (
@@ -1592,21 +1598,43 @@ class HospitalController:
         limit = self.config.robot.a_max
         emergency_hocbf_feasible: bool | None = None
         if active_obstacles or constraints:
-            raw_decision = select_policy(
-                certificates,
-                nominal_control=nominal,
-                lower=np.array([-limit, -limit]),
-                upper=np.array([limit, limit]),
-                mode="input_volume",
-                safe_value_threshold=self.config.policies.safe_value_threshold,
-                fallback_control=np.clip(
-                    -self.config.policies.stop_gain * value[2:4],
-                    -limit,
-                    limit,
-                ),
-                tolerance=self.config.policies.constraint_tolerance,
+            tolerance = self.config.policies.constraint_tolerance
+            input_evaluations = []
+            for certificate in certificates:
+                safe_value = bool(
+                    certificate.valid
+                    and np.isfinite(certificate.value)
+                    and certificate.value
+                    >= self.config.policies.safe_value_threshold - tolerance
+                )
+                polygon = (
+                    clip_rectangle_halfspaces(
+                        [-limit, -limit], [limit, limit],
+                        certificate.halfspaces, tolerance=tolerance,
+                    )
+                    if certificate.valid else None
+                )
+                input_evaluations.append(InputPolicyEvaluation(
+                    policy_id=certificate.policy_id,
+                    value=certificate.value,
+                    safe_value=safe_value,
+                    feasible=bool(polygon is not None and len(polygon.vertices)),
+                    input_volume=0.0 if polygon is None else polygon.area,
+                    intervention_cost=float("inf"),
+                    control=None,
+                    status="input_set_evaluated" if certificate.valid else "invalid_certificate",
+                ))
+            diagnostics = DecisionDiagnostics(
+                mode=SelectionMode.INPUT_VOLUME,
+                selected_policy_id=None,
+                used_fallback=False,
+                fallback_reason=None,
+                fallback_source=None,
+                safe_policy_count=sum(item.safe_value for item in input_evaluations),
+                feasible_policy_count=sum(item.feasible for item in input_evaluations),
+                eligible_policy_count=0,
+                evaluations=tuple(input_evaluations),
             )
-            diagnostics = raw_decision.diagnostics
             by_id = {
                 certificate.policy_id: certificate
                 for certificate in certificates
@@ -1635,10 +1663,26 @@ class HospitalController:
                     ):
                         best = item
                 certificate = by_id[best.policy_id]
-                assert best.control is not None
+                projected = select_policy(
+                    (certificate,), nominal,
+                    [-limit, -limit], [limit, limit],
+                    mode="input_volume",
+                    safe_value_threshold=self.config.policies.safe_value_threshold,
+                    tolerance=tolerance,
+                )
+                if projected.diagnostics.used_fallback:
+                    raise RuntimeError("positive-volume policy projection failed")
+                selected_evaluation = projected.diagnostics.evaluations[0]
+                diagnostics = replace(
+                    diagnostics,
+                    evaluations=tuple(
+                        selected_evaluation if item.policy_id == best.policy_id else item
+                        for item in diagnostics.evaluations
+                    ),
+                )
                 decision = PolicyDecision(
                     certificate=certificate,
-                    control=best.control,
+                    control=projected.control,
                     diagnostics=DecisionDiagnostics(
                         mode=SelectionMode.INPUT_VOLUME,
                         selected_policy_id=certificate.policy_id,

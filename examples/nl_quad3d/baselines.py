@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
 import numpy as np
@@ -200,11 +200,17 @@ class NLQuad3DBaselineSuite:
         bounds: WorldBounds | None,
         *,
         waypoints: np.ndarray | None = None,
-        algorithm_config: NLQuad3DBaselineConfig = NLQuad3DBaselineConfig(),
+        algorithm_config: NLQuad3DBaselineConfig | None = None,
     ) -> None:
         self.controller = controller
         self.model = model
         self.bounds = bounds
+        if algorithm_config is None:
+            algorithm_config = replace(
+                NLQuad3DBaselineConfig(),
+                pcbf_alpha=controller.config.cbf_alpha,
+                mi_num_radial_policies=controller.config.num_radial_policies,
+            )
         self.algorithm_config = algorithm_config
         self._goal = np.zeros(3)
         self._obstacles = np.zeros((0, 7))
@@ -246,6 +252,16 @@ class NLQuad3DBaselineSuite:
 
     def _nominal_feedback(self, state: np.ndarray) -> np.ndarray:
         return self.model.nominal_input(state, self._goal)
+
+    def prepare_nominal_trajectory(self, method, state, goal) -> None:
+        """Prepare the reference outside the safety-filter timing interval."""
+        self._goal = np.asarray(goal, dtype=float).reshape(3)
+        if BenchmarkMethod(method) is BenchmarkMethod.MPS:
+            self.mps.prepare_nominal_trajectory(state, 1)
+        elif BenchmarkMethod(method) is BenchmarkMethod.GATEKEEPER:
+            self.gatekeeper.prepare_nominal_trajectory(
+                state, self.algorithm_config.gatekeeper_nominal_steps
+            )
 
     def _fixed_backup_feedback(self, state: np.ndarray) -> np.ndarray:
         control, self._retrace_rollout_index = self._retrace_control(
@@ -2105,6 +2121,14 @@ class NLQuad3DBaselineSuite:
         value = np.asarray(state, dtype=float).reshape(12)
         self._goal = np.asarray(goal, dtype=float).reshape(3)
         self._obstacles = np.asarray(obstacles, dtype=float).reshape(-1, 7).copy()
+        if parsed in {
+            BenchmarkMethod.BACKUP_CBF,
+            BenchmarkMethod.MPS,
+            BenchmarkMethod.GATEKEEPER,
+            BenchmarkMethod.MULTI_BACKUP_CBF_MI,
+            BenchmarkMethod.MI_MPC,
+        } and isinstance(self.controller, PLCBF_NLQuad3D):
+            self._obstacles = self.controller._active_obstacles(value, self._obstacles)
         self._trajectory_obstacle_history_cache = None
         self._altitude_reference = float(value[2])
         if active_waypoint_index is not None:

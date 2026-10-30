@@ -8,7 +8,7 @@ No algorithm in this module receives a blockage flag or refuge phase.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import cos, sin
 import time
 from typing import Callable, Sequence
@@ -93,6 +93,7 @@ class HospitalBaselineConfig:
     """Algorithm constants matching the warehouse comparison protocol."""
 
     backup_horizon_s: float = 4.0
+    rollout_dt_s: float | None = None
     multi_backup_maneuver_s: float = 2.0
     gatekeeper_nominal_steps: int = 30
     gatekeeper_discount_steps: int = 1
@@ -123,6 +124,10 @@ class HospitalBaselineConfig:
     def __post_init__(self) -> None:
         if self.backup_horizon_s <= 0.0:
             raise ValueError("backup_horizon_s must be positive")
+        if self.rollout_dt_s is not None and (
+            not np.isfinite(self.rollout_dt_s) or self.rollout_dt_s <= 0.0
+        ):
+            raise ValueError("rollout_dt_s must be finite and positive")
         if not 0.0 <= self.multi_backup_maneuver_s < self.backup_horizon_s:
             raise ValueError(
                 "multi_backup_maneuver_s must be shorter than the backup "
@@ -178,12 +183,29 @@ class HospitalBaselineSuite:
         environment: HospitalEnvironment,
         config: HospitalConfig,
         *,
-        algorithm_config: HospitalBaselineConfig = HospitalBaselineConfig(),
+        algorithm_config: HospitalBaselineConfig | None = None,
     ) -> None:
         self.controller = controller
         self.environment = environment
         self.config = config
+        if algorithm_config is None:
+            algorithm_config = replace(
+                HospitalBaselineConfig(),
+                backup_horizon_s=config.policies.room_horizon,
+                rollout_dt_s=config.policies.rollout_dt,
+                trajectory_swept_substeps=1,
+                time_derivative_step_s=config.policies.time_derivative_step,
+                multi_backup_maneuver_s=config.policies.room_horizon / 2,
+                mi_directional_policy_count=config.policies.num_angle_policies,
+            )
         self.algorithm_config = algorithm_config
+        self.rollout_dt = (
+            config.dt if algorithm_config.rollout_dt_s is None
+            else float(algorithm_config.rollout_dt_s)
+        )
+        step_ratio = self.rollout_dt / config.dt
+        if step_ratio < 1 or not np.isclose(step_ratio, round(step_ratio)):
+            raise ValueError("rollout_dt_s must be an integer multiple of the control dt")
         self._target = controller.navigation_path[controller.navigation_index].copy()
         self._obstacles: tuple[DynamicObstacle, ...] = ()
         self._predicted_obstacles: dict[
@@ -199,14 +221,16 @@ class HospitalBaselineSuite:
         self._batch_human_radii = np.empty(0, dtype=float)
         self._backup_steps = max(
             1,
-            int(round(algorithm_config.backup_horizon_s / config.dt)),
+            int(round(algorithm_config.backup_horizon_s / self.rollout_dt)),
         )
         self._retrace_rollout_index = 0
         self._fixed_backup_rollout_policy: HospitalPolicy | None = None
         self.last_mi_mpc_result: BigMTrajectoryMPCResult | None = None
         self.last_plcbf_result: ControllerResult | None = None
         common = dict(
-            step=self._plant_step,
+            step=self._control_step,
+            backup_step=self._plant_step,
+            backup_control_hold_steps=int(round(step_ratio)),
             nominal_control=self._nominal_feedback,
             backup_control=self._fixed_backup_feedback,
             trajectory_is_safe=self._trajectory_is_safe,
@@ -222,6 +246,12 @@ class HospitalBaselineSuite:
         )
 
     def _plant_step(self, state: np.ndarray, control: np.ndarray) -> np.ndarray:
+        """Prediction transition; the actual simulation retains config.dt."""
+        return step_double_integrator(
+            state, control, self.rollout_dt, self.config.robot
+        )
+
+    def _control_step(self, state: np.ndarray, control: np.ndarray) -> np.ndarray:
         return step_double_integrator(
             state, control, self.config.dt, self.config.robot
         )
@@ -235,6 +265,18 @@ class HospitalBaselineSuite:
             self.config.robot,
             self.config.policies.nominal_target_speed,
         )
+
+    def prepare_nominal_trajectory(self, method, state: np.ndarray) -> None:
+        """Prepare nominal controls before timing the safety filter."""
+        self._target = self.controller.navigation_path[
+            self.controller.navigation_index
+        ].copy()
+        if BenchmarkMethod(method) is BenchmarkMethod.MPS:
+            self.mps.prepare_nominal_trajectory(state, 1)
+        elif BenchmarkMethod(method) is BenchmarkMethod.GATEKEEPER:
+            self.gatekeeper.prepare_nominal_trajectory(
+                state, self.algorithm_config.gatekeeper_nominal_steps
+            )
 
     def _fixed_backup_feedback(self, state: np.ndarray) -> np.ndarray:
         policy = self._fixed_backup_rollout_policy
@@ -288,7 +330,7 @@ class HospitalBaselineSuite:
             name=self.algorithm_config.fixed_backup_policy_id,
             kind="retrace",
             horizon=self.algorithm_config.backup_horizon_s,
-            rollout_dt=self.config.dt,
+            rollout_dt=self.rollout_dt,
             target_speed=min(
                 self.algorithm_config.fixed_backup_target_speed_mps,
                 self.config.robot.v_max,
@@ -309,7 +351,7 @@ class HospitalBaselineSuite:
                 name=f"mi_angle_{index:02d}",
                 kind="angle",
                 horizon=self.algorithm_config.backup_horizon_s,
-                rollout_dt=self.config.dt,
+                rollout_dt=self.rollout_dt,
                 target_speed=min(
                     self.algorithm_config.mi_directional_target_speed_mps,
                     self.config.robot.v_max,
@@ -722,6 +764,11 @@ class HospitalBaselineSuite:
         ):
             return False
 
+        if substeps == 1:
+            return bool(np.all(self._point_margins(
+                trajectory[:, :2],
+                np.arange(len(trajectory), dtype=float) * self.config.dt,
+            ) >= 0.0))
         alphas = np.arange(substeps + 1, dtype=float) / substeps
         points = (
             starts[:, None, :]
@@ -756,7 +803,7 @@ class HospitalBaselineSuite:
             path_values = self._point_margins(
                 trajectory[:, :2],
                 time_offset
-                + np.arange(state_count, dtype=float) * self.config.dt,
+                + np.arange(state_count, dtype=float) * self.rollout_dt,
             )
 
             terminal_values = [
@@ -778,7 +825,7 @@ class HospitalBaselineSuite:
                             successor[:2],
                             time_offset
                             + self.algorithm_config.backup_horizon_s
-                            + self.config.dt,
+                            + self.rollout_dt,
                         ),
                         self.algorithm_config.terminal_speed_mps
                         - float(np.linalg.norm(successor[2:4])),
@@ -809,21 +856,18 @@ class HospitalBaselineSuite:
         maneuver_steps: int,
         multi_backup: bool,
     ) -> np.ndarray:
-        """Roll out the source algorithm's single/strict-MB conventions."""
+        """Roll out backup controls on the prediction grid."""
 
-        # The warehouse baselines intentionally use two conventions.
-        # Single BackupCBF has N=int(T/dt) states and constrains phi[1:N].
-        # Strict MB-CBF-MI has ceil(T/dt)+1 states and constrains phi[0:N].
         state_count = (
             int(
                 np.ceil(
                     self.algorithm_config.backup_horizon_s
-                    / self.config.dt
+                    / self.rollout_dt
                 )
             )
             + 1
             if multi_backup
-            else self._backup_steps
+            else self._backup_steps + 1
         )
         state = np.asarray(initial_state, dtype=float).copy()
         states = [state.copy()]
@@ -865,7 +909,7 @@ class HospitalBaselineSuite:
         )
         epsilon = 1e-5
         elapsed = (
-            np.arange(len(trajectory), dtype=float) * self.config.dt
+            np.arange(len(trajectory), dtype=float) * self.rollout_dt
         )
         base = self._point_margins(trajectory[:, :2], elapsed)
         gradients = np.zeros((len(trajectory), 4), dtype=float)
@@ -878,10 +922,10 @@ class HospitalBaselineSuite:
         policy_flow = np.empty_like(trajectory)
         policy_flow[:-1] = (
             trajectory[1:] - trajectory[:-1]
-        ) / self.config.dt
+        ) / self.rollout_dt
         policy_flow[-1] = (
             trajectory[-1] - trajectory[-2]
-        ) / self.config.dt
+        ) / self.rollout_dt
         return np.einsum("ij,ij->i", gradients, policy_flow)
 
     def _backup_candidate(
@@ -977,7 +1021,7 @@ class HospitalBaselineSuite:
                 self._point_margins(
                     state_array[:, :2],
                     np.arange(len(state_array), dtype=float)
-                    * self.config.dt,
+                    * self.rollout_dt,
                 )
             )
         )
@@ -1217,6 +1261,7 @@ class HospitalBaselineSuite:
                 float(time_seconds),
                 obstacles_are_sensed=True,
                 include_rollout_diagnostics=False,
+                nominal_control=nominal_array,
             )
             self.last_plcbf_result = result
             delta = result.control - nominal_array
@@ -1296,7 +1341,7 @@ class HospitalBaselineSuite:
                 int(
                     round(
                         self.algorithm_config.multi_backup_maneuver_s
-                        / self.config.dt
+                        / self.rollout_dt
                     )
                 ),
             )

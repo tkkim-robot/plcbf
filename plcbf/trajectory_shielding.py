@@ -104,12 +104,18 @@ class _TrajectoryCommitmentShield:
         trajectory_is_safe: TrajectoryValidator,
         backup_horizon_steps: int,
         backup_policy_id: str,
+        backup_step: StateStep | None = None,
+        backup_control_hold_steps: int = 1,
     ) -> None:
         if int(backup_horizon_steps) <= 0:
             raise ValueError("backup_horizon_steps must be positive")
         if not str(backup_policy_id):
             raise ValueError("backup_policy_id must not be empty")
         self._step = step
+        self._backup_step = step if backup_step is None else backup_step
+        self.backup_control_hold_steps = int(backup_control_hold_steps)
+        if self.backup_control_hold_steps < 1:
+            raise ValueError("backup_control_hold_steps must be positive")
         self._nominal_control = nominal_control
         self._backup_control = backup_control
         self._trajectory_is_safe = trajectory_is_safe
@@ -118,11 +124,27 @@ class _TrajectoryCommitmentShield:
         self.committed: CommittedTrajectory | None = None
         self.committed_is_safe = False
         self.current_index = 0
+        self._prepared_nominal: tuple[FloatArray, FloatArray] | None = None
 
     def reset(self) -> None:
         self.committed = None
         self.committed_is_safe = False
         self.current_index = 0
+        self._prepared_nominal = None
+
+    def prepare_nominal_trajectory(
+        self, initial_state: ArrayLike, nominal_steps: int
+    ) -> None:
+        """Cache the nominal prefix for the next solve."""
+        state = _vector(initial_state, "initial_state")
+        states = [state.copy()]
+        controls = []
+        for _ in range(max(0, int(nominal_steps))):
+            control = _vector(self._nominal_control(state.copy()), "nominal control")
+            state = _vector(self._step(state.copy(), control.copy()), "next state")
+            controls.append(control)
+            states.append(state.copy())
+        self._prepared_nominal = (np.asarray(states), np.asarray(controls))
 
     def _candidate(
         self,
@@ -134,23 +156,39 @@ class _TrajectoryCommitmentShield:
         controls: list[FloatArray] = []
         requested_nominal_steps = max(0, int(nominal_steps))
 
-        for _ in range(requested_nominal_steps):
-            control = _vector(
-                self._nominal_control(state.copy()),
-                "nominal control",
-            )
-            state = _vector(self._step(state.copy(), control.copy()), "next state")
-            controls.append(control)
-            states.append(state.copy())
+        prepared = self._prepared_nominal
+        if (
+            prepared is not None
+            and requested_nominal_steps <= len(prepared[1])
+            and np.array_equal(state, prepared[0][0])
+        ):
+            states = list(prepared[0][: requested_nominal_steps + 1].copy())
+            controls = list(prepared[1][:requested_nominal_steps].copy())
+            state = states[-1].copy()
+        else:
+            for _ in range(requested_nominal_steps):
+                control = _vector(
+                    self._nominal_control(state.copy()),
+                    "nominal control",
+                )
+                state = _vector(self._step(state.copy(), control.copy()), "next state")
+                controls.append(control)
+                states.append(state.copy())
 
         for _ in range(self.backup_horizon_steps):
             control = _vector(
                 self._backup_control(state.copy()),
                 "backup control",
             )
-            state = _vector(self._step(state.copy(), control.copy()), "next state")
-            controls.append(control)
-            states.append(state.copy())
+            before = state.copy()
+            state = _vector(self._backup_step(before.copy(), control.copy()), "next state")
+            hold = self.backup_control_hold_steps
+            for index in range(1, hold + 1):
+                controls.append(control.copy())
+                states.append(
+                    state.copy() if index == hold
+                    else before + (index / hold) * (state - before)
+                )
 
         return CommittedTrajectory(
             states=np.asarray(states),
@@ -186,6 +224,7 @@ class _TrajectoryCommitmentShield:
         control = self.committed.controls[output_index].copy()
         used_backup = output_index >= self.committed.nominal_steps
         self.current_index += 1
+        self._prepared_nominal = None
         return ShieldDecision(
             control=control,
             feasible=feasible,
